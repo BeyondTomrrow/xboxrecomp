@@ -562,6 +562,13 @@ static void *mcpx_apu_frame_thread(void *arg)
 
         throttle(d);
 
+        /* The doorbell ack stands in for the GP DSP, which on hardware runs
+         * whatever the front end is doing. Tying it to se_frame stopped it
+         * whenever FECTL was trapped or halted, and DirectSound then waits
+         * forever to post its next command: Burnout 3 stalls in
+         * sub_002F805E polling the same doorbell it was acked on at init. */
+        mcpx_apu_dsp_ack_poll(d);
+
         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                 NV_PAPU_SECTL_XCNTMODE);
         uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);

@@ -104,7 +104,7 @@ static int mcpx_apu_mixdown_all(void)
     return on;
 }
 
-static void dsp_ack_frame(MCPXAPUState *d)
+void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
 {
     int i;
 
@@ -173,8 +173,6 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
      */
 
     int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
-
-    dsp_ack_frame(d);
 
     {
         double e = 0;

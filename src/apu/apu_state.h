@@ -524,6 +524,7 @@ void mcpx_apu_vp_reset(MCPXAPUState *d);
 void mcpx_apu_dsp_init(MCPXAPUState *d);
 void mcpx_apu_update_dsp_preference(MCPXAPUState *d);
 void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
+void mcpx_apu_dsp_ack_poll(MCPXAPUState *d);
 
 /* Debug globals */
 extern MCPXAPUState *g_state;
