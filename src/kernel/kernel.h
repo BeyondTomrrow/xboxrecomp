@@ -543,6 +543,10 @@ void xbox_kernel_set_ordinal_remap(const unsigned short *map, int count);
 
 /* Initialize path translation with base directories */
 void xbox_path_init(const char* game_dir, const char* save_dir);
+/* Per-user data folder for settings, caches and logs (kernel_path.c). */
+void xbox_set_user_dir(const char *dir);
+const char *xbox_user_dir(void);
+char *xbox_user_path(const char *rel, char *out, size_t n);
 
 /*
  * Character type of a translated host path. The Win32 file APIs take wide

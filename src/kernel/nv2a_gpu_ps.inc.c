@@ -133,7 +133,11 @@ static void gpu_ps_compile(GpuPsEnt *e)
         return;
     }
     sh = gpu_vp_srchash(src);
-    snprintf(path, sizeof path, "cache\\ps\\%016llX.cso", (unsigned long long)sh);
+    {   /* in the per-user cache folder (kernel_path.c xbox_user_path) */
+        char rel[64];
+        snprintf(rel, sizeof rel, "cache\\ps\\%016llX.cso", (unsigned long long)sh);
+        xbox_user_path(rel, path, sizeof path);
+    }
     f = fopen(path, "rb");
     if (f) {
         fseek(f, 0, SEEK_END);

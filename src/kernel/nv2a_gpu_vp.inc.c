@@ -425,7 +425,11 @@ static void gpu_vp_compile_job(GpuVpJob *j)
     ID3DBlob *blob = NULL, *err = NULL;
     FILE *f;
 
-    snprintf(path, sizeof path, "cache\\vp\\%016llX.cso", (unsigned long long)sh);
+    {   /* in the per-user cache folder (kernel_path.c xbox_user_path) */
+        char rel[64];
+        snprintf(rel, sizeof rel, "cache\\vp\\%016llX.cso", (unsigned long long)sh);
+        xbox_user_path(rel, path, sizeof path);
+    }
     f = fopen(path, "rb");
     if (f) {
         fseek(f, 0, SEEK_END);

@@ -95,6 +95,17 @@ static uint32_t gpu_wide_ox(uint32_t w, uint32_t h)
     return total > w ? (total - w + 1u) / 2u : 0u;
 }
 
+/* The scale a target of this guest size (with its widescreen columns) gets:
+ * the setting, stepped down until it fits D3D11's 16384 texture limit (a 32:9
+ * target at 12x would be 20480 wide). */
+static uint32_t gpu_fit_scale(uint32_t full_w, uint32_t h)
+{
+    uint32_t sc = g_render_scale;
+    while (sc > 1 && (full_w * sc > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION || h * sc > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION))
+        sc--;
+    return sc;
+}
+
 /* What the draw path last bound, so an unchanged setting is not sent again.
  * In-game NFL 2K5 issues ~2,000-2,800 draws a frame and each set ~20 pieces
  * of state; most never change between draws (2026-10-02). Code that binds
@@ -491,7 +502,8 @@ static int gpu_bind_surface(void)
     for (i = 0; i < GPU_MAX_SURFACES; i++) {
         GpuSurface *s = &s_gpu11.surf[i];
         if (s->tex && s->guest == guest) {
-            if (s->w == w && s->h == h && s->pitch == s_gpu.pitch && s->scale == g_render_scale
+            if (s->w == w && s->h == h && s->pitch == s_gpu.pitch
+                    && s->scale == gpu_fit_scale(w + 2 * gpu_wide_ox(w, h), h)
                     && s->ox == gpu_wide_ox(w, h)) {
                 if (s->stale) {             /* the CPU drew into it since */
                     gpu_surface_upload(s);
@@ -518,7 +530,7 @@ static int gpu_bind_surface(void)
         uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
         D3D11_SUBRESOURCE_DATA sd;
         memset(&td, 0, sizeof td);
-        uint32_t sc = g_render_scale, ox = gpu_wide_ox(w, h);
+        uint32_t ox = gpu_wide_ox(w, h), sc = gpu_fit_scale(w + 2 * ox, h);
         td.Width = (w + 2 * ox) * sc; td.Height = h * sc; td.MipLevels = td.ArraySize = 1;
         td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_DEFAULT;

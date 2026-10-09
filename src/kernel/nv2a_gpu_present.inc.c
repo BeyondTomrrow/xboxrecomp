@@ -37,7 +37,7 @@ typedef struct {
     int mode;               /* VM_* */
     int res_w, res_h;       /* windowed client size / fullscreen mode */
     int aspect;             /* AR_* */
-    int scale;              /* internal resolution multiplier, 1..9 */
+    int scale;              /* internal resolution multiplier, 1..12 */
     int filter;             /* SF_* */
     int vsync;
     int brightness;         /* percent */
@@ -61,7 +61,8 @@ void xbox_PresentToast(const char *header, const char *line1, const char *line2,
 
 static void vs_load(void)
 {
-    FILE *f = fopen(k_vs_file, "r");
+    char vpath[MAX_PATH];
+    FILE *f = fopen(xbox_user_path(k_vs_file, vpath, sizeof vpath), "r");
     char line[256];
     if (!f)
         return;
@@ -86,7 +87,7 @@ static void vs_load(void)
     }
     fclose(f);
     if (s_vs.scale < 1) s_vs.scale = 1;
-    if (s_vs.scale > 9) s_vs.scale = 9;
+    if (s_vs.scale > 12) s_vs.scale = 12;   /* 12x = 8640x5760 */
     if (s_vs.filter < SF_BILINEAR || s_vs.filter > SF_ENHANCED) s_vs.filter = SF_ENHANCED;
     if (s_vs.crop < 0) s_vs.crop = 0;
     if (s_vs.crop > 40) s_vs.crop = 40;
@@ -96,7 +97,8 @@ static void vs_load(void)
 
 static void vs_save(void)
 {
-    FILE *f = fopen(k_vs_file, "w");
+    char vpath[MAX_PATH];
+    FILE *f = fopen(xbox_user_path(k_vs_file, vpath, sizeof vpath), "w");
     if (!f)
         return;
     fprintf(f, "; NFL 2K5 video settings (F1 in game edits these)\n"
@@ -104,7 +106,7 @@ static void vs_save(void)
                "mode = %d\nresolution = %dx%d\n"
                "; aspect: 0 fill the screen (a wider view when it is wider than 16:9), 1 stretch, 2 16:9 with bars, 3 21:9, 4 32:9, 5 zoom to fill\n"
                "aspect = %d\n"
-               "; scale: internal resolution = 720x480 times this (1..9; 9 = 6480x4320)\n"
+               "; scale: internal resolution = 720x480 times this (1..12; 12 = 8640x5760)\n"
                "scale = %d\n"
                "; filter: 0 bilinear, 1 sharp bilinear, 2 nearest, 3 enhanced\n"
                "filter = %d\nvsync = %d\nbrightness = %d\ngamma = %d\ncrop = %d\nshow_fps = %d\naniso = %d\n"
@@ -184,6 +186,8 @@ static struct {
     LARGE_INTEGER t0, freq;
     int frames, fps;
 } s_pr;
+
+#include "nv2a_gpu_perf.inc.c"
 
 static volatile LONG s_menu_open;
 volatile LONG g_xbox_input_blocked;      /* nfl2k5_input_hle.c: game input off while the menu is up */
@@ -277,7 +281,7 @@ static int pr_init(void)
     {   /* NFL2K5_RENDER_SCALE overrides the saved scale for this run only
          * (performance captures); the ini is left alone. */
         const char *e = getenv("NFL2K5_RENDER_SCALE");
-        if (e && atoi(e) >= 1 && atoi(e) <= 9) s_vs.scale = atoi(e);
+        if (e && atoi(e) >= 1 && atoi(e) <= 12) s_vs.scale = atoi(e);
     }
     g_render_scale = (uint32_t)s_vs.scale;
     g_aniso = (uint32_t)s_vs.aniso;
@@ -633,7 +637,7 @@ static void menu_change(int item, int dir)
         InterlockedExchange(&s_vs_dirty, 1);
         break;
     case MI_ASPECT: s_vs.aspect = (s_vs.aspect + 6 + dir) % 6; break;
-    case MI_SCALE:  s_vs.scale += dir; if (s_vs.scale < 1) s_vs.scale = 9; if (s_vs.scale > 9) s_vs.scale = 1; break;
+    case MI_SCALE:  s_vs.scale += dir; if (s_vs.scale < 1) s_vs.scale = 12; if (s_vs.scale > 12) s_vs.scale = 1; break;
     case MI_FILTER: s_vs.filter = (s_vs.filter + 4 + dir) % 4; break;
     case MI_VSYNC:  s_vs.vsync = !s_vs.vsync; break;
     case MI_BRIGHT: s_vs.brightness += 5 * dir; if (s_vs.brightness < 50) s_vs.brightness = 50;
@@ -704,7 +708,7 @@ int xbox_VideoSettingValues(int i)
     case MI_FILTER: return 4;
     case MI_RES:    res_build(); return s_nres ? s_nres : 1;
     case MI_ASPECT: return 6;
-    case MI_SCALE:  return 9;
+    case MI_SCALE:  return 12;
     case MI_VSYNC: case MI_FPS: case MI_WIDE: return 2;
     case MI_BRIGHT: case MI_GAMMA: return 21;
     case MI_CROP: case MI_ANISO: return 5;
@@ -967,13 +971,20 @@ static void pr_build_overlay(void)
         DeleteObject(panel); DeleteObject(bar); DeleteObject(selb);
     }
     if (s_vs.show_fps) {
-        char t[32];
-        int len = snprintf(t, sizeof t, "%d FPS", s_pr.fps);
+        char t[64], t2[128];
+        int len, len2;
+        perf_overlay_text(t, sizeof t, t2, sizeof t2, s_pr.fps);
+        len = (int)strlen(t); len2 = (int)strlen(t2);
         of = (HFONT)SelectObject(dc, fb);
         SetTextColor(dc, RGB(1, 1, 1));
         TextOutA(dc, 6, 6, t, len);
         SetTextColor(dc, RGB(120, 255, 120));
         TextOutA(dc, 4, 4, t, len);
+        SelectObject(dc, fs);
+        SetTextColor(dc, RGB(1, 1, 1));
+        TextOutA(dc, 6, 40, t2, len2);
+        SetTextColor(dc, RGB(200, 230, 200));
+        TextOutA(dc, 4, 38, t2, len2);
         SelectObject(dc, of);
     }
     GdiFlush();
@@ -1366,11 +1377,13 @@ static int pr_present(uint32_t guest)
     pr_present_shot();
     pr_record();
     pr_frame_limit();
+
     {
         LARGE_INTEGER a, b, fq;
         QueryPerformanceCounter(&a);
         IDXGISwapChain1_Present(s_pr.sc, s_vs.vsync ? 1u : 0u, 0);
         QueryPerformanceCounter(&b);
+        perf_on_present(s_vs.scale);
         QueryPerformanceFrequency(&fq);
         if ((b.QuadPart - a.QuadPart) * 1000 / fq.QuadPart > 200)
             fprintf(stderr, "  [PRESENT] Present took %lld ms (thread %lu)\n",

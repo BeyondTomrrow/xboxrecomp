@@ -672,3 +672,55 @@ translate:
 }
 
 #endif /* _WIN32 */
+
+/* ---- per-user data (2026-10-09) ----------------------------------------
+ *
+ * Settings, caches and logs a PC game writes belong in the user's profile,
+ * not beside the executable (which may be in Program Files). The title sets
+ * the folder once at startup (xbox_set_user_dir); xbox_user_path() maps a
+ * relative name into it, creating parent folders. When the folder is not
+ * set, names stay relative to the working directory (portable layout).
+ * A file that does not exist there yet but exists at the old relative
+ * location is copied over once, so existing settings carry across. */
+#ifdef _WIN32
+#include <windows.h>
+static char s_user_dir[MAX_PATH];
+
+void xbox_set_user_dir(const char *dir)
+{
+    if (dir && *dir) {
+        strncpy(s_user_dir, dir, sizeof s_user_dir - 1);
+        CreateDirectoryA(s_user_dir, NULL);
+    } else
+        s_user_dir[0] = 0;
+}
+
+const char *xbox_user_dir(void) { return s_user_dir; }
+
+static void user_make_parents(char *path)
+{
+    char *p;
+    for (p = path + 3; *p; p++)
+        if (*p == '\\' || *p == '/') {
+            char c = *p;
+            *p = 0;
+            CreateDirectoryA(path, NULL);
+            *p = c;
+        }
+}
+
+/* `rel` (e.g. "cache\\ps\\x.bin") -> out. Returns out. */
+char *xbox_user_path(const char *rel, char *out, size_t n)
+{
+    if (!s_user_dir[0]) {
+        snprintf(out, n, "%s", rel);
+        return out;
+    }
+    snprintf(out, n, "%s\\%s", s_user_dir, rel);
+    user_make_parents(out);
+    if (GetFileAttributesA(out) == INVALID_FILE_ATTRIBUTES && GetFileAttributesA(rel) != INVALID_FILE_ATTRIBUTES &&
+        !(GetFileAttributesA(rel) & FILE_ATTRIBUTE_DIRECTORY))
+        CopyFileA(rel, out, TRUE);                 /* one-time migration of an existing file */
+    return out;
+}
+#endif

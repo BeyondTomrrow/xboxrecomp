@@ -403,7 +403,10 @@ void xbox_kernel_init(void)
     g_log_cs_init = TRUE;
 
     /* Try to open log file, fall back to stderr */
-    g_log_file = fopen("xbox_kernel.log", "w");
+    {   /* in the per-user folder when the title set one (kernel_path.c) */
+        char lp[MAX_PATH];
+        g_log_file = fopen(xbox_user_path("xbox_kernel.log", lp, sizeof lp), "w");
+    }
 
     /* Set log level from environment variable if present */
     const char* log_env = getenv("XBOX_LOG_LEVEL");
