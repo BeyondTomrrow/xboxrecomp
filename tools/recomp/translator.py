@@ -32,8 +32,16 @@ def _merge_flag_states(states):
 
     CMP/TEST save their operands into function-local _fa/_fb/_fas/_fbs at
     runtime. A shared consumer can use whichever predecessor executed. Keep
-    operation and width equal because sign/parity handling depends on them;
-    arithmetic states still reconstruct operands and cannot use this merge.
+    the operation equal; arithmetic states still reconstruct operands and
+    cannot use this merge.
+
+    Widths may differ. The snapshot is already normalised to each
+    instruction's own width -- _fa/_fb masked, _fas/_fbs sign-extended -- so
+    ZF, CF, PF and the signed compares read the same from either edge. Only
+    SF/OF of a cmp need the width (the sign of the wrapped difference), so
+    the merged operands are tagged and _make_condition refuses those. NFL
+    2K5's match-loading check reaches one jne from `test ah, 41h` (after
+    fnstsw) and from `test eax, eax`; the fallback made it never taken.
     """
     if not states or any(not state or not state[0] for state in states):
         return None
@@ -42,13 +50,19 @@ def _merge_flag_states(states):
         return first
     if first[0] in ("cmp", "test") and len(first[1]) == 2:
         width = _operand_width(first[1][0]) or _operand_width(first[1][1])
+        mixed = False
         for kind, ops in states[1:]:
             if kind != first[0] or len(ops) != 2:
                 return None
             if (_operand_width(ops[0]) or _operand_width(ops[1])) != width:
-                return None
-        return first
+                mixed = True
+        return (first[0], MixedWidthOps(first[1])) if mixed else first
     return _merge_zero_flag(states)
+
+
+class MixedWidthOps(list):
+    """Operands of a cmp/test join whose predecessors differ in width."""
+    mixed_width = True
 
 
 def _merge_zero_flag(states):
@@ -641,7 +655,7 @@ class FunctionTranslator:
         last_setter = None
         for insn in instructions:
             m = insn.mnemonic
-            if m in ("adc", "sbb", "stc", "clc", "cmc"):
+            if m in ("adc", "sbb", "stc", "clc", "cmc", "rcl", "rcr"):
                 return True
             cc = None
             if m.startswith("j") and len(m) > 1:
@@ -817,6 +831,9 @@ class FunctionTranslator:
         # Ensure ebp tracked if function uses 'leave' (implicit ebp)
         if any(insn.mnemonic == "leave" for insn in instructions):
             used_regs.add("ebp")
+        # ...and pushal/popal, which save and restore it (lifter.py).
+        if any(insn.mnemonic in ("pushal", "pushad", "popal", "popad") for insn in instructions):
+            used_regs.add("ebp")
 
         # Guest control leaves the bottom of this function when its last
         # instruction neither returns, jumps, nor traps. A function the lifter
@@ -845,6 +862,9 @@ class FunctionTranslator:
             or (insn.is_cond_jump and insn.jump_target
                 and not (start <= insn.jump_target < end))
             for insn in instructions
+        ) or any(   # "push imm; ret", lifted as a tail jump (lifter.py)
+            a.mnemonic == "push" and b.is_ret and not b.operands
+            for a, b in zip(instructions, instructions[1:])
         )
         if has_tail_jump or fallthrough_target is not None:
             used_regs.add("ebp")
@@ -899,6 +919,10 @@ class FunctionTranslator:
         # Function signature
         lines.append(f"{ret_type} {name}({param_str})")
         lines.append(f"{{")
+        # A mod pack may have changed this function: then the interpreter runs
+        # the pack's bytes instead (src/interp/x86_interp.c). One flag test
+        # when no pack is active.
+        lines.append(f"    RECOMP_INTERP_GATE(0x{start:08X}u);")
 
         # Optional entry trace. Bring-up is mostly "which of these ten init
         # calls does it not come back from", and answering that by overriding
@@ -1736,9 +1760,12 @@ class BatchTranslator:
             for addr in sorted(unresolved):
                 popped = self.translator._stub_ret_bytes(addr)
                 note = (f"ret {popped}" if popped else "not detected")
+                # RECOMP_UNRESOLVED reports the first run of each stub: code
+                # the analysis missed does nothing here, and a missed function
+                # silently doing nothing stalled the coin toss (0x25E780).
                 stub_lines.append(
-                    f"void {unresolved[addr]}(void) {{ g_esp += {4 + popped}; "
-                    f"/* 0x{addr:08X}: {note} */ }}"
+                    f"void {unresolved[addr]}(void) {{ RECOMP_UNRESOLVED(0x{addr:08X}u); "
+                    f"g_esp += {4 + popped}; /* 0x{addr:08X}: {note} */ }}"
                 )
             stub_lines.append("")
 
@@ -1894,6 +1921,12 @@ class BatchTranslator:
             "size_t recomp_get_count(void)",
             "{",
             "    return g_recomp_table_size;",
+            "}",
+            "",
+            "/* Xbox address of the table entry at index (coverage reporting). */",
+            "uint32_t recomp_get_va_at(size_t index)",
+            "{",
+            "    return index < g_recomp_table_size ? g_recomp_table[index].xbox_va : 0;",
             "}",
             "",
             "/* Call all registered functions (for bulk testing) */",

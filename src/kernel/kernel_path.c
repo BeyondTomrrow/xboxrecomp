@@ -43,6 +43,19 @@ typedef struct {
 
 static const path_rule s_rules[] = {
     { "\\Device\\CdRom0\\",                   0, NULL,         NULL          },
+    /* The dashboard's custom soundtracks (XAPI reads MUSIC\ST.DB and
+     * MUSIC\<soundtrack>\<song>.WMA). The host generates them from the
+     * user's <GameRoot>/Music folders, so they live with the saves rather
+     * than in the game dir. Listed before Partition1 so it wins. */
+    { "\\Device\\Harddisk0\\Partition1\\TDATA\\FFFE0000\\MUSIC\\", 1, "\\Soundtracks", "/Soundtracks" },
+    /* Saved games (UDATA) and title data (TDATA) are the player's files, not
+     * the game's: they go under the save dir as ordinary folders. Under the
+     * game dir they landed in the disc folder -- for an install, the user's
+     * own copy of the disc. Existing ones are copied over on first start
+     * (xbox_path_init). No trailing separator, so opening the folder itself
+     * (for enumeration) is covered too. */
+    { "\\Device\\Harddisk0\\Partition1\\UDATA", 1, "\\UDATA",        "/UDATA"       },
+    { "\\Device\\Harddisk0\\Partition1\\TDATA", 1, "\\TDATA",        "/TDATA"       },
     { "\\Device\\Harddisk0\\Partition1\\",    0, NULL,         NULL          },
     /* The rest of the disk. Partition 0 is the whole raw device, 2 holds
      * system data, and 3-5 are the per-title caches behind X:, Y: and Z:.
@@ -266,6 +279,46 @@ static BOOL xbox_partition_device_path(const char *xbox_path, WCHAR *out, DWORD 
     return TRUE;
 }
 
+/* Copy a folder tree, keeping anything already at the destination. */
+static void copy_tree(const WCHAR *from, const WCHAR *to)
+{
+    WCHAR pat[MAX_PATH], a[MAX_PATH], b[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    CreateDirectoryW(to, NULL);
+    swprintf_s(pat, MAX_PATH, L"%s\\*", from);
+    h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE)
+        return;
+    do {
+        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L".."))
+            continue;
+        swprintf_s(a, MAX_PATH, L"%s\\%s", from, fd.cFileName);
+        swprintf_s(b, MAX_PATH, L"%s\\%s", to, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            copy_tree(a, b);
+        else
+            CopyFileW(a, b, TRUE);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+/* Saves used to live in the game dir's UDATA and TDATA. The first start
+ * with the save-dir mapping copies them across (the originals stay, as a
+ * backup), so nobody loses a franchise to the move. */
+static void migrate_save_area(const WCHAR *name)
+{
+    WCHAR from[MAX_PATH], to[MAX_PATH];
+    swprintf_s(from, MAX_PATH, L"%s\\%s", s_game_dir, name);
+    swprintf_s(to, MAX_PATH, L"%s\\%s", s_save_dir, name);
+    if (GetFileAttributesW(to) != INVALID_FILE_ATTRIBUTES)
+        return;                         /* already moved (or started fresh) */
+    if (GetFileAttributesW(from) == INVALID_FILE_ATTRIBUTES)
+        return;
+    copy_tree(from, to);
+    fprintf(stderr, "  [PATH] copied %S -> %S\n", from, to);
+}
+
 void xbox_path_init(const char* game_dir, const char* save_dir)
 {
     WCHAR save_base[MAX_PATH];
@@ -321,6 +374,8 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
             swprintf_s(dir, MAX_PATH, L"%s\\%s", s_save_dir, subs[i]);
             SHCreateDirectoryExW(NULL, dir, NULL);
         }
+        migrate_save_area(L"UDATA");
+        migrate_save_area(L"TDATA");
         swprintf_s(image, MAX_PATH, L"%s\\%s", s_save_dir, XBOX_DISK_IMAGE_NAME);
         xbox_write_partition_table(image);
         /* The other partition devices, sized to the same geometry the table
@@ -418,10 +473,23 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     return TRUE;
 
 translate:
-    fprintf(stderr, "  [PATH] %s\n", xbox_path);
-    fflush(stderr);
+    /* NFL 2K5 scans hundreds of optional cache index files during startup.
+     * Logging every miss changes scheduler timing more than the I/O itself.
+     * Keep ordinary paths visible and make the repetitive cache scan opt-in. */
+    /* The soundtrack database is re-read on every song-info call
+     * (~100 times a second in the menus); keep it out of the log too. */
+    static int file_trace = -1;     /* getenv per open was measurable: ST.DB is read ~100x/s */
+    if (file_trace < 0) file_trace = getenv("RECOMP_FILE_TRACE") != NULL;
+    if (file_trace || xbox_verbose() &&
+        (!(strstr(xbox_path, "Partition5") && strstr(xbox_path, ".uh")) &&
+         !strstr(xbox_path, "\\MUSIC\\ST.DB"))) {
+        fprintf(stderr, "  [PATH] %s\n", xbox_path);
+        fflush(stderr);
+    }
     {
         WCHAR remainder_wide[MAX_PATH];
+        while (*remainder == '\\' || *remainder == '/')
+            remainder++;
         MultiByteToWideChar(CP_ACP, 0, remainder, -1, remainder_wide, MAX_PATH);
 
         for (WCHAR* p = remainder_wide; *p; p++) {

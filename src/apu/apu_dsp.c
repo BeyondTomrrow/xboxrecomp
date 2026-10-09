@@ -27,6 +27,12 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <math.h>
+#include <windows.h>
+#ifdef _WIN32
+#include "apu_env.h"     /* cached getenv: debug switches are read per voice */
+#endif
 
 /* ── DSP command doorbell acknowledgement ────────────────────────────────
  *
@@ -138,6 +144,13 @@ void mcpx_apu_update_dsp_preference(MCPXAPUState *d)
     (void)d;
 }
 
+/* Broadcast mix controls (xbox_AudioSetGameGain / xbox_AudioGameLevel in
+ * apu_core.c): bed gain for everything but the commentary, and the smoothed
+ * level of the commentary (centre bin). */
+volatile float g_apu_bed_gain = 1.0f;
+volatile float g_apu_voice_gain = 1.0f;   /* commentary (centre bin) */
+volatile float g_apu_voice_level;
+
 void mcpx_apu_dsp_frame(MCPXAPUState *d,
                          float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
@@ -158,6 +171,45 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
     int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
 
     dsp_ack_frame(d);
+
+    {
+        double e = 0;
+        float r, a;
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+            e += (double)mixbins[2][i] * mixbins[2][i];
+        r = (float)sqrt(e / NUM_SAMPLES_PER_FRAME);
+        a = r > g_apu_voice_level ? 0.3f : 0.004f;    /* fast attack, slow release */
+        g_apu_voice_level += (r - g_apu_voice_level) * a;
+    }
+
+    {
+        /* RECOMP_APU_BIN_LOG=1: RMS of each mixbin every 2 s, to see which
+         * bins carry what (commentary, crowd, music, effect sends). */
+        static int on = -1;
+        static double e[NUM_MIXBINS];
+        static unsigned long n;
+        static DWORD last;
+        if (on < 0) on = getenv("RECOMP_APU_BIN_LOG") != NULL;
+        if (on) {
+            for (int b = 0; b < NUM_MIXBINS; b++)
+                for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+                    e[b] += (double)mixbins[b][i] * mixbins[b][i];
+            n += NUM_SAMPLES_PER_FRAME;
+            if (GetTickCount() - last > 2000) {
+                char line[512];
+                int len = 0;
+                for (int b = 0; b < NUM_MIXBINS; b++) {
+                    double r = sqrt(e[b] / (double)(n ? n : 1));
+                    if (r > 0.0005)
+                        len += snprintf(line + len, sizeof line - len, " %d:%.3f", b, r);
+                    e[b] = 0;
+                }
+                n = 0;
+                last = GetTickCount();
+                fprintf(stderr, "[BINS]%s\n", len ? line : " silent");
+            }
+        }
+    }
 
     if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
@@ -190,17 +242,41 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
              * mixdown that stops discarding audio. */
             float left, right;
             if (mcpx_apu_mixdown_all()) {
+                /* Bins 0-5 are the speaker feeds (FL, FR, C, LFE, SL, SR).
+                 * NFL 2K5 puts its commentary on the centre bin (2), crowd,
+                 * music and stings on 0/1: the centre goes to both sides at
+                 * -3 dB (it used to land in the left ear only), LFE to both
+                 * at half, and everything but the centre is scaled by the
+                 * "bed" gain so a broadcast theme can replace the game's
+                 * music under the announcers (xbox_AudioSetGameGain). */
+                float bed = g_apu_bed_gain, c = mixbins[2][i] * g_apu_voice_gain, lfe = mixbins[3][i] * 0.5f;
                 left = 0.0f;
                 right = 0.0f;
                 for (int b = 0; b < NUM_MIXBINS; ++b) {
+                    if (b == 2 || b == 3) continue;
                     if (b & 1) right += mixbins[b][i];
                     else       left  += mixbins[b][i];
                 }
+                left = (left + lfe) * bed + 0.7071f * c;
+                right = (right + lfe) * bed + 0.7071f * c;
             } else {
                 left = mixbins[0][i];
                 right = mixbins[1][i];
             }
-            /* Clamp to [-1, 1] range */
+            /* Summing every bin overdrives: soft-limit instead of hard
+             * clipping (x / (1 + |x|) above 0.5), which kept peaks at full
+             * scale in a match (2026-09-26). */
+            {
+                float *ch[2] = { &left, &right };
+                for (int c = 0; c < 2; c++) {
+                    float x = *ch[c], ax = x < 0 ? -x : x;
+                    if (ax > 0.5f) {
+                        float over = ax - 0.5f;
+                        ax = 0.5f + over / (1.0f + 2.0f * over);   /* approaches 1.0 */
+                        *ch[c] = x < 0 ? -ax : ax;
+                    }
+                }
+            }
             if (left > 1.0f) left = 1.0f;
             if (left < -1.0f) left = -1.0f;
             if (right > 1.0f) right = 1.0f;

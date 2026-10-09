@@ -292,6 +292,29 @@ class DisasmEngine:
 
         return resynced
 
+    def adopt_jump_table(self, tbl: int, entries: int) -> int:
+        """Register a table resync_jump_tables() skipped, once its arms are known.
+
+        resync_jump_tables() will not touch a table shorter than min_entries,
+        because on its own it cannot tell two pointer-looking dwords from code.
+        Function-end detection can: it knows which function dispatches through
+        the table, and that every arm lands inside that function's own bounds.
+        With that confirmation, treat the table exactly as a resynced one --
+        drop the instructions the sweep hallucinated over it and decode past it.
+
+        Returns the table's exclusive end.
+        """
+        end = tbl + entries * 4
+        if tbl in self.jump_tables:
+            return self.jump_tables[tbl]
+        for insn in self.get_instructions_in_range(tbl - 16, end):
+            if insn.end_address > tbl and insn.address < end:
+                del self.instructions[insn.address]
+        self._sorted_addrs = None
+        self.jump_tables[tbl] = end
+        self.decode_at(end)
+        return end
+
     def jump_table_entries(self, tbl: int) -> List[int]:
         """Code pointers held by a resynced jump table, or [] if unknown."""
         end = self.jump_tables.get(tbl)
@@ -507,6 +530,23 @@ class DisasmEngine:
             return False
         # ...through the register the load just filled.
         return jmp_ops[0].mem.base == dst.reg and jmp_ops[0].mem.index == 0
+
+    def follows_text_terminator(self, addr: int) -> bool:
+        """Does a UTF-16 string end right before `addr`?
+
+        Mod packs put strings in front of their code. The sweep decodes the
+        text as instructions and runs over the start of the real code
+        (SOFTDRINK 0x014D9C10, 2026-10-08), so a seed there is not a bad seed.
+        """
+        section = self.image.get_section_at_va(addr)
+        if section is None or not section.executable:
+            return False
+        data = self.image.get_section_data(section)
+        offset = addr - section.virtual_addr
+        if not data or offset < 6 or offset >= len(data):
+            return False
+        prev = data[offset - 6:offset]
+        return prev[1] == 0 and prev[3] == 0 and 0x20 <= prev[0] < 0x7F and             0x20 <= prev[2] < 0x7F and prev[4] == 0 and prev[5] == 0
 
     def probes_as_prologue(self, addr: int) -> bool:
         """

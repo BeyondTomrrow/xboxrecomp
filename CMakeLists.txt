@@ -20,6 +20,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 add_compile_definitions(
     WIN32_LEAN_AND_MEAN
     NOMINMAX
+    $<$<BOOL:${NFL2K5_ABI_CHECK}>:RECOMP_ABI_CHECK>
 )
 
 # Option to build examples

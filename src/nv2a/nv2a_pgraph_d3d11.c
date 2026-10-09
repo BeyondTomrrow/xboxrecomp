@@ -192,6 +192,18 @@ static struct {
     int initialized;
 } g_pg;
 
+/* Bounded, opt-in trace for comparing the first live draw packet with Xemu.
+ * This observes the packet after the common MMIO decoder has expanded it; it
+ * does not change scheduling, method handling, or rendering state. */
+static unsigned g_pg_trace_batch;
+static unsigned g_pg_trace_words;
+
+static int pgraph_draw_trace_enabled(void)
+{
+    const char *value = getenv("RECOMP_PGRAPH_DRAW_TRACE");
+    return value && value[0] && value[0] != '0';
+}
+
 /* ══════════════════════════════════════════════════════════════════════
  * Float/uint32 conversion
  * ══════════════════════════════════════════════════════════════════════ */
@@ -468,6 +480,10 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
         if (param == 0) {
             /* END: submit accumulated vertices */
             if (g_pg.in_draw) {
+                if (pgraph_draw_trace_enabled() && g_pg_trace_batch <= 4) {
+                    fprintf(stderr, "[PGRAPH-D3D11] draw #%u end: mode=%u inline-dwords=%u\n",
+                            g_pg_trace_batch, g_pg.draw_mode, g_pg.inline_count);
+                }
                 submit_draw();
                 g_pg.in_draw = 0;
             }
@@ -477,6 +493,12 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
             g_pg.draw_mode = param;
             g_pg.d3d_prim_type = nv2a_draw_mode_to_d3d(param);
             g_pg.inline_count = 0;
+            if (pgraph_draw_trace_enabled() && g_pg_trace_batch < 4) {
+                g_pg_trace_batch++;
+                g_pg_trace_words = 0;
+                fprintf(stderr, "[PGRAPH-D3D11] draw #%u begin: mode=%u\n",
+                        g_pg_trace_batch, param);
+            }
         }
         return 1;
 
@@ -484,6 +506,12 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
     case NV097_INLINE_ARRAY:
         if (g_pg.in_draw && g_pg.inline_count < MAX_INLINE_VERTS * INLINE_VERT_DWORDS) {
             g_pg.inline_data[g_pg.inline_count++] = param;
+            if (pgraph_draw_trace_enabled() && g_pg_trace_batch > 0 &&
+                g_pg_trace_batch <= 4 && g_pg_trace_words < 32) {
+                fprintf(stderr, "[PGRAPH-D3D11] draw #%u inline[%u]=%08X\n",
+                        g_pg_trace_batch, g_pg_trace_words, param);
+                g_pg_trace_words++;
+            }
         }
         return 1;
 

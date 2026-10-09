@@ -19,7 +19,7 @@ from typing import Dict, List, Optional, Tuple
 # the linker maps class those as CODE, and they are exactly the sections we
 # want disassembled.
 DATA_SECTION_NAMES = frozenset({
-    ".data", ".data1", ".rdata", ".idata", ".edata", ".reloc", ".tls",
+    ".data", ".data1", ".rdata", ".idata", ".edata", ".reloc", ".tls", ".string_",
 })
 
 

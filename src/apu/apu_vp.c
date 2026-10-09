@@ -21,6 +21,9 @@
 
 #include "apu_state.h"
 #include "fpconv.h"
+#ifdef _WIN32
+#include "apu_env.h"     /* cached getenv: debug switches are read per voice */
+#endif
 
 /* #define DEBUG_MCPX */
 
@@ -46,6 +49,15 @@ static const struct {
  * Notify status helper
  * ============================================================ */
 
+/* RECOMP_APU_SSL_LOG=1: stream packet bookkeeping -- each segment list the
+ * title hands a voice (SSL A/B) and each "done" the voice reports. */
+static int ssl_log_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_APU_SSL_LOG") != NULL;
+    return on;
+}
+
 static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
                               int status)
 {
@@ -56,6 +68,8 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
 
     stb_phys(address_space_memory, notify_offset, (uint8_t)status);
     stb_phys(address_space_memory, notify_offset - 1, 1);
+    if (ssl_log_on() && (notifier == MCPX_HW_NOTIFIER_SSLA_DONE || notifier == MCPX_HW_NOTIFIER_SSLA_DONE + 1))
+        fprintf(stderr, "[SSL] %03X done %c t=%lu\n", v, 'A' + notifier - MCPX_HW_NOTIFIER_SSLA_DONE, GetTickCount());
 
     qatomic_or(&d->regs[NV_PAPU_ISTS],
                NV_PAPU_ISTS_FEVINTSTS | NV_PAPU_ISTS_FENINTSTS);
@@ -66,11 +80,17 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
  * Filter helpers
  * ============================================================ */
 
+static void voice_resampler_reset(uint16_t v);
+static uint8_t s_adpcm_cbo_valid[MCPX_HW_MAX_VOICES];   /* defined with voice_get_samples */
+static uint8_t s_adpcm_shift[MCPX_HW_MAX_VOICES];
 static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
 {
     assert(v < MCPX_HW_MAX_VOICES);
     memset(&d->vp.filters[v].svf, 0, sizeof(d->vp.filters[v].svf));
     hrtf_filter_clear_history(&d->vp.filters[v].hrtf);
+    voice_resampler_reset(v);
+    s_adpcm_cbo_valid[v] = 0;
+    s_adpcm_shift[v] = 0;
     if (d->vp.filters[v].resampler) {
         src_reset(d->vp.filters[v].resampler);
     }
@@ -185,6 +205,20 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     d->regs[NV_PAPU_FEDECMETH] = method;
     d->regs[NV_PAPU_FEDECPARAM] = argument;
     unsigned int selected_handle, list;
+    {
+        /* What the title asks of the voice processor: the first few methods,
+         * then a running count (2026-09-24, NFL 2K5 speech never finishing). */
+        static unsigned long n;
+        n++;
+        static unsigned long ons, offs;
+        if (method == NV1BA0_PIO_VOICE_ON && ++ons <= 30)
+            fprintf(stderr, "[APU] VOICE_ON #%lu arg %08X (method #%lu)\n", ons, argument, n);
+        if (method == NV1BA0_PIO_VOICE_OFF && ++offs <= 30)
+            fprintf(stderr, "[APU] VOICE_OFF #%lu arg %08X (method #%lu)\n", offs, argument, n);
+        if (n <= 40 || (n % 5000) == 0)
+            fprintf(stderr, "[APU] method #%lu %04X arg %08X (voice on %lu off %lu)\n",
+                    n, method, argument, ons, offs);
+    }
 
     switch (method) {
     case NV1BA0_PIO_VOICE_LOCK:
@@ -273,6 +307,15 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         }
 
         voice_reset_filters(d, (uint16_t)selected_handle);
+        if (getenv("RECOMP_APU_VOICE_LOG"))
+            fprintf(stderr, "[VOICE] %03X ON ba %08X ebo %06X lbo %06X fmt %08X pitch %d list %d (t=%lu)\n",
+                    (unsigned)selected_handle,
+                    voice_get_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_CUR_PSL_START, NV_PAVS_VOICE_CUR_PSL_START_BA),
+                    voice_get_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_PAR_NEXT, NV_PAVS_VOICE_PAR_NEXT_EBO),
+                    voice_get_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_CUR_PSH_SAMPLE, NV_PAVS_VOICE_CUR_PSH_SAMPLE_LBO),
+                    voice_get_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFFu),
+                    (int16_t)voice_get_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_TAR_PITCH_LINK, NV_PAVS_VOICE_TAR_PITCH_LINK_PITCH),
+                    (int)list, GetTickCount());
         voice_set_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_PAR_STATE,
                        NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 1);
 
@@ -308,10 +351,35 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     }
 
     case NV1BA0_PIO_VOICE_OFF:
+        if (getenv("RECOMP_APU_VOICE_LOG"))
+            fprintf(stderr, "[VOICE] %03X OFF at cbo %06X (t=%lu)\n", argument & NV1BA0_PIO_VOICE_OFF_HANDLE,
+                    voice_get_mask(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_OFF_HANDLE), NV_PAVS_VOICE_PAR_OFFSET,
+                                   NV_PAVS_VOICE_PAR_OFFSET_CBO), GetTickCount());
         voice_off(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_OFF_HANDLE));
         break;
 
     case NV1BA0_PIO_VOICE_PAUSE:
+        if (getenv("RECOMP_APU_VOICE_LOG")) {
+            fprintf(stderr, "[VOICE] %03X %s at cbo %06X (t=%lu)\n", argument & NV1BA0_PIO_VOICE_PAUSE_HANDLE,
+                    (argument & NV1BA0_PIO_VOICE_PAUSE_ACTION) ? "pause" : "resume",
+                    voice_get_mask(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_PAUSE_HANDLE), NV_PAVS_VOICE_PAR_OFFSET,
+                                   NV_PAVS_VOICE_PAR_OFFSET_CBO), GetTickCount());
+            if (getenv("RECOMP_APU_PAUSE_STACK")) {
+                /* Guest return addresses on the calling thread's stack: who
+                 * pauses/resumes the voice (the FE method runs on the guest
+                 * thread that wrote the MMIO register). */
+                extern __declspec(thread) uint32_t g_esp;
+                extern ptrdiff_t xbox_GetMemoryOffset(void);
+                const uint8_t *gm = (const uint8_t *)xbox_GetMemoryOffset();
+                int shown = 0;
+                fprintf(stderr, "[VOICE]   stack:");
+                for (uint32_t k = 0; k < 96 && shown < 14; k++) {
+                    uint32_t w = *(const uint32_t *)(gm + g_esp + k * 4);
+                    if (w >= 0x00011000u && w < 0x00480000u) { fprintf(stderr, " %08X", w); shown++; }
+                }
+                fprintf(stderr, "\n");
+            }
+        }
         voice_set_mask(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_PAUSE_HANDLE),
                        NV_PAVS_VOICE_PAR_STATE, NV_PAVS_VOICE_PAR_STATE_PAUSED,
                        (argument & NV1BA0_PIO_VOICE_PAUSE_ACTION) != 0);
@@ -407,16 +475,28 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                        NV_PAVS_VOICE_CUR_PSL_START_BA, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_CFG_BUF_LBO:
+        if (getenv("RECOMP_APU_VOICE_LOG"))
+            fprintf(stderr, "[VOICE] %03X set lbo %06X cbo %06X (t=%lu)\n", (unsigned)d->regs[NV_PAPU_FECV], argument,
+                    voice_get_mask(d, (uint16_t)d->regs[NV_PAPU_FECV], NV_PAVS_VOICE_PAR_OFFSET, NV_PAVS_VOICE_PAR_OFFSET_CBO),
+                    GetTickCount());
         voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
                        NV_PAVS_VOICE_CUR_PSH_SAMPLE,
                        NV_PAVS_VOICE_CUR_PSH_SAMPLE_LBO, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_BUF_CBO:
+        if (getenv("RECOMP_APU_VOICE_LOG"))
+            fprintf(stderr, "[VOICE] %03X set cbo %06X (was %06X, t=%lu)\n", (unsigned)d->regs[NV_PAPU_FECV], argument,
+                    voice_get_mask(d, (uint16_t)d->regs[NV_PAPU_FECV], NV_PAVS_VOICE_PAR_OFFSET, NV_PAVS_VOICE_PAR_OFFSET_CBO),
+                    GetTickCount());
         voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
                        NV_PAVS_VOICE_PAR_OFFSET,
                        NV_PAVS_VOICE_PAR_OFFSET_CBO, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_CFG_BUF_EBO:
+        if (getenv("RECOMP_APU_VOICE_LOG"))
+            fprintf(stderr, "[VOICE] %03X set ebo %06X cbo %06X (t=%lu)\n", (unsigned)d->regs[NV_PAPU_FECV], argument,
+                    voice_get_mask(d, (uint16_t)d->regs[NV_PAPU_FECV], NV_PAVS_VOICE_PAR_OFFSET, NV_PAVS_VOICE_PAR_OFFSET_CBO),
+                    GetTickCount());
         voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
                        NV_PAVS_VOICE_PAR_NEXT,
                        NV_PAVS_VOICE_PAR_NEXT_EBO, argument);
@@ -451,6 +531,11 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         int ssl = 0;
         int current_voice = d->regs[NV_PAPU_FECV];
         assert(current_voice < MCPX_HW_MAX_VOICES);
+        if (ssl_log_on())
+            fprintf(stderr, "[SSL] %03X set A base %u count %u (playing %c seg %d) t=%lu\n", current_voice,
+                    (unsigned)GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE),
+                    (unsigned)GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_COUNT),
+                    'A' + d->vp.ssl[current_voice].ssl_index, d->vp.ssl[current_voice].ssl_seg, GetTickCount());
         d->vp.ssl[current_voice].base[ssl] =
             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
         d->vp.ssl[current_voice].count[ssl] =
@@ -461,6 +546,11 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         int ssl = 1;
         int current_voice = d->regs[NV_PAPU_FECV];
         assert(current_voice < MCPX_HW_MAX_VOICES);
+        if (ssl_log_on())
+            fprintf(stderr, "[SSL] %03X set B base %u count %u (playing %c seg %d) t=%lu\n", current_voice,
+                    (unsigned)GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE),
+                    (unsigned)GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_COUNT),
+                    'A' + d->vp.ssl[current_voice].ssl_index, d->vp.ssl[current_voice].ssl_seg, GetTickCount());
         d->vp.ssl[current_voice].base[ssl] =
             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
         d->vp.ssl[current_voice].count[ssl] =
@@ -727,6 +817,74 @@ static float voice_step_envelope(MCPXAPUState *d, uint16_t v, uint32_t reg_0,
  * Sample fetching from voice buffers
  * ============================================================ */
 
+/* ADPCM play position as the title sees it. DirectSound turns CBO into a
+ * byte offset and NFL 2K5's music streamer writes the next chunk there; the
+ * voice processor decodes whole 36-byte / 64-sample blocks, so on the
+ * console that offset lands on a block. Stepping CBO sample by sample left
+ * it mid-block, the streamer copied data 14-22 bytes off the block grid, and
+ * the menu music decoded as static (2026-09-26). The register shows the
+ * block; the sample within it is kept here while the register still holds
+ * the value we wrote (the title can move it at any time). */
+static uint32_t s_adpcm_cbo_reg[MCPX_HW_MAX_VOICES], s_adpcm_cbo_sub[MCPX_HW_MAX_VOICES];
+static uint8_t s_adpcm_cbo_valid[MCPX_HW_MAX_VOICES];
+
+/* ADPCM buffers whose data sits off the 36-byte block grid.
+ *
+ * NFL 2K5 streams its menu music into a looping ADPCM buffer per channel.
+ * In this port the game restarts that stream more often than on the console
+ * (timing), and each restart writes the song from the current write cursor,
+ * which is usually mid-block: the whole buffer then holds valid ADPCM at a
+ * constant byte shift (8, 22, ... measured 2026-09-26), and decoding it on
+ * the grid gives static. When a block header is invalid (step index > 88 or
+ * reserved byte != 0), find the shift at which the next 8 headers are all
+ * valid and decode at that shift until the grid itself is valid again. A
+ * random 8-block match is ~1e-23, so this never fires on good data. */
+static uint8_t s_adpcm_shift[MCPX_HW_MAX_VOICES];
+
+volatile int g_apu_mute_music;   /* xbox_AudioMuteGameMusic */
+
+static int adpcm_header_ok(uint32_t w)
+{
+    return ((w >> 16) & 0xFF) <= 88 && (w >> 24) == 0;
+}
+
+static uint32_t adpcm_word_at(MCPXAPUState *d, uint32_t ba, uint32_t buf_bytes, uint32_t off)
+{
+    return ldl_le_phys(address_space_memory,
+                       get_data_ptr(d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFF, ba + off % buf_bytes));
+}
+
+static void adpcm_realign(MCPXAPUState *d, uint32_t v, uint32_t ba, uint32_t buf_bytes, uint32_t block_index)
+{
+    uint32_t base = block_index * 36u, sh, k;
+    uint32_t old = s_adpcm_shift[v], best = old, best_score = 0;
+
+    /* A single random payload word has about a 1/736 chance of looking like
+     * an ADPCM header.  Accepting the current shift after one such word made
+     * the decoder stay on the wrong grid for a whole block whenever the
+     * title rewrote part of its circular music buffer.  Score a short local
+     * run instead.  Requiring the current block to be valid still lets us
+     * switch exactly at a boundary between differently aligned regions. */
+    for (sh = 0; sh < 36; sh++) {
+        uint32_t score = 0;
+        for (k = 0; k < 4; k++) {
+            if (!adpcm_header_ok(adpcm_word_at(d, ba, buf_bytes, base + k * 36u + sh)))
+                break;
+        }
+        score = k;
+        if (score > best_score || (score == best_score && sh == old)) {
+            best = sh;
+            best_score = score;
+        }
+    }
+    if (best_score) {
+        if (best != old && getenv("RECOMP_APU_VOICE_LOG"))
+            fprintf(stderr, "[VOICE] %03X ADPCM realigned: shift %u -> %u at block %u (score %u/4)\n",
+                    v, old, best, block_index, best_score);
+        s_adpcm_shift[v] = (uint8_t)best;
+    }
+}
+
 static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                        int num_samples_requested)
 {
@@ -825,6 +983,9 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
 
     bool adpcm =
         (container_size_index == NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_ADPCM);
+    if (adpcm && s_adpcm_cbo_valid[v] && cbo == s_adpcm_cbo_reg[v])
+        cbo += s_adpcm_cbo_sub[v];
+    bool end_pad = !stream && loop && lbo <= ebo && lbo + ADPCM_SAMPLES_PER_BLOCK > ebo;
 
     if (adpcm) {
         block_size = 36;
@@ -841,9 +1002,14 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
             unsigned int block_position = cbo % ADPCM_SAMPLES_PER_BLOCK;
             if (adpcm_block_index != (int)block_index) {
                 uint32_t linear_addr = block_index * (uint32_t)block_size;
+                if (!stream && samples_per_block == 1) {
+                    uint32_t buf_bytes = (ebo / ADPCM_SAMPLES_PER_BLOCK + 1) * 36u;
+                    adpcm_realign(d, v, ba, buf_bytes, block_index);
+                    linear_addr = (linear_addr + s_adpcm_shift[v]) % buf_bytes;
+                }
                 if (stream) {
                     hwaddr addr = segment_offset + linear_addr;
-                    memcpy(adpcm_block, &d->ram_ptr[addr & 0x03FFFFFF],
+                    memcpy(adpcm_block, apu_phys(addr),
                            block_size);
                 } else {
                     linear_addr += ba;
@@ -909,6 +1075,36 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         if (!stereo) {
             samples[sample_count][1] = samples[sample_count][0];
         }
+        /* The one-block end loop of a one-shot (LOOP, LBO = EBO - 63) is
+         * DirectSound's end padding: it holds the voice until the title
+         * stops it. NFL 2K5's 3D sound engine re-binds such voices and
+         * restores them to LBO, so some never stop, and an audible last
+         * block repeated forever was the in-game "train horn" drone
+         * (2026-10-02). Play the padding as silence. */
+        if (end_pad && cbo >= lbo) {
+            samples[sample_count][0] = 0.0f;
+            samples[sample_count][1] = 0.0f;
+        }
+    }
+
+    if (stream && getenv("RECOMP_APU_VOICE_LOG")) {
+        /* Stream voices: the segment being played and the loudest sample
+         * read from it, every 2 s -- silent data and a wrong address look
+         * the same from the speakers. */
+        static DWORD slog[MCPX_HW_MAX_VOICES];
+        static float speak[MCPX_HW_MAX_VOICES];
+        for (int i = 0; i < sample_count; i++) {
+            float a = fabsf(samples[i][0]);
+            if (a > speak[v]) speak[v] = a;
+        }
+        if (GetTickCount() - slog[v] > 2000) {
+            slog[v] = GetTickCount();
+            fprintf(stderr, "[STREAM] %03X ssl %d/%d seg %d/%d off %08X len %u cs %d ssize %d spb %d stereo %d peak %.4f first %08X\n",
+                    v, ssl_index, d->vp.ssl[v].count[ssl_index], ssl_seg, count, (uint32_t)segment_offset,
+                    (unsigned)seg_len, seg_cs, sample_size, seg_spb, stereo, speak[v],
+                    segment_offset ? ldl_le_phys(address_space_memory, segment_offset) : 0);
+            speak[v] = 0;
+        }
     }
 
     if (cbo >= ebo) {
@@ -934,6 +1130,21 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         }
     }
 
+    /* One-shot sounds loop a single padding block at the end of the buffer
+     * (LOOP set, LBO = EBO - 63); DirectSound stops the voice once CBO is
+     * past LBO. Reporting a block-aligned CBO there kept it at exactly LBO,
+     * so effects were never stopped and replayed their last block forever --
+     * the in-game "train horn" drone (2026-10-02). The block grid is only
+     * reported for the long looping buffers the music streamer writes into. */
+    if (adpcm && !(loop && lbo + ADPCM_SAMPLES_PER_BLOCK > ebo)) {
+        uint32_t sub = cbo % ADPCM_SAMPLES_PER_BLOCK;
+        s_adpcm_cbo_sub[v] = sub;
+        s_adpcm_cbo_reg[v] = cbo - sub;
+        s_adpcm_cbo_valid[v] = 1;
+        cbo -= sub;
+    } else {
+        s_adpcm_cbo_valid[v] = 0;
+    }
     voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_OFFSET,
                    NV_PAVS_VOICE_PAR_OFFSET_CBO, cbo);
     return sample_count;
@@ -946,26 +1157,83 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
  * resample. This gives us functional audio at the cost of quality.
  * ============================================================ */
 
+/* Per-voice resampler state. The VP plays each voice at its pitch
+ * (rate = output/source = 2^(-pitch/4096)); this used to be ignored and
+ * every voice was fetched 1:1 at 48 kHz, so 22/32/44.1 kHz material played
+ * at the wrong speed with hard steps between frames -- heard as static
+ * (2026-09-26). Cubic (Catmull-Rom) interpolation over a 4-sample history
+ * that persists across frames; source samples are pulled from the voice in
+ * small chunks into a FIFO. */
+#define RS_FIFO 256
+typedef struct {
+    float hist[4][2];
+    double pos;
+    float fifo[RS_FIFO][2];
+    int fifo_n, fifo_i;
+    bool ended;
+} VoiceResampler;
+static VoiceResampler s_rs[MCPX_HW_MAX_VOICES];
+
+static void voice_resampler_reset(uint16_t v)
+{
+    memset(&s_rs[v], 0, sizeof(s_rs[v]));
+    s_rs[v].pos = 1.0;
+}
+
 static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
                           int requested_num, float rate)
 {
-    /* Without libsamplerate, just fetch raw samples at native rate.
-     * Rate < 1.0 means we need more source samples than output samples.
-     * For initial functionality, just get the samples directly. */
-    int sample_count = 0;
-    while (sample_count < requested_num) {
-        int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
-                                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
-        if (!active) break;
+    VoiceResampler *r = &s_rs[v];
+    double step = (rate > 0.0f) ? 1.0 / (double)rate : 1.0;
+    if (step > 64.0) step = 64.0;
+    if (step < 1.0 / 64.0) step = 1.0 / 64.0;
 
-        int count = voice_get_samples(d, v, &samples[sample_count],
-                                      requested_num - sample_count);
-        if (count < 0) break;
-        if (count == 0) return -1;
-        sample_count += count;
+    for (int i = 0; i < requested_num; i++) {
+        while (r->pos >= 1.0) {
+            float in[2] = { 0.0f, 0.0f };
+            r->pos -= 1.0;
+            if (r->fifo_i >= r->fifo_n && !r->ended) {
+                int need = (int)((requested_num - i) * step) + 4;
+                if (need > RS_FIFO) need = RS_FIFO;
+                r->fifo_n = r->fifo_i = 0;
+                memset(r->fifo, 0, sizeof(r->fifo[0]) * need);
+                if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
+                    r->ended = true;
+                } else {
+                    int got = 0;
+                    while (got < need) {
+                        int c = voice_get_samples(d, v, &r->fifo[got], need - got);
+                        if (c <= 0) break;
+                        got += c;
+                        if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                                            NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE))
+                            break;
+                    }
+                    if (got == 0) r->ended = true;
+                    r->fifo_n = got;
+                }
+            }
+            if (r->fifo_i < r->fifo_n) {
+                in[0] = r->fifo[r->fifo_i][0];
+                in[1] = r->fifo[r->fifo_i][1];
+                r->fifo_i++;
+            }
+            memmove(r->hist[0], r->hist[1], sizeof(r->hist[0]) * 3);
+            r->hist[3][0] = in[0];
+            r->hist[3][1] = in[1];
+        }
+        float t = (float)r->pos, t2 = t * t, t3 = t2 * t;
+        for (int c = 0; c < 2; c++) {
+            float p0 = r->hist[0][c], p1 = r->hist[1][c];
+            float p2 = r->hist[2][c], p3 = r->hist[3][c];
+            samples[i][c] = 0.5f * ((2.0f * p1) + (-p0 + p2) * t +
+                                    (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t2 +
+                                    (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t3);
+        }
+        r->pos += step;
     }
-    (void)rate; /* Ignored until we add proper resampling */
-    return sample_count;
+    return requested_num;
 }
 
 /* ============================================================
@@ -1006,6 +1274,97 @@ static void voice_process(MCPXAPUState *d,
                                         NV_PAVS_VOICE_CFG_ENV0_EF_PITCHSCALE);
     float rate = 1.0f / powf(2.0f, (p + ps * 32 * ef_value) / 4096.0f);
     dbg->rate = rate;
+    {
+        /* RECOMP_APU_VOICE_LOG=1: each voice's pitch, rate and format, once
+         * per voice start and every 5 s. */
+        static int on = -1;
+        static DWORD last[MCPX_HW_MAX_VOICES];
+        static unsigned calls[MCPX_HW_MAX_VOICES];
+        extern unsigned long g_apu_vp_frames;
+        static unsigned long frames_at[MCPX_HW_MAX_VOICES];
+        if (on < 0) on = getenv("RECOMP_APU_VOICE_LOG") != NULL;
+        calls[v]++;
+        if (on && GetTickCount() - last[v] > 5000) {
+            uint32_t fmt = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFFu);
+            last[v] = GetTickCount();
+            fprintf(stderr, "[VOICE] %03X processed %u in %lu frames; pitch %d ps %d rate %.4f fmt %08X stream %u stereo %u ssize %u csize %u spb %u cbo %06X ebo %06X lbo %06X\n",
+                    v, calls[v], g_apu_vp_frames - frames_at[v], p, ps, rate, fmt, (fmt >> 24) & 1, (fmt >> 27) & 1, (fmt >> 28) & 3, (fmt >> 30) & 3,
+                    ((fmt >> 16) & 0x1F) + 1,
+                    voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET, NV_PAVS_VOICE_PAR_OFFSET_CBO),
+                    voice_get_mask(d, v, NV_PAVS_VOICE_PAR_NEXT, NV_PAVS_VOICE_PAR_NEXT_EBO),
+                    voice_get_mask(d, v, NV_PAVS_VOICE_CUR_PSH_SAMPLE, NV_PAVS_VOICE_CUR_PSH_SAMPLE_LBO));
+            {
+                /* Where the voice's samples live: base, first SGE page
+                 * addresses, and the contiguous high-water mark apu_phys
+                 * uses to pick low memory vs the physical window. */
+                extern uint32_t xbox_ContiguousAllocatedBytes(void);
+                uint32_t ba = voice_get_mask(d, v, NV_PAVS_VOICE_CUR_PSL_START, NV_PAVS_VOICE_CUR_PSL_START_BA);
+                uint32_t sge = d->regs[NV_PAPU_VPSGEADDR];
+                fprintf(stderr, "[VOICE] %03X ba %08X sge %08X pages %08X %08X %08X contig_hw %08X\n", v, ba, sge,
+                        ldl_le_phys(address_space_memory, sge + (ba / 4096) * 8),
+                        ldl_le_phys(address_space_memory, sge + (ba / 4096 + 1) * 8),
+                        ldl_le_phys(address_space_memory, sge + (ba / 4096 + 2) * 8),
+                        xbox_ContiguousAllocatedBytes());
+                if (((fmt >> 30) & 3) == 2) {
+                    /* ADPCM: how many of the buffer's blocks carry a valid
+                     * header (step index <= 88, reserved byte 0)? Garbage
+                     * in the buffer decodes as noise. */
+                    uint32_t ebo = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_NEXT, NV_PAVS_VOICE_PAR_NEXT_EBO);
+                    uint32_t blocks = (ebo + 1) / 64, ok = 0, b;
+                    for (b = 0; b < blocks; b++) {
+                        uint32_t w = ldl_le_phys(address_space_memory, get_data_ptr(sge, 0xFFFFFFFF, ba + b * 36));
+                        if (((w >> 16) & 0xFF) <= 88 && (w >> 24) == 0) ok++;
+                    }
+                    fprintf(stderr, "[VOICE] %03X adpcm blocks valid %u / %u\n", v, ok, blocks);
+                    if (ok < blocks) {
+                        /* The first invalid blocks, and where the bad run starts and ends. */
+                        uint32_t shown = 0, run_lo = 0xFFFFFFFFu, run_hi = 0;
+                        for (b = 0; b < blocks; b++) {
+                            hwaddr pa = get_data_ptr(sge, 0xFFFFFFFF, ba + b * 36);
+                            uint32_t w = ldl_le_phys(address_space_memory, pa);
+                            if (((w >> 16) & 0xFF) <= 88 && (w >> 24) == 0) continue;
+                            if (b < run_lo) run_lo = b;
+                            run_hi = b;
+                            if (shown++ < 2) {
+                                const uint8_t *q = apu_phys(pa);
+                                fprintf(stderr, "[VOICE] %03X bad block %u pa %08X: %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                                        v, b, (unsigned)pa, q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7],
+                                        q[8], q[9], q[10], q[11], q[12], q[13], q[14], q[15]);
+                            }
+                        }
+                        fprintf(stderr, "[VOICE] %03X bad blocks span %u..%u, cbo %06X\n", v, run_lo, run_hi,
+                                voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET, NV_PAVS_VOICE_PAR_OFFSET_CBO));
+                        {
+                            /* Which byte shift makes the buffer valid ADPCM? */
+                            uint32_t sh, best = 0, best_ok = 0;
+                            for (sh = 0; sh < 36; sh++) {
+                                uint32_t n = 0;
+                                for (b = 0; b + 1 < blocks; b++) {
+                                    uint32_t w2 = ldl_le_phys(address_space_memory, get_data_ptr(sge, 0xFFFFFFFF, ba + b * 36 + sh));
+                                    if (((w2 >> 16) & 0xFF) <= 88 && (w2 >> 24) == 0) n++;
+                                }
+                                if (n > best_ok) { best_ok = n; best = sh; }
+                            }
+                            fprintf(stderr, "[VOICE] %03X best shift %u (%u valid)\n", v, best, best_ok);
+                        }
+                    }
+                    {
+                        /* The voice's scatter-gather pages should run on
+                         * consecutively from the first; list any that don't. */
+                        uint32_t first = ldl_le_phys(address_space_memory, sge + (ba / 4096) * 8), pg;
+                        uint32_t npages = (ba % 4096 + blocks * 36 + 4095) / 4096;
+                        for (pg = 0; pg < npages; pg++) {
+                            uint32_t e = ldl_le_phys(address_space_memory, sge + (ba / 4096 + pg) * 8);
+                            if (e != first + pg * 4096)
+                                fprintf(stderr, "[VOICE] %03X sge page %u = %08X (expected %08X)\n", v, pg, e, first + pg * 4096);
+                        }
+                    }
+                }
+            }
+            calls[v] = 0;
+            frames_at[v] = g_apu_vp_frames;
+        }
+    }
 
     /* Step amplitude envelope */
     float ea_value = voice_step_envelope(
@@ -1089,8 +1448,52 @@ static void voice_process(MCPXAPUState *d,
         dbg->bin[i] = (uint8_t)bin[i];
         dbg->vol[i] = vol[i];
     }
+    {
+        /* RECOMP_APU_VOICE_LOG: where each voice goes (bin:gain), every 5 s. */
+        static DWORD last_route[MCPX_HW_MAX_VOICES];
+        if (getenv("RECOMP_APU_VOICE_LOG") && GetTickCount() - last_route[v] > 5000) {
+            char buf[256];
+            int len = 0;
+            last_route[v] = GetTickCount();
+            for (int i = 0; i < 8; i++)
+                if (attenuate(vol[i]) > 0.001f)
+                    len += snprintf(buf + len, sizeof buf - len, " %d:%.2f", bin[i], attenuate(vol[i]));
+            fprintf(stderr, "[ROUTE] t=%lu %03X ebo %06X csize %u rate %.3f ->%s\n", GetTickCount(), v,
+                    voice_get_mask(d, v, NV_PAVS_VOICE_PAR_NEXT, NV_PAVS_VOICE_PAR_NEXT_EBO),
+                    voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE),
+                    rate, len ? buf : " (silent)");
+        }
+    }
 
     if (voice_should_mute(v)) return;
+
+    /* A broadcast theme replaces the game's own music (menus and pregame):
+     * NFL 2K5 streams it on voices 0x44/0x45 (left/right), commentary and
+     * crowd on others (measured 2026-09-26, RECOMP_APU_VOICE_LOG). */
+    if (g_apu_mute_music && (v == 0x44 || v == 0x45)) return;
+    /* Its pregame cues (team cards etc.) come on pooled voices (0x50/0x51
+     * measured) that are later reused for effects, so they are told apart by
+     * routing: game music is a stereo pair, each half sent to one front
+     * speaker only (bin 0 or bin 1); commentary is centred, crowd and effects
+     * go to both sides. Exception: the stadium crowd beds are hard-panned
+     * pairs too, on 0x4A..0x4F from match load to the end (measured). */
+    if (g_apu_mute_music && v >= MCPX_HW_MAX_3D_VOICES && !(v >= 0x4A && v <= 0x4F)) {
+        int left = 0, right = 0, other = 0;
+        for (int i = 0; i < 8; i++) {
+            if (attenuate(vol[i]) <= 0.001f) continue;
+            if (bin[i] == 0) left = 1;
+            else if (bin[i] == 1) right = 1;
+            else other = 1;
+        }
+        if (!other && (left != right)) {
+            static DWORD last_log[MCPX_HW_MAX_VOICES];
+            if (getenv("RECOMP_APU_VOICE_LOG") && GetTickCount() - last_log[v] > 5000) {
+                last_log[v] = GetTickCount();
+                fprintf(stderr, "[ROUTE] t=%lu %03X muted (game music under a broadcast theme)\n", GetTickCount(), v);
+            }
+            return;
+        }
+    }
 
     /* Low-pass filter */
     int fmode = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_MISC,
@@ -1127,6 +1530,42 @@ static void voice_process(MCPXAPUState *d,
                                      NV_PAVS_VOICE_CFG_HRTF_TARGET_HANDLE);
         if (hrtf_handle != HRTF_NULL_HANDLE) {
             hrtf_filter_process(&d->vp.filters[v].hrtf, samples, samples);
+        }
+    }
+
+    /* RECOMP_APU_VOICE_DUMP=<dir>: each voice's output (left, at its largest
+     * bin gain) to <dir>\v<handle>.raw as records of {uint32 frame, int16[32]},
+     * to find which voice carries a sound in a recording. */
+    {
+        static int on = -1;
+        static char dir[260];
+        static FILE *f[MCPX_HW_MAX_VOICES];
+        extern unsigned long g_apu_vp_frames;
+        if (on < 0) {
+            const char *e = getenv("RECOMP_APU_VOICE_DUMP");
+            on = e && *e;
+            if (on) snprintf(dir, sizeof dir, "%s", e);
+        }
+        if (on && v < MCPX_HW_MAX_VOICES) {
+            if (!f[v]) {
+                char p[300];
+                snprintf(p, sizeof p, "%s\\v%03X.raw", dir, v);
+                f[v] = fopen(p, "wb");
+            }
+            if (f[v]) {
+                float g = 0.0f;
+                for (int b = 0; b < 8; b++) {
+                    float a = attenuate(vol[b]);
+                    if (a > g) g = a;
+                }
+                g *= ea_value;
+                uint32_t fr = (uint32_t)g_apu_vp_frames;
+                int16_t out[NUM_SAMPLES_PER_FRAME];
+                for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+                    out[i] = (int16_t)(clampf(g * samples[i][0], -1.0f, 1.0f) * 32767.0f);
+                fwrite(&fr, 4, 1, f[v]);
+                fwrite(out, 2, NUM_SAMPLES_PER_FRAME, f[v]);
+            }
         }
     }
 
@@ -1169,10 +1608,44 @@ static void voice_process(MCPXAPUState *d,
  * Simplified single-threaded version (no worker threads initially)
  * ============================================================ */
 
+unsigned long g_apu_vp_frames;   /* VP frames run (RECOMP_APU_VOICE_LOG) */
+
 void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
+    static unsigned long frames, processed, idle, last_ms;
+    frames++;
+    g_apu_vp_frames++;
+    {
+        unsigned long now = GetTickCount();
+        extern int xbox_verbose(void);
+        if (now - last_ms >= 5000 && xbox_verbose()) {
+            extern uint32_t xbox_ContiguousAllocatedBytes(void);
+            fprintf(stderr, "[APU] vp frames=%lu voices processed=%lu idle=%lu ISTS=%08X IEN=%08X"
+                    " FECTL=%08X FENADDR=%08X tops=%04X/%04X/%04X"
+                    " VPVADDR=%08X contig_hw=%08X\n", frames, processed, idle,
+                    (unsigned)d->regs[NV_PAPU_ISTS], (unsigned)d->regs[NV_PAPU_IEN],
+                    (unsigned)d->regs[NV_PAPU_FECTL], (unsigned)d->regs[NV_PAPU_FENADDR],
+                    (unsigned)d->regs[voice_list_regs[0].top], (unsigned)d->regs[voice_list_regs[1].top],
+                    (unsigned)d->regs[voice_list_regs[2].top], (unsigned)d->regs[NV_PAPU_VPVADDR],
+                    xbox_ContiguousAllocatedBytes());
+            /* The active voices and where each is playing (CBO), EBO end,
+             * paused bit -- speech that never advances shows up here. */
+            for (int l = 0; l < 3; l++) {
+                uint16_t v = (uint16_t)d->regs[voice_list_regs[l].top];
+                for (int k = 0; v != 0xFFFF && k < 24; k++) {
+                    fprintf(stderr, "[APU]   list%d voice %03X cbo=%06X ebo=%06X state=%08X\n", l, v,
+                            voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET, NV_PAVS_VOICE_PAR_OFFSET_CBO),
+                            voice_get_mask(d, v, NV_PAVS_VOICE_PAR_NEXT, NV_PAVS_VOICE_PAR_NEXT_EBO),
+                            voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE, 0xFFFFFFFFu));
+                    v = (uint16_t)voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
+                                                 NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+                }
+            }
+            last_ms = now;
+        }
+    }
 
     for (int list = 0; list < 3; list++) {
         hwaddr top, current, next;
@@ -1194,10 +1667,36 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
 
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
+                idle++;
                 fe_method(d, SE2FE_IDLE_VOICE, v);
             } else {
-                /* Process voice directly (single-threaded) */
-                voice_process(d, mixbins, d->vp.sample_buf, v, list);
+                /* DirectSound locks a voice (PIO VOICE_LOCK) while it reads
+                 * or rewrites the voice record directly (play cursor,
+                 * position, buffer). As on the console (and xemu), the VP
+                 * leaves a locked voice alone: wait for the unlock briefly,
+                 * else skip it this frame. Processing it anyway wrote stale
+                 * positions over the title's, and NFL 2K5's music streamer
+                 * restarted songs every 1-5 s (2026-10-01). */
+                static unsigned long lock_waits, lock_skips;
+                static DWORD lock_log;
+                bool skip = false;
+                if (is_voice_locked(d, v)) {
+                    int64_t until = qemu_clock_get_us(QEMU_CLOCK_REALTIME) + 3000;
+                    lock_waits++;
+                    while (is_voice_locked(d, v) && qemu_clock_get_us(QEMU_CLOCK_REALTIME) < until)
+                        qemu_cond_timedwait(&d->cond, &d->lock, 1);
+                    skip = is_voice_locked(d, v);
+                    if (skip) lock_skips++;
+                }
+                if (getenv("RECOMP_APU_VOICE_LOG") && GetTickCount() - lock_log > 5000) {
+                    lock_log = GetTickCount();
+                    fprintf(stderr, "[APU] voice locks: waited %lu, skipped %lu\n", lock_waits, lock_skips);
+                }
+                if (!skip) {
+                    /* Process voice directly (single-threaded) */
+                    processed++;
+                    voice_process(d, mixbins, d->vp.sample_buf, v, list);
+                }
             }
             d->regs[current] = d->regs[next];
         }

@@ -200,12 +200,25 @@ class FunctionDetector:
             i = bisect.bisect_right(starts, addr) - 1
             return not (i >= 0 and addr < bounds[i][1])
 
+        # A switch arm is never a function start, even when it sits right
+        # after a ret with a push as its first instruction. NFL 2K5's
+        # sub_000F3E90 dispatches through the 10-entry table at 0x000F3F78; its
+        # arm 0x000F3F2D ("push esi; call ...") was taken for a gap prologue,
+        # registered, and then clamped the switch's own range, so the arms past
+        # it lifted as failed RECOMP_ITAILs that skipped the pop edi/pop esi
+        # epilogue and corrupted the stack of everything above.
+        arms = set()
+        for tbl in list(self.engine.jump_tables):
+            arms.update(self.engine.jump_table_entries(tbl))
+
         added = False
         for insn in list(self.engine.instructions.values()):
             if not insn.is_ret:
                 continue
             nxt = insn.end_address
             if nxt in self._candidates or nxt in self.functions:
+                continue
+            if nxt in arms:
                 continue
             section = self.image.get_section_at_va(nxt)
             if section is None or not section.executable:
@@ -814,7 +827,11 @@ class FunctionDetector:
             target = insn.jump_target
             if target is None or target in self._alias_entries:
                 continue
-            if target in self._candidates or target in self.functions:
+            # A candidate that overlaps an already-built body can be omitted
+            # from self.functions.  It still needs an alias entry; treating
+            # the mere candidate record as sufficient left taken jcc edges
+            # calling an unresolved stub (NFL 2K5: 0x000B1470).
+            if target in self.functions:
                 continue
 
             i = bisect.bisect_right(starts, insn.address) - 1
@@ -828,7 +845,18 @@ class FunctionDetector:
 
             j = bisect.bisect_right(starts, target) - 1
             if j >= 0 and bodies[j][0] <= target < bodies[j][1]:
-                continue                    # inside a function: handled above
+                # The unconditional-tail pass above creates an alias when a
+                # jmp enters another function, but it deliberately skips jcc.
+                # Conditional branches can have the same shared-tail shape.
+                # Leaving these targets unregistered makes the translator
+                # emit a callable stub for the taken edge; that stub returns
+                # immediately instead of executing the shared epilogue.  In
+                # NFL 2K5 this affected, among others, the loop edge at
+                # 0x000B1470 and the false-return block at 0x0028940C.
+                if target not in self._alias_entries:
+                    self._alias_entries[target] = bodies[j][1]
+                    added = True
+                continue
 
             section = self.image.get_section_at_va(target)
             if section is None or not section.executable:
@@ -879,6 +907,30 @@ class FunctionDetector:
         callable. The alternative -- a stub that returns immediately -- silently
         skips the epilogue and leaks the caller's frame.
         """
+        # An alias that runs only from its entry to the function's end can
+        # jump back to an earlier label of that function (a loop whose tail is
+        # also entered from outside, SOFTDRINK 0x00372D9C -> 0x00372D75). That
+        # label needs an alias of its own or the edge calls an empty stub.
+        # Targets are searched only inside the same parent body.
+        starts_sorted = sorted(self.functions)
+        work = list(self._alias_entries.items())
+        while work:
+            a_addr, a_end = work.pop()
+            for insn in self.engine.get_instructions_in_range(a_addr, a_end) or []:
+                if not (insn.is_cond_jump or getattr(insn, "is_jump", False) or insn.mnemonic == "jmp"):
+                    continue
+                t = insn.jump_target
+                if t is None or a_addr <= t < a_end or t in self._alias_entries or t in self.functions:
+                    continue
+                k = bisect.bisect_right(starts_sorted, a_addr) - 1
+                if k < 0:
+                    continue
+                p_start = starts_sorted[k]
+                p_end = self.functions[p_start].end
+                if p_start <= t < p_end and t < a_addr:
+                    self._alias_entries[t] = a_end
+                    work.append((t, a_end))
+
         for addr, end in sorted(self._alias_entries.items()):
             if addr in self.functions:
                 continue
@@ -1011,6 +1063,16 @@ class FunctionDetector:
                 continue
 
             insn = self.engine.get_instruction(addr)
+            if insn is None and addr <= max_target:
+                # An address that must be inside the function (a branch
+                # target or switch arm lies at or beyond it) that the sweep
+                # stepped over out of phase. NFL 2K5's sub_001EC830 is a lone
+                # `jmp [edx*4+0x1EC8BC]` whose 13 setter arms follow it; the
+                # sweep had decoded 0x1EC831.. instead, so the function ended
+                # on its dispatch and every arm was an unresolved ITAIL --
+                # the game died on the first kick return. Decode here.
+                self.engine.decode_at(addr)
+                insn = self.engine.get_instruction(addr)
             if insn is None:
                 break
 
@@ -1042,6 +1104,21 @@ class FunctionDetector:
             # dispatch itself, dropping every case and the shared epilogue --
             # MSVC's memcpy loses its "pop edi / pop esi", so every caller is
             # left with those registers clobbered.
+            #
+            # A table shorter than resync_jump_tables()' minimum was never
+            # resynced, so it has no known entries -- and the function then
+            # ended on its own dispatch. NFL 2K5's device pump sub_0004A790
+            # (`movzx ecx, byte [eax+idx]; jmp [ecx*4+0x4A7BC]`, two arms, the
+            # table parked after the final `ret`) and memcpy's tail-copy
+            # dispatch both lost every arm this way: the lifter saw targets
+            # outside the function, emitted RECOMP_ITAIL, the lookup failed,
+            # and the case silently acted as a bare `ret`. Read such a table
+            # here instead, bounded to this function's own range, and adopt it.
+            if (insn.jump_table is not None
+                    and insn.jump_table not in self.engine.jump_tables):
+                arms = self._local_table_arms(insn.jump_table, start, upper)
+                if len(arms) >= 2:
+                    self.engine.adopt_jump_table(insn.jump_table, len(arms))
             if insn.jump_table is not None:
                 for target in self.engine.jump_table_entries(insn.jump_table):
                     if start <= target < upper and target > max_target:
@@ -1080,6 +1157,23 @@ class FunctionDetector:
             addr = insn.end_address
 
         return max_addr
+
+    def _local_table_arms(self, tbl: int, start: int, upper: int,
+                          max_entries: int = 64) -> List[int]:
+        """Leading entries of the table at `tbl` that land inside [start, upper).
+
+        The table must itself sit inside the function's bounds (MSVC parks it
+        in the body), and it ends at the first entry that points anywhere else.
+        """
+        if not (start <= tbl < upper):
+            return []
+        arms = []
+        for i in range(max_entries):
+            target = self.engine.image.read_u32_at_va(tbl + i * 4)
+            if target is None or not (start <= target < upper):
+                break
+            arms.append(target)
+        return arms
 
     def _table_after(self, addr: int, upper: int) -> Optional[int]:
         """End of an embedded jump table starting at or just after `addr`.

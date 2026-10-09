@@ -10,5 +10,5 @@ target_include_directories(xbox_video PUBLIC
 )
 target_link_libraries(xbox_video PUBLIC xbox_d3d8)
 if(WIN32)
-    target_link_libraries(xbox_video PUBLIC mfplat mfreadwrite mfuuid mf ole32)
+    target_link_libraries(xbox_video PUBLIC mfplat mfreadwrite mfuuid mf ole32 imm32)
 endif()

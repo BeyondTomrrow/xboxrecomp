@@ -756,6 +756,18 @@ class XBEParser:
                     sec.name = self._read_string(name_off, 32)
             sections.append(sec)
 
+        # A mod pack that grew the header (SizeOfHeaders past the retail
+        # 0xCC4) keeps code in the new space; SOFTDRINK calls 0x00010A10 and
+        # 0x00010B40 there. Describe it as a section so the converter sees it.
+        headers_size = self._read_u32(0x0108)
+        if 0xCC4 < headers_size <= 0x1000 and sections:
+            sections.append(XBESectionHeader(
+                flags=0x6, virtual_addr=base + 0xA00, virtual_size=headers_size - 0xA00,
+                raw_addr=0xA00, raw_size=headers_size - 0xA00, section_name_addr=0,
+                section_name_refcount=0, head_shared_page_refcount_addr=0,
+                tail_shared_page_refcount_addr=0, section_digest=bytes(20),
+                name=".HDRCODE"))
+
         return sections
 
     def _parse_certificate(self, header: XBEHeader) -> XBECertificate:

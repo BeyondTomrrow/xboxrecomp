@@ -43,12 +43,13 @@ static HWND vp_create_window(void)
     wc.lpfnWndProc   = vp_wndproc;
     wc.hInstance     = GetModuleHandleA(NULL);
     wc.hCursor       = LoadCursorA(NULL, IDC_ARROW);
-    wc.lpszClassName = "XboxRecompVideo";
+    wc.hIcon         = LoadIconA(GetModuleHandleA(NULL), MAKEINTRESOURCEA(1));
+    wc.lpszClassName = "ESPN NFL 2K5 Video";
     RegisterClassA(&wc);
 
     r.left = 0; r.top = 0; r.right = VP_WINDOW_W; r.bottom = VP_WINDOW_H;
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-    return CreateWindowExA(0, "XboxRecompVideo", "Xbox Recomp - Video",
+    return CreateWindowExA(0, "ESPN NFL 2K5 Video", "ESPN NFL 2K5",
                            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                            CW_USEDEFAULT, CW_USEDEFAULT,
                            r.right - r.left, r.bottom - r.top,

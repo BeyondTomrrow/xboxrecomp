@@ -532,6 +532,13 @@ VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
     }
 }
 
+int xbox_RtlCriticalSectionOwnedByCurrentThread(PRTL_CRITICAL_SECTION CriticalSection)
+{
+    CRITICAL_SECTION *cs = xbox_cs_shadow(CriticalSection);
+
+    return cs && cs->OwningThread == (HANDLE)(uintptr_t)GetCurrentThreadId();
+}
+
 VOID __stdcall xbox_RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
     /* Creating the shadow here is not required -- Enter does it -- but doing

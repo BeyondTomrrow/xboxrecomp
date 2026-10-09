@@ -393,7 +393,15 @@ typedef VOID (__stdcall *PXBOX_SYSTEM_ROUTINE)(PVOID StartContext);
  * MmClaimGpuInstanceMemory reports GPU instance memory at its top. Shared so
  * the layout and the bridges cannot disagree about where it is. */
 #define XBOX_CONTIG_BASE 0x80000000u
-#define XBOX_CONTIG_SIZE (64u * 1024u * 1024u)
+/* Physical addresses of low memory (image, data, heap) carry this bit, so
+ * they cannot be mistaken for contiguous-window offsets (see
+ * xbox_MmGetPhysicalAddress). Hardware models strip it. */
+#define XBOX_PHYS_LOW_TAG 0x40000000u
+/* 64 MB on a retail console. A 128 MB (devkit) run -- SOFTDRINK 2K28's K128 mode
+ * asks for a 64 MB contiguous block and loads its expanded assets there --
+ * needs the window to cover all of that RAM (xbox_SetTotalRam sets it). */
+extern uint32_t g_xbox_contig_size;
+#define XBOX_CONTIG_SIZE (g_xbox_contig_size)
 
 /* Default GPU instance size, used when a caller asks to claim everything. */
 #define XBOX_GPU_INSTANCE_DEFAULT (128u * 1024u)
@@ -508,6 +516,7 @@ ULONG_PTR xbox_resolve_ordinal(ULONG ordinal);
 
 /* Kernel bridge (kernel_bridge.c) - resolve kernel thunks in Xbox memory */
 void xbox_kernel_bridge_init(void);
+void xbox_kernel_bridge_shutdown(void);
 
 /**
  * Per-title kernel ordinal remap.
@@ -591,6 +600,10 @@ void xbox_SetCrtLockTable(uint32_t table_va, uint32_t count);
 VOID    __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection);
 VOID    __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSection);
 VOID    __stdcall xbox_RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION CriticalSection);
+/* The scheduler may only interrupt a guest thread after it has dropped the
+ * frontend work-queue lock.  This queries the bridge-owned Win32 shadow; it
+ * deliberately does not read or alter the Xbox-visible lock object. */
+int     xbox_RtlCriticalSectionOwnedByCurrentThread(PRTL_CRITICAL_SECTION CriticalSection);
 
 ULONG   __stdcall xbox_RtlNtStatusToDosError(NTSTATUS Status);
 
@@ -742,6 +755,7 @@ NTSTATUS __stdcall xbox_NtWaitForSingleObjectEx(HANDLE Handle, KPROCESSOR_MODE W
 NTSTATUS __stdcall xbox_NtWaitForMultipleObjectsEx(ULONG Count, HANDLE Handles[], ULONG WaitType, BOOLEAN Alertable, PLARGE_INTEGER Timeout);
 NTSTATUS __stdcall xbox_NtSuspendThread(HANDLE ThreadHandle, PULONG PreviousSuspendCount);
 NTSTATUS __stdcall xbox_NtResumeThread(HANDLE ThreadHandle, PULONG PreviousSuspendCount);
+void xbox_thread_safe_point(void);
 NTSTATUS __stdcall xbox_NtClearEvent(HANDLE EventHandle);
 NTSTATUS __stdcall xbox_NtCreateMutant(PHANDLE MutantHandle, PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, BOOLEAN InitialOwner);
 NTSTATUS __stdcall xbox_NtReleaseMutant(HANDLE MutantHandle, PLONG PreviousCount);
@@ -758,6 +772,15 @@ VOID     __stdcall xbox_KeInitializeTimerEx(PXBOX_KTIMER Timer, XBOX_TIMER_TYPE 
 VOID     __stdcall xbox_KeInitializeDpc(PXBOX_KDPC Dpc, PKDEFERRED_ROUTINE DeferredRoutine, PVOID DeferredContext);
 BOOLEAN  __stdcall xbox_KeInsertQueueDpc(PXBOX_KDPC Dpc, PVOID SystemArgument1, PVOID SystemArgument2);
 BOOLEAN  __stdcall xbox_KeRemoveQueueDpc(PXBOX_KDPC Dpc);
+/* Drains bridge-owned guest DPC records on a recompiled guest thread. */
+void xbox_bridge_drain_guest_dpcs(void);
+void xbox_bridge_signal_worker_completion(void);
+void xbox_bridge_wait_worker_completion(DWORD timeout_ms);
+void xbox_bridge_service_scheduler_now(void);
+void xbox_bridge_note_scheduler_ready(void);
+void xbox_bridge_drive_scheduler_until(uint32_t target_count, DWORD timeout_ms);
+int xbox_bridge_begin_title_tick(DWORD timeout_ms);
+void xbox_bridge_end_title_tick(void);
 
 BOOLEAN  __stdcall xbox_KeSynchronizeExecution(PXBOX_KINTERRUPT Interrupt, PVOID SynchronizeRoutine, PVOID SynchronizeContext);
 
@@ -1073,5 +1096,15 @@ void xbox_log(int level, const char* subsystem, const char* fmt, ...);
 #ifdef __cplusplus
 }
 #endif
+
+/* Guest code runs one host thread at a time; host blocking calls in the
+ * kernel layer release that lock. See xbox_ggl.h. */
+#include "xbox_ggl.h"
+
+/* RECOMP_VERBOSE=1: the per-frame and periodic bring-up logging (file
+ * reads, draws, kernel summaries, voice lists). Off for normal play: those
+ * lines -- hundreds a second -- were written and flushed on the game
+ * thread (kernel_bridge.c). */
+int xbox_verbose(void);
 
 #endif /* XBOX_KERNEL_H */

@@ -10,7 +10,9 @@ set(KERNEL_SOURCES
     kernel_rtl.c
     kernel_memory.c
     kernel_file.c
+    kernel_overlay.c
     kernel_thread.c
+    xbox_ggl.c
     kernel_sync.c
     kernel_hal.c
     kernel_xbox.c
@@ -48,10 +50,21 @@ else()
 endif()
 
 if(MSVC)
-    target_compile_options(xbox_kernel PRIVATE /W4 /WX- /O2 /GS- /Gy)
+    # /Zi: private symbols, so profiles and crash reports name static
+    # functions instead of the nearest public one.
+    target_compile_options(xbox_kernel PRIVATE /W4 /WX- /O2 /GS- /Gy /Zi /FS)
     target_compile_definitions(xbox_kernel PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(xbox_kernel PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
 endif()
 
 target_compile_definitions(xbox_kernel PRIVATE $<$<CONFIG:Debug>:_DEBUG>)
+
+# PUBLIC: icall_feedback.c's g_icall_seen array and the dump/init functions
+# are compiled under this guard. Anything linking xbox_kernel (the generated
+# recompiled code included) reads/writes g_icall_seen through the
+# RECOMP_ICALL_OBSERVE macro in recomp_icall_feedback.h, so the define has to
+# be visible on both sides of that link, not just inside this library.
+# Matches config/game.cmake, which defines the same macro for the NFL2K5
+# target itself.
+target_compile_definitions(xbox_kernel PUBLIC RECOMP_ICALL_FEEDBACK)

@@ -23,6 +23,9 @@
 #include "apu.h"
 #include "apu_xaudio2.h"
 #include "fpconv.h"
+#ifdef _WIN32
+#include "apu_env.h"     /* cached getenv: debug switches are read per voice */
+#endif
 
 /* ============================================================
  * Globals
@@ -58,6 +61,20 @@ void mcpx_debug_end_frame(void) {}
  * IRQ handling (stubbed - no PCI bus in standalone)
  * ============================================================ */
 
+/* The APU's interrupt line, as the kernel sees it (kernel_bridge.c raises
+ * the title's connected ISR while it is set). The title's DirectSound ISR
+ * reads NV_PAPU_ISTS and acknowledges by writing it, which comes back through
+ * the register write path to update_irq and drops the line. Before this the
+ * line went nowhere, so DirectSound never learned that a voice had stopped or
+ * a stream packet had played -- NFL 2K5 waited forever on pregame speech
+ * (2026-09-24). */
+static volatile LONG g_apu_irq_line;
+int mcpx_apu_irq_line(void) { return g_apu_irq_line != 0; }
+/* Set by the host (kernel bridge): wakes the thread that delivers the line.
+ * Polling it every 10 ms left the front end trapped 20-37 ms each time a
+ * voice went idle (2026-10-01). */
+void (*g_apu_irq_wake)(void);
+
 static void update_irq(MCPXAPUState *d)
 {
     if (d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
@@ -69,10 +86,11 @@ static void update_irq(MCPXAPUState *d)
         qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_GINTSTS);
         /* In standalone mode we don't raise a PCI IRQ; the game's kernel
          * stub will poll ISTS directly or we'll signal via a flag. */
-        pci_irq_assert(PCI_DEVICE(d));
+        if (InterlockedExchange(&g_apu_irq_line, 1) == 0 && g_apu_irq_wake)
+            g_apu_irq_wake();   /* run the title's ISR now, not at the next poll */
     } else {
         qatomic_and(&d->regs[NV_PAPU_ISTS], ~NV_PAPU_ISTS_GINTSTS);
-        pci_irq_deassert(PCI_DEVICE(d));
+        InterlockedExchange(&g_apu_irq_line, 0);
     }
 }
 
@@ -268,43 +286,84 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
             g_waveout.frames_written);
 }
 
+/* Game audio gain, 0..1 (xbox_AudioSetGameGain): lets a broadcast theme
+ * play over a ducked game mix (src/nfl2k5_presentation.cpp). */
+static volatile float g_game_gain = 1.0f;
+/* Smoothed level (RMS, 0..1 of full scale) of what the game plays, so a
+ * broadcast theme can dip under the announcers (xbox_AudioGameLevel). */
+static volatile float g_game_level;
+/* The broadcast mix acts inside the mixdown (apu_dsp.c): the gain scales the
+ * game's music/crowd bed but not the commentary, and the level reported is
+ * the commentary's, so a theme dips only under the announcers. */
+extern volatile float g_apu_bed_gain, g_apu_voice_level;
+extern volatile int g_apu_mute_music;
+extern volatile float g_apu_voice_gain;
+void xbox_AudioSetCommentaryGain(float gain) { g_apu_voice_gain = gain < 0.0f ? 0.0f : gain > 1.0f ? 1.0f : gain; }
+void xbox_AudioMuteGameMusic(int mute) { g_apu_mute_music = mute; }
+float xbox_AudioGameLevel(void) { return g_apu_voice_level; }
+void xbox_AudioSetGameGain(float gain)
+{
+    g_apu_bed_gain = gain < 0.0f ? 0.0f : gain > 1.0f ? 1.0f : gain;
+}
+
 void mcpx_apu_monitor_frame(MCPXAPUState *d)
 {
     if ((d->ep_frame_div + 1) % 8) {
         return;
     }
 
-    /* XAudio2 path: render and submit a buffer */
+    /* XAudio2 path. monitor.frame_buf holds this frame's 256 samples: the
+     * EP output mcpx_apu_dsp_frame wrote for the eight VP sub-frames (the
+     * game's own mixed audio). This used to clear the buffer first and play
+     * only the host-side test tone and software mixer, so every sample the
+     * title's DirectSound produced was thrown away, and it submitted a
+     * 1024-sample buffer per 256-sample frame (2026-09-26). Now: the APU
+     * output plus the software mixer on top, gathered into XAudio2-sized
+     * buffers. */
     if (xa2_is_active()) {
+        static int16_t acc[1024][2];
+        static int acc_n;
         int buf_size = xa2_get_buffer_size();
-        int16_t xa2_tmp[1024][2];  /* matches XA2_BUF_SAMPLES max */
-        int remaining = buf_size;
-        int out_offset = 0;
+        int i;
 
-        while (remaining > 0) {
-            int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
-            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
-
-            if (g_test_tone.active && !g_audio_muted) {
-                for (int i = 0; i < chunk; i++) {
-                    int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
-                    d->monitor.frame_buf[i][0] = s;
-                    d->monitor.frame_buf[i][1] = s;
-                    g_test_tone.phase += g_test_tone.phase_inc;
-                    if (g_test_tone.phase >= 2.0 * M_PI)
-                        g_test_tone.phase -= 2.0 * M_PI;
-                }
+        if (buf_size > 1024) buf_size = 1024;
+        if (g_test_tone.active && !g_audio_muted) {
+            for (i = 0; i < MIXER_FRAME_SAMPLES; i++) {
+                int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
+                d->monitor.frame_buf[i][0] = s;
+                d->monitor.frame_buf[i][1] = s;
+                g_test_tone.phase += g_test_tone.phase_inc;
+                if (g_test_tone.phase >= 2.0 * M_PI)
+                    g_test_tone.phase -= 2.0 * M_PI;
             }
-
-            if (!g_audio_muted)
-                mixer_render(d->monitor.frame_buf, chunk);
-
-            memcpy(xa2_tmp + out_offset, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
-            out_offset += chunk;
-            remaining -= chunk;
         }
-
-        xa2_submit_samples((const int16_t *)xa2_tmp, buf_size);
+        if (!g_audio_muted)
+            mixer_render(d->monitor.frame_buf, MIXER_FRAME_SAMPLES);
+        else
+            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+        {
+            double e = 0;
+            float rms, a;
+            for (i = 0; i < MIXER_FRAME_SAMPLES; i++) {
+                double l = d->monitor.frame_buf[i][0], r = d->monitor.frame_buf[i][1];
+                e += l * l + r * r;
+            }
+            rms = (float)(sqrt(e / (2.0 * MIXER_FRAME_SAMPLES)) / 32768.0);
+            a = rms > g_game_level ? 0.5f : 0.02f;     /* fast attack, slow release */
+            g_game_level += (rms - g_game_level) * a;
+        }
+        for (i = 0; i < MIXER_FRAME_SAMPLES; i++) {
+            float gain = g_game_gain;
+            acc[acc_n][0] = (int16_t)(d->monitor.frame_buf[i][0] * gain);
+            acc[acc_n][1] = (int16_t)(d->monitor.frame_buf[i][1] * gain);
+            if (++acc_n == buf_size) {
+                xa2_submit_samples((const int16_t *)acc, buf_size);
+                acc_n = 0;
+            }
+        }
+        /* The next frame starts silent: the EP writes all 256 samples when
+         * the pipeline runs, and an idle APU contributes nothing. */
+        memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
         return;
     }
 
@@ -375,7 +434,10 @@ static void throttle(MCPXAPUState *d)
     int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 
     if (d->next_frame_time_us == 0 ||
-        now_us - d->next_frame_time_us > EP_FRAME_US) {
+        now_us - d->next_frame_time_us > 64000) {
+        /* Up to 64 ms behind (a front-end trap, a scheduling hiccup) is
+         * caught up by running frames back to back; the speaker queue has
+         * the room. Further behind, resynchronise. */
         d->next_frame_time_us = now_us;
     }
 
@@ -449,6 +511,55 @@ static void *mcpx_apu_frame_thread(void *arg)
         /* Always run the audio output loop — the software mixer and test tone
          * need continuous frame delivery regardless of APU register state.
          * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
+        /* As xemu: while the front end is trapped or halted the pipeline
+         * stands still until the title's ISR releases it, and the time is
+         * made up afterwards (throttle). Emitting silent frames meanwhile cut
+         * 20-37 ms holes in all audio whenever a voice ended -- choppy menu
+         * sounds, chopped commentary, effects "like a fan" (2026-10-01).
+         * Stalls longer than 40 ms fall back to silent frames so output and
+         * the software mixer never stop. */
+        {
+            static int64_t stall_since;
+            int xm = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]), NV_PAPU_SECTL_XCNTMODE);
+            uint32_t fc = qatomic_read(&d->regs[NV_PAPU_FECTL]);
+            /* Stall statistics, every 5 s: count, total and longest wait for
+             * the title's ISR, and how many ran into the 40 ms fallback. */
+            static unsigned st_n, st_timeouts;
+            static int64_t st_total, st_max, st_last_log;
+            static int st_timed_out;
+            if (xm != NV_PAPU_SECTL_XCNTMODE_OFF && !g_test_tone.active &&
+                (fc & (NV_PAPU_FECTL_FEMETHMODE_TRAPPED | NV_PAPU_FECTL_FEMETHMODE_HALTED))) {
+                int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+                if (!stall_since) { stall_since = now; st_timed_out = 0; }
+                if (now - stall_since < 40000) {
+                    update_irq(d);
+                    d->set_irq = false;
+                    qemu_cond_timedwait(&d->cond, &d->lock, 1);
+                    continue;
+                }
+                if (!st_timed_out) { st_timed_out = 1; st_timeouts++; }
+            } else if (stall_since) {
+                int64_t dur = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - stall_since;
+                st_n++;
+                st_total += dur;
+                if (dur > st_max) st_max = dur;
+                stall_since = 0;
+            }
+            {
+                int64_t now_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+                if (now_ms - st_last_log > 5000) {
+                    static int on = -1;
+                    if (on < 0) on = getenv("RECOMP_APU_VOICE_LOG") != NULL;
+                    if (on && (st_n || st_timeouts))
+                        fprintf(stderr, "[APU] ISR stalls: %u in 5 s, total %.1f ms, max %.1f ms, >40 ms %u\n",
+                                st_n, st_total / 1000.0, st_max / 1000.0, st_timeouts);
+                    st_n = st_timeouts = 0;
+                    st_total = st_max = 0;
+                    st_last_log = now_ms;
+                }
+            }
+        }
+
         throttle(d);
 
         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
@@ -461,7 +572,19 @@ static void *mcpx_apu_frame_thread(void *arg)
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
             se_frame(d);
+            /* As xemu's frame loop: a frame that raised a notifier or trapped
+             * the front end updates the interrupt line. */
+            if (d->set_irq) {
+                update_irq(d);
+                d->set_irq = false;
+            }
         } else {
+            /* A trapped or halted front end is waiting for the title's ISR
+             * (xemu sets set_irq here). */
+            if (fectl & (NV_PAPU_FECTL_FEMETHMODE_TRAPPED | NV_PAPU_FECTL_FEMETHMODE_HALTED)) {
+                update_irq(d);
+                d->set_irq = false;
+            }
             /* Lightweight: just monitor frame (test tone + software mixer) */
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
@@ -637,7 +760,15 @@ uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
 void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned int size)
 {
     if (!d) return;
+    /* Serialise with the frame thread, which processes voices holding
+     * d->lock (as xemu does). Unlocked, the title's voice commands (set
+     * position, start, pause/resume, buffer pointers) landed mid-frame and
+     * were overwritten by the voice processor: NFL 2K5's music streamer saw
+     * its positions jump and restarted the song every 1-5 s, and announcer
+     * lines were cut (2026-10-01). The lock is a recursive critical section. */
+    qemu_mutex_lock(&d->lock);
     mcpx_apu_dispatch_mmio(d, (hwaddr)addr, val, size, true);
+    qemu_mutex_unlock(&d->lock);
 }
 
 /* ============================================================

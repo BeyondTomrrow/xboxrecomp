@@ -59,7 +59,7 @@ ALL_SECTIONS = {
 # Conventional PE data-section names; matched by name regardless of the XBE's
 # executable flag (matches tools/disasm/loader.py's DATA_SECTION_NAMES).
 _DATA_SECTION_NAMES = frozenset({
-    ".data", ".data1", ".rdata", ".idata", ".edata", ".reloc", ".tls",
+    ".data", ".data1", ".rdata", ".idata", ".edata", ".reloc", ".tls", ".string_",
 })
 
 _configured_from = None

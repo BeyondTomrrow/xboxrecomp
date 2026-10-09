@@ -135,6 +135,14 @@ static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
     return xbox_translate_path(xbox_path, win_path, buf_size);
 }
 
+/* Mod pack disc overlays (kernel_overlay.c). */
+int  xbox_overlay_wants(const WCHAR *win_path);
+void xbox_overlay_attach(HANDLE h, const WCHAR *win_path);
+void xbox_overlay_detach(HANDLE h);
+int  xbox_overlay_read(HANDLE h, void *buf, ULONG len, const LARGE_INTEGER *off, ULONG *got);
+int  xbox_overlay_size(HANDLE h, LONGLONG *size);
+int  xbox_overlay_path_size(const WCHAR *win_path, LONGLONG *size);
+
 NTSTATUS __stdcall xbox_NtCreateFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
@@ -185,7 +193,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
             xbox_share_to_win32(ShareAccess), NULL, OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS, NULL);
     } else {
-        if (CreateOptions & XBOX_FILE_NO_INTERMEDIATE_BUFFERING)
+        if ((CreateOptions & XBOX_FILE_NO_INTERMEDIATE_BUFFERING) && !xbox_overlay_wants(win_path))
             flags_and_attrs |= FILE_FLAG_NO_BUFFERING;
         if (FileAttributes & XBOX_FILE_ATTRIBUTE_READONLY)
             flags_and_attrs |= FILE_ATTRIBUTE_READONLY;
@@ -221,6 +229,8 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     }
 
     *FileHandle = h;
+    if (!(CreateOptions & XBOX_FILE_DIRECTORY_FILE))
+        xbox_overlay_attach(h, win_path);
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_SUCCESS;
         IoStatusBlock->Information = (CreateDisposition == XBOX_FILE_CREATE) ? 2 : 1;
@@ -241,6 +251,20 @@ NTSTATUS __stdcall xbox_NtReadFile(
 
     if (!IoStatusBlock)
         return STATUS_INVALID_PARAMETER;
+
+    {
+        ULONG got;
+        if (xbox_overlay_read(FileHandle, Buffer, Length, ByteOffset, &got)) {
+            IoStatusBlock->Information = got;
+            if (got == 0 && Length > 0) {
+                IoStatusBlock->Status = STATUS_END_OF_FILE;
+                return STATUS_END_OF_FILE;
+            }
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            if (Event) SetEvent(Event);
+            return STATUS_SUCCESS;
+        }
+    }
 
     if (ByteOffset && ByteOffset->QuadPart >= 0) {
         memset(&ov, 0, sizeof(ov));
@@ -305,10 +329,14 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     return STATUS_UNSUCCESSFUL;
 }
 
+void xbox_release_dir_context(HANDLE FileHandle);
+
 NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
+        xbox_release_dir_context(Handle);
+        xbox_overlay_detach(Handle);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
@@ -360,6 +388,8 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
             info->AllocationSize.QuadPart = ((LONGLONG)fi.nFileSizeHigh << 32) | fi.nFileSizeLow;
             info->AllocationSize.QuadPart = (info->AllocationSize.QuadPart + 4095) & ~4095LL;
             info->EndOfFile.QuadPart = ((LONGLONG)fi.nFileSizeHigh << 32) | fi.nFileSizeLow;
+            if (xbox_overlay_size(FileHandle, &info->EndOfFile.QuadPart))
+                info->AllocationSize.QuadPart = (info->EndOfFile.QuadPart + 4095) & ~4095LL;
             info->NumberOfLinks = fi.nNumberOfLinks;
             info->DeletePending = FALSE;
             info->Directory = (fi.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? TRUE : FALSE;
@@ -391,6 +421,7 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
             info->LastWriteTime.HighPart  = fi.ftLastWriteTime.dwHighDateTime;
             info->ChangeTime = info->LastWriteTime;
             info->EndOfFile.QuadPart = ((LONGLONG)fi.nFileSizeHigh << 32) | fi.nFileSizeLow;
+            xbox_overlay_size(FileHandle, &info->EndOfFile.QuadPart);
             info->AllocationSize.QuadPart = (info->EndOfFile.QuadPart + 4095) & ~4095LL;
             info->FileAttributes = fi.dwFileAttributes;
             IoStatusBlock->Status = STATUS_SUCCESS;
@@ -574,6 +605,7 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
     FileInformation->LastWriteTime.HighPart  = fad.ftLastWriteTime.dwHighDateTime;
     FileInformation->ChangeTime = FileInformation->LastWriteTime;
     FileInformation->EndOfFile.QuadPart = ((LONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+    xbox_overlay_path_size(win_path, &FileInformation->EndOfFile.QuadPart);
     FileInformation->AllocationSize.QuadPart = (FileInformation->EndOfFile.QuadPart + 4095) & ~4095LL;
     FileInformation->FileAttributes = fad.dwFileAttributes;
     return STATUS_SUCCESS;
@@ -590,6 +622,29 @@ typedef struct {
 static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
 static CRITICAL_SECTION s_dir_cs;
 static BOOL s_dir_cs_init = FALSE;
+
+/* A directory handle is closing: end its enumeration. The title often stops
+ * listing a directory before the end (a save lookup returns at its match),
+ * and the search handle used to stay open. It kept the directory busy, so
+ * deleting a save to overwrite it left the folder delete-pending and every
+ * later create in it failed with access denied ("Cannot create save on Xbox
+ * Hard Disk", 2026-10-01). It also outlived the handle value, which Windows
+ * reuses: a later directory could continue another one's listing. */
+void xbox_release_dir_context(HANDLE FileHandle)
+{
+    if (!s_dir_cs_init || !FileHandle) return;
+    EnterCriticalSection(&s_dir_cs);
+    for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
+        if (s_dir_contexts[i].file_handle == FileHandle) {
+            if (s_dir_contexts[i].find_handle && s_dir_contexts[i].find_handle != INVALID_HANDLE_VALUE)
+                FindClose(s_dir_contexts[i].find_handle);
+            s_dir_contexts[i].find_handle = NULL;
+            s_dir_contexts[i].file_handle = NULL;
+            s_dir_contexts[i].first_done = FALSE;
+        }
+    }
+    LeaveCriticalSection(&s_dir_cs);
+}
 
 static DIR_CONTEXT* find_or_create_dir_context(HANDLE FileHandle, BOOL create)
 {
@@ -1219,7 +1274,6 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     entry->AllocationSize.QuadPart = (st.st_size + 4095) & ~4095LL;
     entry->FileAttributes = mode_to_xbox_attrs(st.st_mode);
     entry->FileNameLength = name_len;
-
     ULONG header_size = (ULONG)((ULONG_PTR)&((PXBOX_FILE_DIRECTORY_INFORMATION)0)->FileName);
     if (name_len > 0 && (header_size + (ULONG)name_len) <= Length)
         memcpy(entry->FileName, de->d_name, name_len);

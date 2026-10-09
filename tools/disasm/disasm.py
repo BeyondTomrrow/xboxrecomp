@@ -210,7 +210,7 @@ class Disassembler:
                     # A prologue is the evidence that separates the two cases:
                     # the bad HL2 seed at 0x00202C2E is six bytes into a mov
                     # and decodes as nothing of the kind.
-                    if self.engine.probes_as_prologue(addr):
+                    if self.engine.probes_as_prologue(addr) or self.engine.follows_text_terminator(addr):
                         if self.engine.decode_at(addr):
                             realigned += 1
                             self.func_detector._add_candidate(

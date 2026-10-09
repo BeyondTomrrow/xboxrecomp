@@ -24,7 +24,7 @@ FORCE_CODE_SECTIONS = {"XIPS"}
 
 # Sections that are resources/data even if flagged executable.
 FORCE_DATA_SECTIONS = {
-    ".data", ".data1", ".rdata",
+    ".data", ".data1", ".rdata", ".string_",
     "EnglishXlate", "JapaneseXlate", "GermanXlate",
     "FrenchXlate", "SpanishXlate", "ItalianXlate",
 }

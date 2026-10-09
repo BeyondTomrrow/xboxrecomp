@@ -411,6 +411,9 @@ _FLAGS_UNDEFINED = frozenset({
 _EFLAGS_PRESERVE = frozenset({
     # General-purpose data movement / stack
     "mov", "lea", "push", "pop", "nop", "leave", "ret",
+    # Mod caves test a result inside their save-everything wrapper and
+    # branch after it: `test eax, eax; popal; jne` (SOFTDRINK v0.4 0x14E83E7).
+    "pushal", "pushad", "popal", "popad",
     "movzx", "movsx", "xchg", "bswap",
     "cdq", "cwde", "cbw", "cwd",
     "lahf",
@@ -487,6 +490,131 @@ def _has_xmm_operand(ops):
                for op in (ops or ()))
 
 
+def lift_loop(lifter, insn, flag_setter, flag_ops):
+    """loop/loope/loopne: ecx--, then branch while ecx != 0 (and ZF==1 for
+    loope, ZF==0 for loopne). Flags are not modified."""
+    m = insn.mnemonic
+    target = insn.jump_target
+    cond = "ecx != 0"
+    if m in ("loope", "loopz", "loopne", "loopnz"):
+        zf = _make_condition("je", flag_setter, flag_ops) if flag_setter else None
+        if zf:
+            zf_expr = zf[0]
+        else:
+            zf_expr = f"RECOMP_FLAGS_FALLBACK(0x{insn.address:08X}u, _flags)"
+        cond = (f"ecx != 0 && ({zf_expr})" if m in ("loope", "loopz")
+                else f"ecx != 0 && !({zf_expr})")
+    out = ["ecx--; /* " + m + " */"]
+    if target:
+        if lifter._is_external_target(target):
+            name = lifter._call_target_name(target)
+            out.append(f"if ({cond}) {{ g_seh_ebp = ebp; {name}(); return; }} /* {m} */")
+        else:
+            out.append(f"if ({cond}) goto loc_{target:08X}; /* {m} */")
+    else:
+        out.append(f"/* {m} - no target */")
+    return out
+
+
+# Functions that return their answer in EFLAGS (flag_return_scan.py), from
+# the JSON list named by RECOMP_FLAG_RETURN_FUNCS. Empty when unset.
+def _load_flag_return_funcs():
+    """(functions returning flags, functions entered with live flags)."""
+    import os as _os, json as _json
+    path = _os.environ.get("RECOMP_FLAG_RETURN_FUNCS")
+    if not path or not _os.path.exists(path):
+        return frozenset(), frozenset()
+    d = _json.load(open(path))
+    if isinstance(d, list):
+        d = {"returns": d, "entries": []}
+    return (frozenset(int(x, 16) for x in d.get("returns", [])),
+            frozenset(int(x, 16) for x in d.get("entries", [])))
+
+
+FLAG_RETURN_FUNCS, FLAG_ENTRY_FUNCS = _load_flag_return_funcs()
+
+
+def _load_caves():
+    """Mod cave call targets -> their largest `ret N` (flag_return_scan.py)."""
+    import os as _os, json as _json
+    path = _os.environ.get("RECOMP_FLAG_RETURN_FUNCS")
+    if not path or not _os.path.exists(path):
+        return {}
+    d = _json.load(open(path))
+    if not isinstance(d, dict):
+        return {}
+    return {int(k, 16): int(v) for k, v in d.get("caves", {}).items()}
+
+
+CAVE_CALLS = _load_caves()
+_FLAG_RETURN_SORTED = tuple(sorted(FLAG_RETURN_FUNCS))
+
+
+def _func_returns_flags(lifter):
+    """A flag-returning entry lies in this function (its start, or a call
+    target the analysis placed inside it, flag_return_scan.py)."""
+    import bisect as _bisect
+    lo = lifter.func_start
+    hi = lifter.func_end if lifter.func_end > lo else lo + 1
+    k = _bisect.bisect_left(_FLAG_RETURN_SORTED, lo)
+    return k < len(_FLAG_RETURN_SORTED) and _FLAG_RETURN_SORTED[k] < hi
+
+# x86 condition encodings for recomp_rf_cond (recomp_types.h).
+_RF_CC = {}
+for _cc, _names in enumerate((("jo",), ("jno",), ("jb", "jc", "jnae"), ("jae", "jnb", "jnc"),
+                              ("je", "jz"), ("jne", "jnz"), ("jbe", "jna"), ("ja", "jnbe"),
+                              ("js",), ("jns",), ("jp", "jpe"), ("jnp", "jpo"),
+                              ("jl", "jnge"), ("jge", "jnl"), ("jle", "jng"), ("jg", "jnle"))):
+    for _n in _names:
+        _RF_CC[_n] = _cc
+
+# Instructions that leave EFLAGS alone between a flag setter and its ret.
+_RF_PRESERVE = {"mov", "movzx", "movsx", "pop", "push", "lea", "nop", "xchg", "cdq", "cwde",
+                "popal", "popad", "pushal", "pushad", "fld", "fstp", "fst", "fxch", "fldz", "fld1"}
+
+
+def _rf_export_at_ret(insns, i):
+    """C statement handing the flags at insns[i] (a ret) to the caller, or
+    None when what set them cannot be expressed."""
+    j = i - 1
+    while j >= 0 and insns[j].mnemonic in _RF_PRESERVE:
+        j -= 1
+    if j < 0:
+        return None
+    p = insns[j]
+    m = p.mnemonic
+    ops = p.operands
+    between = insns[j + 1:i]
+    if m in ("cmp", "test"):
+        return ("g_rf_kind = %d; g_rf_a = _fa; g_rf_b = _fb; g_rf_as = _fas; g_rf_bs = _fbs;"
+                " /* %s flags returned to the caller */" % (1 if m == "cmp" else 2, m))
+    if m == "stc":
+        return "g_rf_kind = 4; g_rf_cf = 1; /* stc: carry returned to the caller */"
+    if m == "clc":
+        return "g_rf_kind = 4; g_rf_cf = 0; /* clc: carry returned to the caller */"
+    if m == "xor" and len(ops) == 2 and ops[0].type == "reg" and ops[1].type == "reg" \
+            and ops[0].reg == ops[1].reg:
+        return "g_rf_kind = 3; g_rf_a = 0; g_rf_cf = 0; /* xor self: zero returned to the caller */"
+    if m in ("inc", "dec", "add", "sub", "and", "or", "xor", "neg", "shl", "shr", "sar") \
+            and ops and ops[0].type == "reg":
+        reg = ops[0].reg
+        # The result is the register, unless something in between rewrote it.
+        for q in between:
+            if q.operands and q.operands[0].type == "reg" and q.operands[0].reg == reg \
+                    and q.mnemonic in ("mov", "movzx", "movsx", "pop", "lea", "xchg"):
+                return None
+            if q.mnemonic in ("popal", "popad"):
+                return None
+        cf = "0"   # _cf exists only where a carry reader was seen
+        return ("{ g_rf_kind = 3; g_rf_a = (uint32_t)(%s); g_rf_cf = (uint32_t)(%s); }"
+                " /* %s result returned to the caller */" % (_fmt_operand_read(ops[0]), cf, m))
+    return None
+
+
+_RF_EXPORT = ("g_rf_kind = %d; g_rf_a = _fa; g_rf_b = _fb; g_rf_as = _fas; g_rf_bs = _fbs;"
+              " /* flags handed to the next function */")
+
+
 def _make_condition(jcc, flag_setter, flag_ops):
     """
     Generate a C condition expression for a jcc based on what set the flags.
@@ -496,6 +624,14 @@ def _make_condition(jcc, flag_setter, flag_ops):
     if not cond_info:
         return None
     cmp_macro, test_macro, desc = cond_info
+
+    # Right after a call to a flag-returning function: its last cmp/test,
+    # which it stored in g_rf_* at return (kind 1 cmp, 2 test).
+    if flag_setter == "__retflags":
+        cc = _RF_CC.get(jcc)
+        if cc is None:
+            return None
+        return (f"recomp_rf_cond({cc})", desc + " (flags returned by the callee)")
 
     # A join whose predecessors disagree on which instruction set the flags,
     # but agree that the zero flag came from the same destination register.
@@ -521,6 +657,12 @@ def _make_condition(jcc, flag_setter, flag_ops):
     # comparison happens. Use those rather than re-reading registers that may
     # since have changed.
     SIGNED = {"CMP_L", "CMP_LE", "CMP_G", "CMP_GE", "TEST_S"}
+    # A cmp/test join of different widths (translator._merge_flag_states):
+    # the snapshot answers everything except the sign/overflow of a cmp's
+    # difference, which depends on the width.
+    if (getattr(flag_ops, "mixed_width", False) and flag_setter == "cmp"
+            and not cmp_macro and jcc not in ("jp", "jnp")):
+        return None
     if flag_setter in ("cmp", "test", "bsf", "bsr") and len(flag_ops) >= 2:
         signed = (cmp_macro in SIGNED) or (test_macro in SIGNED)
         lhs, rhs = ("_fas", "_fbs") if signed else ("_fa", "_fb")
@@ -1312,6 +1454,25 @@ class Lifter:
             return self._lift_push(insn, ops)
         if m == "pop":
             return self._lift_pop(insn, ops)
+        # pushal/popal and pushfd/popfd: the save-everything wrapper mod code
+        # caves put around a hook (SOFTDRINK 2K28's in every one). Skipped,
+        # the hook's own register use leaked into the caller: NFL 2K5's boot
+        # read a clobbered edi after the cave at 0x014E8555, decided startup
+        # had failed and rebooted (2026-10-03). Order as the CPU: eax, ecx,
+        # edx, ebx, original esp, ebp, esi, edi; popal skips the esp slot.
+        if m in ("pushal", "pushad"):
+            return ["{ uint32_t _sp0 = esp; PUSH32(esp, eax); PUSH32(esp, ecx); PUSH32(esp, edx);"
+                    " PUSH32(esp, ebx); PUSH32(esp, _sp0); PUSH32(esp, ebp); PUSH32(esp, esi);"
+                    " PUSH32(esp, edi); } /* pushal */"]
+        if m in ("popal", "popad"):
+            return ["POP32(esp, edi); POP32(esp, esi); POP32(esp, ebp); esp += 4;"
+                    " POP32(esp, ebx); POP32(esp, edx); POP32(esp, ecx); POP32(esp, eax); /* popal */"]
+        if m == "pushfd":
+            # IF and the reserved bit, plus the direction flag: the only flag
+            # kept in a variable across instructions.
+            return ["PUSH32(esp, 0x202u | (g_df ? 0x400u : 0u)); /* pushfd */"]
+        if m == "popfd":
+            return ["{ uint32_t _efl; POP32(esp, _efl); g_df = (int)((_efl >> 10) & 1u); } /* popfd */"]
 
         # ── Arithmetic ──
         if m in ("add", "sub", "and", "or", "xor"):
@@ -1338,6 +1499,8 @@ class Lifter:
             return self._lift_sar(insn, ops)
         if m in ("rol", "ror"):
             return self._lift_rotate(insn, ops, m)
+        if m in ("rcl", "rcr"):
+            return self._lift_rotate_carry(insn, ops, m)
 
         # ── Comparison / test (standalone, not part of cmp+jcc pattern) ──
         if m == "cmp":
@@ -1594,7 +1757,7 @@ class Lifter:
         if m in ("bsf", "bsr"):
             if len(ops) < 2:
                 self.unimplemented.setdefault(m, []).append(insn.address)
-                return [f"/* TODO: {m} {insn.op_str} */"]
+                return [f"RECOMP_TODO(0x{insn.address:08X}u); /* TODO: {m} {insn.op_str} */"]
             dst = _fmt_operand_read(ops[0])
             src = _fmt_operand_read(ops[1])
             width = (_operand_width(ops[1]) or 4) * 8
@@ -1663,7 +1826,7 @@ class Lifter:
         #
         # Recorded, not merely commented -- see self.unimplemented.
         self.unimplemented.setdefault(m, []).append(insn.address)
-        return [f"/* TODO: {m} {insn.op_str} */"]
+        return [f"RECOMP_TODO(0x{insn.address:08X}u); /* TODO: {m} {insn.op_str} */"]
 
     # ── MOV family ──
 
@@ -2066,6 +2229,35 @@ class Lifter:
         func = ("ROL" if m == "rol" else "ROR") + suffix
         return [_fmt_operand_write(ops[0], f"{func}({dst}, {cnt})")]
 
+    def _lift_rotate_carry(self, insn, ops, m):
+        """rcl/rcr: rotate through the carry flag, at the operand's width.
+
+        Were unimplemented (skipped). MSVC's 64-bit helpers are built on them
+        -- _aullrem normalises its divisor with `shr ecx,1; rcr ebx,1` -- so
+        every 64-bit remainder by a divisor wider than 32 bits came out wrong
+        (NFL 2K5's at 0x41A5E1, 2026-09-25). The count is masked to 5 bits and
+        taken modulo width+1, one bit at a time through _cf; OF is not
+        modelled. _function_needs_cf counts these as carry consumers, so _cf
+        is maintained in any function that has one.
+        """
+        if len(ops) < 2:
+            return [f"/* {m}: bad operands */"]
+        dst = _fmt_operand_read(ops[0])
+        cnt = _fmt_operand_read(ops[1])
+        bits = (_operand_width(ops[0]) or 4) * 8
+        mask = {8: "0xFFu", 16: "0xFFFFu"}.get(bits, "0xFFFFFFFFu")
+        if m == "rcr":
+            step = (f"int _nc = (int)(_v & 1u); "
+                    f"_v = ((_v >> 1) | ((uint32_t)(_cf & 1) << {bits - 1})) & {mask}; _cf = _nc;")
+        else:
+            step = (f"int _nc = (int)((_v >> {bits - 1}) & 1u); "
+                    f"_v = ((_v << 1) | (uint32_t)(_cf & 1)) & {mask}; _cf = _nc;")
+        return [
+            f"{{ uint32_t _v = (uint32_t)({dst}) & {mask}; unsigned _n = ((unsigned)({cnt}) & 31u) % {bits + 1}u;",
+            f"  while (_n--) {{ {step} }}",
+            "  " + _fmt_operand_write(ops[0], "_v") + f" }} /* {m} */",
+        ]
+
     # ── Compare / Test (standalone) ──
 
     # Sign-extending cast and mask per operand width, shared by the flag
@@ -2370,8 +2562,17 @@ class Lifter:
                 break
             inside.append(target)
         # Two arms is the smallest thing worth calling a switch; one is more
-        # likely a coincidence than a jump table.
+        # likely a coincidence than a jump table -- unless the jump itself is
+        # `jmp [index*4 + table]`, which is a switch whatever its table holds.
+        # MSVC emits one-entry tables behind a byte index table when every
+        # case lands on the same arm: NFL 2K5's 0x204D38 (`movzx edx, byte
+        # [eax+0x204EA8]; jmp [edx*4+0x204EA4]`, six cases -> 0x204DC8). Left
+        # unresolved it became an indirect tail jump into the middle of its
+        # own function, which cannot be dispatched, and the game died once
+        # audio started driving that path (2026-09-24).
         if len(inside) >= 2:
+            return inside
+        if len(inside) == 1 and op.mem_index and getattr(op, "mem_scale", 1) == 4:
             return inside
         return []
 
@@ -2450,6 +2651,15 @@ class Lifter:
         target = insn.jump_target
         jcc = insn.mnemonic
 
+        # loop/loope/loopne: decrement ecx (flags untouched), branch while it
+        # is nonzero -- and, for loope/loopne, while ZF says so. Lifted as a
+        # flag-based jcc these compiled to "never taken" with ecx never
+        # decremented: NFL 2K5's MMX memcpy at 0x3CEE8F (movq/movntq/loop)
+        # copied one quadword of every buffer (2026-09-25). Without a known
+        # flag setter the ZF half of loope/loopne stays the fallback.
+        if jcc in ("loop", "loope", "loopz", "loopne", "loopnz"):
+            return lift_loop(self, insn, None, None)
+
         # jecxz/jcxz: jump if ecx/cx is zero (not flag-based)
         if jcc in ("jecxz", "jcxz"):
             cond = "ecx == 0" if jcc == "jecxz" else "LO16(ecx) == 0"
@@ -2469,7 +2679,10 @@ class Lifter:
         # right bit while the generic _flags fallback -- which nothing ever
         # assigns -- is silently always false. The XCompress bit reader jumps
         # into the middle of its refill exactly this way.
-        cond = "_flags"
+        # RECOMP_FLAGS_FALLBACK evaluates to _flags (always 0, as before) and
+        # reports the instruction the first time it runs, so a never-taken
+        # branch on a live path can be found (2026-09-25).
+        cond = f"RECOMP_FLAGS_FALLBACK(0x{insn.address:08X}u, _flags)"
         if self.needs_cf:
             if jcc in ("jb", "jnae", "jc"):
                 cond = "_cf"
@@ -2488,13 +2701,13 @@ class Lifter:
     def _lift_setcc(self, insn, ops, m):
         if len(ops) < 1:
             return [f"/* {m}: no operand */"]
-        return [_fmt_operand_write(ops[0], f"_flags /* {m} */")]
+        return [_fmt_operand_write(ops[0], f"RECOMP_FLAGS_FALLBACK(0x{insn.address:08X}u, _flags) /* {m} */")]
 
     def _lift_cmovcc(self, insn, ops, m):
         if len(ops) < 2:
             return [f"/* {m}: bad operands */"]
         src = _fmt_operand_read(ops[1])
-        return [f"if (_flags /* {m} */) {_fmt_operand_write(ops[0], src)}"]
+        return [f"if (RECOMP_FLAGS_FALLBACK(0x{insn.address:08X}u, _flags) /* {m} */) {_fmt_operand_write(ops[0], src)}"]
 
     # ── String operations ──
 
@@ -2727,10 +2940,10 @@ class Lifter:
         if m in self._MMX_BINARY and len(ops) >= 2:
             a, b = src(dst), src(ops[1])
             if a is None or b is None:
-                return [f"/* TODO: {m} {insn.op_str} */"]
+                return [f"RECOMP_TODO(0x{insn.address:08X}u); /* TODO: {m} {insn.op_str} */"]
             if is_mm(dst):
                 return [f"{dst.reg} = {self._MMX_BINARY[m]}({a}, {b}); /* {m} */"]
-            return [f"/* TODO: {m} {insn.op_str} (dst not mm) */"]
+            return [f"RECOMP_TODO(0x{insn.address:08X}u); /* TODO: {m} {insn.op_str} (dst not mm) */"]
 
         if m in self._MMX_SHIFT and len(ops) >= 2 and is_mm(dst):
             count = ops[1]
@@ -2741,7 +2954,7 @@ class Lifter:
             elif count.type == "mem":
                 cnt = f"MMX_MEM({_fmt_mem(count)}).q"
             else:
-                return [f"/* TODO: {m} {insn.op_str} */"]
+                return [f"RECOMP_TODO(0x{insn.address:08X}u); /* TODO: {m} {insn.op_str} */"]
             return [f"{dst.reg} = {self._MMX_SHIFT[m]}({dst.reg}, {cnt}); /* {m} */"]
 
         # cvtpi2ps: the other direction -- two dwords in, two singles out,
@@ -2760,7 +2973,7 @@ class Lifter:
             elif s_op.type == "mem":
                 a = f"MMX_MEM({_fmt_mem(s_op)})"
             else:
-                return [f"/* TODO: {m} {insn.op_str} */"]
+                return [f"RECOMP_TODO(0x{insn.address:08X}u); /* TODO: {m} {insn.op_str} */"]
             return [f"{dst.reg} = XMM_FROM_PI({dst.reg}, {a}); /* cvtpi2ps */"]
 
         # cvtps2pi / cvttps2pi: two singles in, two dwords out. The source is
@@ -2775,20 +2988,20 @@ class Lifter:
                 addr = _fmt_mem(s_op)
                 lo, hi = f"MEMF({addr})", f"MEMF(({addr}) + 4)"
             else:
-                return [f"/* TODO: {m} {insn.op_str} */"]
+                return [f"RECOMP_TODO(0x{insn.address:08X}u); /* TODO: {m} {insn.op_str} */"]
             return [f"{dst.reg} = MMX_FROM_PS({lo}, {hi}, {trunc}); /* {m} */"]
 
         if m == "pshufw" and len(ops) >= 3 and is_mm(dst):
             a = src(ops[1])
             if a is None:
-                return [f"/* TODO: {m} {insn.op_str} */"]
+                return [f"RECOMP_TODO(0x{insn.address:08X}u); /* TODO: {m} {insn.op_str} */"]
             return [f"{dst.reg} = MMX_PSHUFW({a}, {ops[2].imm & 0xFF}u); /* pshufw */"]
 
         if m == "pinsrw" and len(ops) >= 3 and is_mm(dst):
             v = (f"{ops[1].reg}" if ops[1].type == "reg"
                  else f"MEM16({_fmt_mem(ops[1])})" if ops[1].type == "mem" else None)
             if v is None:
-                return [f"/* TODO: {m} {insn.op_str} */"]
+                return [f"RECOMP_TODO(0x{insn.address:08X}u); /* TODO: {m} {insn.op_str} */"]
             return [f"{dst.reg} = MMX_PINSRW({dst.reg}, {v}, "
                     f"{ops[2].imm & 0xFF}u); /* pinsrw */"]
 
@@ -2820,14 +3033,14 @@ class Lifter:
                              " /* movd */"])
                 if dst.type == "reg":
                     return [f"{dst.reg} = {ops[1].reg}.ud[0]; /* movd */"]
-            return [f"/* TODO: {m} {insn.op_str} */"]
+            return [f"RECOMP_TODO(0x{insn.address:08X}u); /* TODO: {m} {insn.op_str} */"]
 
         # movntq: a non-temporal store. The hint is irrelevant; the store is not.
         if m == "movntq" and len(ops) >= 2 and dst.type == "mem" and is_mm(ops[1]):
             return [f"MMX_STORE({_fmt_mem(dst)}, {ops[1].reg}); /* movntq */"]
 
         self.unimplemented.setdefault(m, []).append(insn.address)
-        return [f"/* TODO: {m} {insn.op_str} */"]
+        return [f"RECOMP_TODO(0x{insn.address:08X}u); /* TODO: {m} {insn.op_str} */"]
 
     def _lift_sse(self, insn, m, ops):
         """Translate SSE instructions to C float operations."""
@@ -3372,7 +3585,7 @@ class Lifter:
         if m == "fscale":
             return [f"fp_top() = ldexp(fp_top(), (int)fp_st1()); /* fscale */"]
         if m == "frndint":
-            return [f"fp_top() = rint(fp_top()); /* frndint */"]
+            return [f"fp_top() = recomp_frndint(fp_top(), g_fp_control_word); /* frndint */"]
         if m == "fldpi":
             return [f"fp_push(3.14159265358979323846); /* fldpi */"]
         if m == "fldl2e":
@@ -3479,6 +3692,47 @@ class Lifter:
                         f"{_fmt_operand_read(ops[0])};"
                         f" /* fldcw {insn.op_str} */"]
             return [f"/* fldcw {insn.op_str} - no source operand */"]
+        if m in ("fxsave", "fxrstor") and ops and ops[0].type == "mem":
+            # Mod caves (gcc code) bracket their SSE/x87 use with fxsave/fxrstor so
+            # the game's live xmm0-7 and x87 stack survive the cave. Dropping both
+            # let the cave clobber them (SOFTDRINK 0x014E3050, 2026-10-08). The
+            # 512-byte image is private to this pair: x87 slots hold doubles.
+            a = _fmt_mem(ops[0])
+            if m == "fxsave":
+                out = ["{ uint32_t _fx = %s; union { double d; uint32_t u[2]; } _t; int _k;" % a,
+                       "MEM32(_fx + 8) = (uint32_t)g_fp_top; MEM16(_fx) = g_fp_control_word;",
+                       "for (_k = 0; _k < 8; _k++) { _t.d = g_fp_stack[_k]; MEM32(_fx + 32 + 8 * _k) = _t.u[0]; MEM32(_fx + 36 + 8 * _k) = _t.u[1]; }"]
+                for i in range(8):
+                    out.append("XMM_STORE(_fx + %d, g_xmm%d);" % (160 + 16 * i, i))
+                out.append("} /* fxsave */")
+                return out
+            out = ["{ uint32_t _fx = %s; union { double d; uint32_t u[2]; } _t; int _k;" % a,
+                   "g_fp_top = (int)(MEM32(_fx + 8) & 7u); g_fp_control_word = MEM16(_fx);",
+                   "for (_k = 0; _k < 8; _k++) { _t.u[0] = MEM32(_fx + 32 + 8 * _k); _t.u[1] = MEM32(_fx + 36 + 8 * _k); g_fp_stack[_k] = _t.d; }"]
+            for i in range(8):
+                out.append("g_xmm%d = XMM_MEM(_fx + %d);" % (i, 160 + 16 * i))
+            out.append("} /* fxrstor */")
+            return out
+        if m in ("fnsave", "fsave", "frstor") and ops and ops[0].type == "mem":
+            # Same private image as fxsave (x87 half only); fnsave then
+            # re-initialises the unit like the hardware does.
+            a = _fmt_mem(ops[0])
+            if m != "frstor":
+                return ["{ uint32_t _fx = %s; union { double d; uint32_t u[2]; } _t; int _k;" % a,
+                        "MEM32(_fx + 8) = (uint32_t)g_fp_top; MEM16(_fx) = g_fp_control_word;",
+                        "for (_k = 0; _k < 8; _k++) { _t.d = g_fp_stack[_k]; MEM32(_fx + 32 + 8 * _k) = _t.u[0]; MEM32(_fx + 36 + 8 * _k) = _t.u[1]; }",
+                        "g_fp_top = 0; g_fp_control_word = 0x037Fu; } /* fnsave */"]
+            return ["{ uint32_t _fx = %s; union { double d; uint32_t u[2]; } _t; int _k;" % a,
+                    "g_fp_top = (int)(MEM32(_fx + 8) & 7u); g_fp_control_word = MEM16(_fx);",
+                    "for (_k = 0; _k < 8; _k++) { _t.u[0] = MEM32(_fx + 32 + 8 * _k); _t.u[1] = MEM32(_fx + 36 + 8 * _k); g_fp_stack[_k] = _t.d; }",
+                    "} /* frstor */"]
+        if m in ("fnstenv", "fstenv", "fldenv") and ops and ops[0].type == "mem":
+            a = _fmt_mem(ops[0])
+            if m == "fldenv":
+                return ["{ uint32_t _fx = %s; g_fp_top = (int)(MEM32(_fx + 8) & 7u); g_fp_control_word = MEM16(_fx); } /* fldenv */" % a]
+            return ["{ uint32_t _fx = %s; MEM32(_fx + 8) = (uint32_t)g_fp_top; MEM16(_fx) = g_fp_control_word; } /* fnstenv */" % a]
+        if m in ("fninit", "finit"):
+            return ["g_fp_top = 0; g_fp_control_word = 0x037Fu; /* fninit */"]
         if m == "fldz":
             return [f"fp_push(0.0); /* fldz */"]
         if m == "fld1":
@@ -3503,7 +3757,20 @@ def lift_basic_block(lifter, bb, flag_state=None):
         and flag_state is a tuple for passing to the next block.
     """
     stmts = []
-    insns = bb.instructions
+    # An instruction that starts inside the one before it belongs to another
+    # decoding of the same bytes -- a sweep that wandered in from a jump
+    # table and is one byte out of step. Execution runs one of them, never
+    # both. MSVC's memcpy copies 7 dwords with "mov eax,[esi+ecx*4-1C] /
+    # mov [edi+ecx*4-1C],eax" right after its UnwindUp table; the stray
+    # decode added an "inc esp" from inside the second mov, every 28-byte
+    # copy left the stack one byte off, and the caller popped garbage
+    # (the WMA decoder's WAVEFORMATEX read, 2026-10-01).
+    insns = []
+    for insn in bb.instructions:
+        if insns and insn.address < insns[-1].address + max(insns[-1].size, 1):
+            stmts.append(f"/* skipped 0x{insn.address:08X} {insn.mnemonic}: overlaps the previous instruction */")
+            continue
+        insns.append(insn)
     i = 0
 
     # Track the last instruction that set flags
@@ -3512,6 +3779,11 @@ def lift_basic_block(lifter, bb, flag_state=None):
     else:
         last_flag_setter = None
         last_flag_ops = []
+        # Entered by a detour cave straight after its cmp/test: the first
+        # branch reads the flags the cave handed over (g_rf_*).
+        if (insns and lifter is not None and insns[0].address == lifter.func_start
+                and lifter.func_start in FLAG_ENTRY_FUNCS):
+            last_flag_setter = "__retflags"
 
     while i < len(insns):
         curr = insns[i]
@@ -3532,6 +3804,72 @@ def lift_basic_block(lifter, bb, flag_state=None):
             last_flag_setter = flag_insn.mnemonic
             last_flag_ops = list(flag_insn.operands)
             i += consumed
+            continue
+
+        # "push <continuation>; jmp F": F's ret returns to the continuation,
+        # not to this function's caller. gcc-built mod code uses it to give a
+        # shared body its own epilogue (SOFTDRINK 0x014E3050: push 0x014E343E;
+        # jmp 0x014E305C). Lifted as a tail jump, F's ret popped the
+        # continuation and returned to the caller, which left the real return
+        # address on the stack: esp drifted 4 bytes per call (2026-10-08).
+        # Lower it as a call with that return address, then run the
+        # continuation as a tail jump.
+        # The same with the jmp left out: "push <continuation>" as a function's
+        # last instruction, falling through into the shared body (SOFTDRINK
+        # 0x014E3057: push 0x014E3449, then 0x014E305C).
+        _push_fall = (curr.mnemonic == "push" and i + 1 == len(insns) and len(curr.operands) == 1
+                      and curr.operands[0].type == "imm"
+                      and curr.address + curr.size == lifter.func_end)
+        if _push_fall or (curr.mnemonic == "push" and i + 1 < len(insns) and insns[i + 1].mnemonic == "jmp"
+                and insns[i + 1].jump_target is not None and len(curr.operands) == 1
+                and curr.operands[0].type == "imm"):
+            _cont = curr.operands[0].imm & 0xFFFFFFFF
+            _dest = lifter.func_end if _push_fall else insns[i + 1].jump_target
+            if (is_code_address(_cont) and _cont != _dest
+                    and abs(_cont - curr.address) < 0x2000
+                    and not (lifter.func_start <= _dest < lifter.func_end)
+                    and not (lifter.func_start <= _cont < lifter.func_end)):
+                # F may also drop the continuation itself and return straight
+                # to the caller (0x014E340D: lea esp,[esp+4]; xor eax,eax;
+                # ret); then esp is already past our return address.
+                stmts.append("{ uint32_t _cont_sp0 = esp; PUSH32(esp, 0x%08Xu);" % _cont)
+                stmts.append("g_seh_ebp = ebp; RECOMP_ABI_CALL(0x%08Xu, sub_%08X); /* push-continuation jmp */"
+                             % (_dest, _dest))
+                stmts.append("if (esp != _cont_sp0) return; } /* returned past the continuation */")
+                stmts.append("g_seh_ebp = ebp; RECOMP_ITAIL(0x%08Xu); return; /* continuation 0x%08X */"
+                             % (_cont, _cont))
+                last_flag_setter = None
+                last_flag_ops = []
+                i += 1 if _push_fall else 2
+                continue
+
+        # "push <code address>; ret" is a jump there (detour caves return into
+        # the original function this way). Lifted as a return it went back to
+        # the caller and the rest of the original never ran (SOFTDRINK 2K28's
+        # cave at 0x014E834F for 0x6E390, 2026-10-03).
+        if (curr.mnemonic == "push" and i + 1 < len(insns) and insns[i + 1].is_ret
+                and not insns[i + 1].operands and len(curr.operands) == 1
+                and curr.operands[0].type == "imm"):
+            target = curr.operands[0].imm & 0xFFFFFFFF
+            if last_flag_setter in ("cmp", "test") and target in FLAG_ENTRY_FUNCS:
+                stmts.append(_RF_EXPORT % (1 if last_flag_setter == "cmp" else 2))
+            if lifter.func_start <= target < lifter.func_end and not lifter._is_external_target(target):
+                stmts.append(f"goto loc_{target:08X}; /* push-ret jump */")
+            else:
+                stmts.append(f"g_seh_ebp = ebp; RECOMP_ITAIL(0x{target:08X}u); return; /* push-ret jump */")
+            last_flag_setter = None
+            last_flag_ops = []
+            i += 2
+            continue
+        if (curr.mnemonic == "jmp" and curr.jump_target is not None
+                and curr.jump_target in FLAG_ENTRY_FUNCS
+                and last_flag_setter in ("cmp", "test")):
+            stmts.append(_RF_EXPORT % (1 if last_flag_setter == "cmp" else 2))
+
+        # loop family: ecx counter, and ZF for loope/loopne
+        if curr.mnemonic in ("loop", "loope", "loopz", "loopne", "loopnz"):
+            stmts.extend(lift_loop(lifter, curr, last_flag_setter, last_flag_ops))
+            i += 1
             continue
 
         # Handle jecxz/jcxz specially (not flag-based)
@@ -3602,8 +3940,49 @@ def lift_basic_block(lifter, bb, flag_state=None):
             results = lifter._lift_neg(
                 curr, curr.operands, preserve_carry=preserve)
         else:
+            if curr.is_ret and _func_returns_flags(lifter):
+                _ex = _rf_export_at_ret(insns, i)
+                if _ex:
+                    stmts.append(_ex)
+            if False:
+                # Hand this function's flags back to the caller. XOR's flags
+                # are represented as `test result,result`: the lifter saved
+                # the XOR result in _fa, while _fb may belong to an older
+                # comparison on that control-flow path.
+                if last_flag_setter == "xor":
+                    ops_ = last_flag_ops
+                    self_xor = (len(ops_) == 2 and ops_[0].type == "reg" and ops_[1].type == "reg"
+                                and ops_[0].reg == ops_[1].reg)
+                    if self_xor:
+                        # Always 0, and the lifter does not snapshot it.
+                        stmts.append("g_rf_kind = 2; g_rf_a = 0; g_rf_b = 0; g_rf_as = 0; g_rf_bs = 0;"
+                                     " /* xor self: flags of zero returned to the caller */")
+                    else:
+                        stmts.append("g_rf_kind = 2; g_rf_a = _fa; g_rf_b = _fa; g_rf_as = _fas; g_rf_bs = _fas;"
+                                     " /* XOR flags returned to the caller */")
+                else:
+                    stmts.append("g_rf_kind = %d; g_rf_a = _fa; g_rf_b = _fb; g_rf_as = _fas; g_rf_bs = _fbs;"
+                                 " /* flags returned to the caller */" % (1 if last_flag_setter == "cmp" else 2))
             results = lifter.lift_instruction(insns[i])
-        stmts.extend(results)
+        if curr.is_call and curr.call_target in CAVE_CALLS:
+            # A mod cave may drop its return address and jump into this
+            # function's body ("call as jmp"); that body's ret then returns past
+            # this call site. The guest has left this function, so leave too --
+            # carrying on ran the body a second time on a dead frame
+            # (SOFTDRINK 2K28 v0.4, 0x014DDE5F for 0x1CEAC0, 2026-10-07).
+            stmts.append("{ uint32_t _cave_sp0 = esp;")
+            stmts.extend(results)
+            stmts.append("if (esp > _cave_sp0 + %du) { return; } } /* cave returned past this call */"
+                         % CAVE_CALLS[curr.call_target])
+        else:
+            stmts.extend(results)
+
+        if curr.is_call and curr.call_target in FLAG_RETURN_FUNCS:
+            # The callee answers in EFLAGS (g_rf_*).
+            last_flag_setter = "__retflags"
+            last_flag_ops = []
+            i += 1
+            continue
 
         # Track flag-setting instructions
         if curr.mnemonic in FLAG_SETTERS:
@@ -3640,10 +4019,17 @@ def lift_basic_block(lifter, bb, flag_state=None):
             # repe cmpsb/repne scasb = comparison, sets flags
             rest = curr.op_str.strip() if hasattr(curr, 'op_str') else ""
             raw_m = curr.mnemonic
-            if "cmpsb" in raw_m or "scasb" in raw_m:
+            # Every width compares, not just the byte forms. "repe cmpsd"
+            # was taken for a flag-preserving copy, so the jcc after it read
+            # whatever set the flags before (often an "xor reg, reg": always
+            # "equal"). The XDK WMA decoder matches ASF object GUIDs exactly
+            # that way and handed every object to the File Properties parser,
+            # which rejected the second one -- no custom soundtrack ever
+            # played (2026-10-01). 114 sites in NFL 2K5.
+            if "cmps" in raw_m or "scas" in raw_m:
                 last_flag_setter = raw_m
                 last_flag_ops = list(curr.operands)
-            elif "cmpsb" in rest or "scasb" in rest:
+            elif "cmps" in rest or "scas" in rest:
                 last_flag_setter = raw_m
                 last_flag_ops = list(curr.operands)
             else:

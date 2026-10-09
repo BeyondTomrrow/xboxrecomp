@@ -77,6 +77,31 @@ class StringCompareLifterTest(unittest.TestCase):
         self.assertIn("_flags", jcc)
         self.assertNotIn("_fa", jcc)
 
+    def test_dword_compare_replaces_an_earlier_flag_setter(self):
+        # The XDK WMA decoder's GUID match: "xor edx, edx / repe cmpsd /
+        # jne". The jne used to pair with the xor (ZF from a zero result:
+        # never taken), so every ASF object looked like the first GUID.
+        clear = Instruction(0, 2, "xor", "edx, edx", "33d2")
+        clear.operands = [Operand(type="reg", reg="edx"), Operand(type="reg", reg="edx")]
+        compare = Instruction(
+            2, 2, "repe cmpsd", "dword ptr [esi], dword ptr es:[edi]",
+            "f3a7")
+        compare.operands = [
+            Operand(type="mem", mem_base="esi", mem_size=4),
+            Operand(type="mem", mem_base="edi", mem_size=4),
+        ]
+        jump = Instruction(4, 2, "jne", "0x10", "750a")
+        jump.jump_target = 0x10
+        lifter = Lifter()
+        lifter.func_start = 0
+        lifter.func_end = 0x20
+
+        lifted, _ = lift_basic_block(
+            lifter, BasicBlock(start=0, instructions=[clear, compare, jump]))
+        jcc = "\n".join(lifted).splitlines()[-1]
+        self.assertIn("(_flags == 0)", jcc)
+        self.assertNotIn("_fa", jcc)
+
 
 if __name__ == "__main__":
     unittest.main()

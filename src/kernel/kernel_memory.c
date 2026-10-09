@@ -10,6 +10,7 @@
  */
 
 #include "kernel.h"
+#include "xbox_memory_layout.h"
 #if defined(_WIN32)
 /* _aligned_malloc/_aligned_free; POSIX gets them from win32_compat.h */
 #include <malloc.h>
@@ -138,9 +139,9 @@ NTSTATUS __stdcall xbox_MmQueryStatistics(PXBOX_MM_STATISTICS MemoryStatistics)
     memset(MemoryStatistics, 0, sizeof(XBOX_MM_STATISTICS));
     MemoryStatistics->Length = sizeof(XBOX_MM_STATISTICS);
 
-    /* Xbox has 64MB RAM. Report plausible values. */
+    /* Report the active retail/devkit memory layout selected before boot. */
     ULONG page_size = 4096;
-    MemoryStatistics->TotalPhysicalPages = 64 * 1024 * 1024 / page_size; /* 16384 pages */
+    MemoryStatistics->TotalPhysicalPages = (ULONG)(g_xbox_total_ram / page_size);
     MemoryStatistics->AvailablePages = (ULONG)(ms.ullAvailPhys / page_size);
     if (MemoryStatistics->AvailablePages > MemoryStatistics->TotalPhysicalPages)
         MemoryStatistics->AvailablePages = MemoryStatistics->TotalPhysicalPages / 2;
@@ -179,9 +180,20 @@ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
      * nothing naming this function.
      */
     uint32_t va = (uint32_t)(uintptr_t)BaseAddress;
-    return (ULONG_PTR)((va >= XBOX_CONTIG_BASE &&
-                        (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
-                     ? va - XBOX_CONTIG_BASE : va);
+    if (va >= XBOX_CONTIG_BASE &&
+        (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
+        return (ULONG_PTR)(va - XBOX_CONTIG_BASE);
+    /* Low memory (the image, its data and the title's heap). On the console
+     * it is the same physical RAM as the window, identity mapped; here it is
+     * separate storage, so its physical address must not collide with a
+     * window offset. XBOX_PHYS_LOW_TAG marks it; the APU and the GPU strip it
+     * and read low memory. Untagged, NFL 2K5's soundtrack player handed the
+     * APU its decode buffers at 0x00C17A68, which also names a window offset
+     * below the contiguous high-water mark: the stream voice read zeros from
+     * the window and custom soundtracks played silence (2026-10-01). */
+    if (va && va < 0x04000000u)
+        return (ULONG_PTR)(va | XBOX_PHYS_LOW_TAG);
+    return (ULONG_PTR)va;
 }
 
 VOID __stdcall xbox_MmPersistContiguousMemory(PVOID BaseAddress, ULONG NumberOfBytes, BOOLEAN Persist)

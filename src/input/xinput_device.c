@@ -12,6 +12,7 @@
 
 #include "xinput_xbox.h"
 #include <string.h>
+#include <stdlib.h>
 
 /* ======================================================================== */
 #if defined(_WIN32)
@@ -31,8 +32,21 @@ void xbox_InputInit(void)
         DWORD result = XInputGetState(i, &state);
         g_controller_connected[i] = (result == ERROR_SUCCESS);
     }
+    if (!g_controller_connected[0] && getenv("RECOMP_SIMULATE_INPUT"))
+        g_controller_connected[0] = TRUE;
 }
 
+/* 2026-09-22: EXPERIMENTAL, at explicit user direction ("keep going" /
+ * "don't stop until you get a picture") -- the game reached a genuinely
+ * stable, real, per-frame main loop for the first time this session (see
+ * PROJECT_STATUS.md) but never advances past a blank screen, exactly the
+ * behavior of a title screen waiting for a "press start" signal with no
+ * real controller ever connected to this headless test machine. When
+ * RECOMP_SIMULATE_INPUT is set and no real controller answered, fake
+ * port 0 as connected and periodically tap the START button (a few
+ * frames pressed, then released, repeating) so whatever polling window
+ * the guest samples on eventually sees a real press+release edge. Not a
+ * fix for anything -- purely a synthetic nudge, gated off by default. */
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     XINPUT_STATE xi_state;
@@ -44,6 +58,20 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     result = XInputGetState(dwPort, &xi_state);
     if (result != ERROR_SUCCESS) {
         g_controller_connected[dwPort] = FALSE;
+        if (dwPort == 0 && getenv("RECOMP_SIMULATE_INPUT")) {
+            static DWORD sim_packet = 0;
+            static DWORD sim_frame = 0;
+            BOOL press = ((sim_frame++ % 120) < 6);
+            memset(pState, 0, sizeof(XBOX_INPUT_STATE));
+            pState->dwPacketNumber = ++sim_packet;
+            if (press) {
+                pState->Gamepad.wButtons = XBOX_GAMEPAD_START;
+                pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A] = 255;
+            }
+            g_controller_connected[0] = TRUE;
+            g_last_packet[0] = sim_packet;
+            return ERROR_SUCCESS;
+        }
         return result;
     }
 
