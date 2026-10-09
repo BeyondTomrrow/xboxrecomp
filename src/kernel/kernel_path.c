@@ -433,6 +433,40 @@ static void xbox_remember_host_path(const wchar_t *p)
 
 
 
+/* Folders a title maps under the disc (2026-10-09): "D:\<name>\..." and
+ * "\Device\CdRom0\<name>\..." open files in a host folder of the title's
+ * choosing -- NFL 2K5's added teams (mods\teams) are read this way. */
+static struct { char name[32]; WCHAR host[MAX_PATH]; } s_title_dirs[8];
+static int s_title_dir_count;
+
+void xbox_path_map_disc_dir(const char *name, const char *host_dir)
+{
+    if (s_title_dir_count >= 8 || !name || !host_dir) return;
+    snprintf(s_title_dirs[s_title_dir_count].name, sizeof s_title_dirs[0].name, "%s", name);
+    MultiByteToWideChar(CP_UTF8, 0, host_dir, -1, s_title_dirs[s_title_dir_count].host, MAX_PATH);
+    s_title_dir_count++;
+}
+
+static int title_dir_path(const char *xbox_path, xbox_host_char *out, DWORD n)
+{
+    static const char *const disc[] = { "D:\\", "\\??\\D:\\", "\\Device\\CdRom0\\" };
+    int i, k;
+    for (k = 0; k < 3; k++) {
+        int skip = match_prefix(xbox_path, disc[k]);
+        if (!skip) continue;
+        for (i = 0; i < s_title_dir_count; i++) {
+            size_t ln = strlen(s_title_dirs[i].name);
+            const char *rest = xbox_path + skip;
+            if (_strnicmp(rest, s_title_dirs[i].name, ln) || (rest[ln] != '\\' && rest[ln] != 0)) continue;
+            rest += ln;
+            if (*rest == '\\') rest++;
+            _snwprintf_s(out, n, _TRUNCATE, L"%s\\%S", s_title_dirs[i].host, rest);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size)
 {
     const char*  remainder = NULL;
@@ -445,6 +479,9 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
 
     if (!s_initialized)
         xbox_path_init(NULL, NULL);
+
+    if (title_dir_path(xbox_path, host_path_buf, buf_size))
+        return TRUE;
 
     {
         char linked[512];
