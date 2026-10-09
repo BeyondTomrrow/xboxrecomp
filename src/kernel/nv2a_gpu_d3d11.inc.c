@@ -699,6 +699,87 @@ static void gpu_upload_note(const Texture *t, int cube)
     }
 }
 
+static LONGLONG g_tex_upload_qpc, g_tex_create_qpc;
+
+/* Texture object pool (2026-10-09). Creating a texture and its view cost
+ * ~0.15-0.2 ms each, ~2/3 of the 30-50 ms render-thread spikes at camera cuts
+ * (100+ new textures; [HITCH] log). A replaced or evicted texture is kept here
+ * and refilled with UpdateSubresource when one of the same description is
+ * needed. Only entries pooled in an earlier frame are reused, so a texture a
+ * draw of this frame may still bind is never overwritten; draws already
+ * issued keep their contents (UpdateSubresource is ordered after them).
+ * RECOMP_TEX_POOL=0 turns it off. */
+#define TEX_POOL 384
+static struct { ID3D11Texture2D *tex; ID3D11ShaderResourceView *srv; D3D11_TEXTURE2D_DESC d; uint32_t frame; } s_tpool[TEX_POOL];
+static int s_tpool_n;
+static unsigned s_tpool_hits, s_tpool_misses;
+
+static int tex_pool_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = !(env_cached("RECOMP_TEX_POOL") && env_cached("RECOMP_TEX_POOL")[0] == '0');
+    return on;
+}
+
+static void tex_pool_put(ID3D11Texture2D *tex, ID3D11ShaderResourceView *srv)
+{
+    D3D11_TEXTURE2D_DESC d;
+    if (!tex || !srv || !tex_pool_on()) {
+        if (srv) ID3D11ShaderResourceView_Release(srv);
+        if (tex) ID3D11Texture2D_Release(tex);
+        return;
+    }
+    ID3D11Texture2D_GetDesc(tex, &d);
+    if (d.Usage != D3D11_USAGE_DEFAULT) {          /* immutable ones cannot be refilled */
+        ID3D11ShaderResourceView_Release(srv);
+        ID3D11Texture2D_Release(tex);
+        return;
+    }
+    if (s_tpool_n == TEX_POOL) {                   /* full: drop the oldest */
+        ID3D11ShaderResourceView_Release(s_tpool[0].srv);
+        ID3D11Texture2D_Release(s_tpool[0].tex);
+        memmove(&s_tpool[0], &s_tpool[1], sizeof s_tpool[0] * (TEX_POOL - 1));
+        s_tpool_n--;
+    }
+    s_tpool[s_tpool_n].tex = tex; s_tpool[s_tpool_n].srv = srv; s_tpool[s_tpool_n].d = d;
+    s_tpool[s_tpool_n].frame = s_gpu11.frame;
+    s_tpool_n++;
+}
+
+/* Create (or take from the pool and refill) a shader-resource texture. */
+static int tex_make(D3D11_TEXTURE2D_DESC *td, const D3D11_SUBRESOURCE_DATA *sd,
+                    ID3D11Texture2D **tex, ID3D11ShaderResourceView **srv)
+{
+    int i;
+    if (tex_pool_on()) {
+        td->Usage = D3D11_USAGE_DEFAULT;
+        for (i = s_tpool_n - 1; i >= 0; i--) {
+            const D3D11_TEXTURE2D_DESC *p = &s_tpool[i].d;
+            if (s_tpool[i].frame != s_gpu11.frame && p->Width == td->Width && p->Height == td->Height &&
+                    p->MipLevels == td->MipLevels && p->ArraySize == td->ArraySize && p->Format == td->Format &&
+                    p->MiscFlags == td->MiscFlags) {
+                UINT k, subs = td->ArraySize * (td->MipLevels ? td->MipLevels : 1);
+                *tex = s_tpool[i].tex; *srv = s_tpool[i].srv;
+                memmove(&s_tpool[i], &s_tpool[i + 1], sizeof s_tpool[0] * (size_t)(s_tpool_n - i - 1));
+                s_tpool_n--;
+                for (k = 0; k < subs; k++)
+                    ID3D11DeviceContext_UpdateSubresource(s_gpu11.ctx, (ID3D11Resource *)*tex, k, NULL,
+                                                          sd[k].pSysMem, sd[k].SysMemPitch, sd[k].SysMemSlicePitch);
+                s_tpool_hits++;
+                return 1;
+            }
+        }
+    }
+    if (++s_tpool_misses % 2000 == 0)
+        fprintf(stderr, "  [TEXPOOL] %u reused, %u created (pool holds %d)\n", s_tpool_hits, s_tpool_misses, s_tpool_n);
+    if (FAILED(ID3D11Device_CreateTexture2D(s_gpu11.dev, td, sd, tex)))
+        return 0;
+    if (FAILED(ID3D11Device_CreateShaderResourceView(s_gpu11.dev, (ID3D11Resource *)*tex, NULL, srv))) {
+        ID3D11Texture2D_Release(*tex); *tex = NULL;
+        return 0;
+    }
+    return 1;
+}              /* decode + create + upload, all textures (hitch log) */
 static ID3D11ShaderResourceView *gpu_texture(int st, int cube)
 {
     Texture *t = st == 0 ? &s_gpu.tex : &s_stage[st];
@@ -826,8 +907,10 @@ static ID3D11ShaderResourceView *gpu_texture(int st, int cube)
         if (!hash)
             hash = gpu_tex_hash(t);
     }
-    if (e->srv) { ID3D11ShaderResourceView_Release(e->srv); e->srv = NULL; }
-    if (e->tex) { ID3D11Texture2D_Release(e->tex); e->tex = NULL; }
+    LARGE_INTEGER tex_t0;                       /* frame statistics: texture decode + upload time */
+    QueryPerformanceCounter(&tex_t0);
+    tex_pool_put(e->tex, e->srv);               /* reused for a later texture of the same shape */
+    e->tex = NULL; e->srv = NULL;
     /* DXT1/3/5 go to the GPU as BC1/2/3 as they are -- same block layout,
      * no swizzle -- instead of being decoded texel by texel on the CPU,
      * which re-decoded the whole 4x4 block for every texel (2026-09-26). */
@@ -850,8 +933,7 @@ static ID3D11ShaderResourceView *gpu_texture(int st, int cube)
             sd[f].SysMemPitch = (t->width / 4) * bb;
             sd[f].SysMemSlicePitch = fbytes;
         }
-        if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, sd, &e->tex))) {
-            ID3D11Device_CreateShaderResourceView(s_gpu11.dev, (ID3D11Resource *)e->tex, NULL, &e->srv);
+        if (tex_make(&td, sd, &e->tex, &e->srv)) {
             e->addr = t->offset; e->fmt = t->color; e->w = t->width; e->h = t->height;
             e->pitch = t->pitch; e->palette = tpal; e->hash = hash; e->last_use = s_gpu11.frame;
             e->checked = s_gpu11.frame + 1;
@@ -1044,8 +1126,13 @@ decoded:
             free(pix);
             return NULL;                                 /* a cube face must be square */
         }
-        if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, sd, &e->tex)))
-            ID3D11Device_CreateShaderResourceView(s_gpu11.dev, (ID3D11Resource *)e->tex, NULL, &e->srv);
+        {
+            LARGE_INTEGER c0, c1;
+            QueryPerformanceCounter(&c0);
+            tex_make(&td, sd, &e->tex, &e->srv);
+            QueryPerformanceCounter(&c1);
+            g_tex_create_qpc += c1.QuadPart - c0.QuadPart;
+        }
     }
     free(pix);
     e->addr = t->offset; e->fmt = t->color; e->w = t->width; e->h = t->height;
@@ -1054,6 +1141,29 @@ decoded:
     e->cube = (uint32_t)cube;
     s_gpu11.tex_uploads++;
     gpu_upload_note(t, cube);
+    if (env_cached("RECOMP_TEX_REPEAT_LOG")) {   /* how many uploads are contents seen before? */
+        static uint64_t seen[1 << 16];
+        static unsigned uploads, repeats;
+        const uint8_t *gm = (const uint8_t *)xbox_GetMemoryOffset();
+        uint32_t bytes = gpu_tex_bytes(t), i2, h2 = 2166136261u;
+        uint64_t key;
+        unsigned slot;
+        if (bytes > 4u * 1024u * 1024u) bytes = 4u * 1024u * 1024u;
+        for (i2 = 0; i2 + 4 <= bytes; i2 += 4) h2 = (h2 ^ *(const uint32_t *)(gm + t->offset + i2)) * 16777619u;
+        key = ((uint64_t)h2 << 32) ^ ((uint64_t)t->color << 24) ^ ((uint64_t)t->width << 12) ^ t->height ^ ((uint64_t)tpal << 1);
+        slot = (unsigned)(key ^ (key >> 29)) & 0xFFFF;
+        while (seen[slot] && seen[slot] != key) slot = (slot + 1) & 0xFFFF;
+        uploads++;
+        if (seen[slot] == key) repeats++; else seen[slot] = key;
+        if ((uploads % 500) == 0)
+            fprintf(stderr, "  [TEXREPEAT] %u uploads, %u of them contents uploaded before (%.0f%%)\n",
+                    uploads, repeats, 100.0 * repeats / uploads);
+    }
+    {
+        LARGE_INTEGER tex_t1;
+        QueryPerformanceCounter(&tex_t1);
+        g_tex_upload_qpc += tex_t1.QuadPart - tex_t0.QuadPart;
+    }
     return e->srv;
 }
 
