@@ -609,9 +609,10 @@ static uint32_t gpu_tex_bytes(const Texture *t)
 /* ── Texture overrides (2026-10-09) ─────────────────────────────────────────
  * The title can show its own image in place of one of the game's textures
  * (the Controller Setup pictures and button icons, src/nfl2k5_controller_art.cpp):
- *   wants(fmt, w, h)  -- the shapes it may replace (cheap; asked per lookup)
- *   gen()             -- changes whenever its images change, so the cached
- *                        texture is uploaded again
+ *   wants(fmt, w, h)  -- the shapes it may replace (cheap; asked per lookup):
+ *                        bit 0 = may replace, bit 1 = its image follows gen()
+ *   gen()             -- changes whenever those images change, so the cached
+ *                        texture is uploaded again (only shapes with bit 1)
  *   override(...)     -- given the texture's content hash (every byte, plus the
  *                        palette) and, for formats decoded here, its BGRA texels,
  *                        returns BGRA texels of any size (sampled with normalized
@@ -620,6 +621,51 @@ int (*g_xbox_tex_override_wants)(uint32_t fmt, uint32_t w, uint32_t h);
 uint32_t (*g_xbox_tex_override_gen)(void);
 const uint32_t *(*g_xbox_tex_override)(uint32_t fmt, uint32_t w, uint32_t h, uint32_t content,
                                        const uint32_t *orig, uint32_t *out_w, uint32_t *out_h);
+
+volatile long g_xbox_tex_dump_wanted;   /* the title dumps textures: DXT ones are decoded for it */
+
+/* DXT1/3/5 (BC1/2/3) to BGRA, for a texture dump. */
+static uint32_t *dxt_decode(const uint8_t *src, uint32_t w, uint32_t h, uint32_t fmt)
+{
+    uint32_t *out = (uint32_t *)calloc((size_t)w * h, 4), bx, by, i;
+    uint32_t bb = fmt == 0x0C ? 8u : 16u;
+    if (!out) return NULL;
+    for (by = 0; by < h / 4; by++)
+        for (bx = 0; bx < w / 4; bx++) {
+            const uint8_t *b = src + (by * (w / 4) + bx) * bb, *c = fmt == 0x0C ? b : b + 8;
+            uint32_t col[4], c0 = c[0] | c[1] << 8, c1 = c[2] | c[3] << 8, idx = c[4] | c[5] << 8 | c[6] << 16 | (uint32_t)c[7] << 24;
+            uint32_t r0 = (c0 >> 11) * 255 / 31, g0 = ((c0 >> 5) & 63) * 255 / 63, b0 = (c0 & 31) * 255 / 31;
+            uint32_t r1 = (c1 >> 11) * 255 / 31, g1 = ((c1 >> 5) & 63) * 255 / 63, b1 = (c1 & 31) * 255 / 31;
+            uint8_t al[16];
+            col[0] = 0xFF000000u | r0 << 16 | g0 << 8 | b0;
+            col[1] = 0xFF000000u | r1 << 16 | g1 << 8 | b1;
+            if (c0 > c1 || fmt != 0x0C) {
+                col[2] = 0xFF000000u | ((2 * r0 + r1) / 3) << 16 | ((2 * g0 + g1) / 3) << 8 | (2 * b0 + b1) / 3;
+                col[3] = 0xFF000000u | ((r0 + 2 * r1) / 3) << 16 | ((g0 + 2 * g1) / 3) << 8 | (b0 + 2 * b1) / 3;
+            } else {
+                col[2] = 0xFF000000u | ((r0 + r1) / 2) << 16 | ((g0 + g1) / 2) << 8 | (b0 + b1) / 2;
+                col[3] = 0;
+            }
+            for (i = 0; i < 16; i++) al[i] = 255;
+            if (fmt == 0x0E)
+                for (i = 0; i < 16; i++) al[i] = (uint8_t)(((b[i / 2] >> (4 * (i & 1))) & 15) * 17);
+            else if (fmt == 0x0F) {
+                uint32_t a0 = b[0], a1 = b[1], av[8], k;
+                uint64_t bits = 0;
+                for (k = 0; k < 6; k++) bits |= (uint64_t)b[2 + k] << (8 * k);
+                av[0] = a0; av[1] = a1;
+                for (k = 2; k < 8; k++)
+                    av[k] = a0 > a1 ? ((8 - k) * a0 + (k - 1) * a1) / 7 : k < 6 ? ((6 - k) * a0 + (k - 1) * a1) / 5 : k == 6 ? 0 : 255;
+                for (i = 0; i < 16; i++) al[i] = (uint8_t)av[(bits >> (3 * i)) & 7];
+            }
+            for (i = 0; i < 16; i++) {
+                uint32_t px = col[(idx >> (2 * i)) & 3];
+                if (fmt != 0x0C) px = (px & 0x00FFFFFFu) | (uint32_t)al[i] << 24;
+                out[(by * 4 + i / 4) * w + bx * 4 + (i & 3)] = px;
+            }
+        }
+    return out;
+}
 
 static uint32_t gpu_tex_bytes(const Texture *t);
 static int tex_override_wants(const Texture *t)
@@ -664,7 +710,7 @@ static uint32_t gpu_tex_hash(const Texture *t)
             h = (h ^ *(const uint32_t *)(mem + t->palette + i)) * 16777619u;
     if (t->color == 0x0B && t->width == 128 && t->height == 128)
         h ^= (uint32_t)prompt_style() * 0x5BD1E995u;   /* the button sheet follows the prompt style */
-    if (tex_override_wants(t) && g_xbox_tex_override_gen)
+    if ((tex_override_wants(t) & 2) && g_xbox_tex_override_gen)
         h ^= g_xbox_tex_override_gen() * 0x9E3779B1u;    /* its replacement changed */
     return h;
 }
@@ -827,13 +873,25 @@ static int tex_upload_override(GpuTexture *e, const Texture *t, uint32_t tpal, u
 {
     D3D11_TEXTURE2D_DESC td;
     D3D11_SUBRESOURCE_DATA sd;
-    if (!ow || !oh || ow > 4096 || oh > 4096) return 0;
+    if (!ow || !oh || ow > 16384 || oh > 16384) return 0;
     memset(&td, 0, sizeof td);
     td.Width = ow; td.Height = oh; td.MipLevels = 1; td.ArraySize = 1;
     td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_IMMUTABLE; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     sd.pSysMem = img; sd.SysMemPitch = ow * 4; sd.SysMemSlicePitch = ow * oh * 4;
-    if (!tex_make(&td, &sd, &e->tex, &e->srv)) return 0;
+    if (ow > t->width || oh > t->height) {
+        /* larger than the game's: a full mip chain, so it does not shimmer far away */
+        td.MipLevels = 0; td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        td.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, NULL, &e->tex))) return 0;
+        if (FAILED(ID3D11Device_CreateShaderResourceView(s_gpu11.dev, (ID3D11Resource *)e->tex, NULL, &e->srv))) {
+            ID3D11Texture2D_Release(e->tex); e->tex = NULL;
+            return 0;
+        }
+        ID3D11DeviceContext_UpdateSubresource(s_gpu11.ctx, (ID3D11Resource *)e->tex, 0, NULL, img, ow * 4, ow * oh * 4);
+        ID3D11DeviceContext_GenerateMips(s_gpu11.ctx, e->srv);
+    } else if (!tex_make(&td, &sd, &e->tex, &e->srv)) return 0;
     e->addr = t->offset; e->fmt = t->color; e->w = t->width; e->h = t->height;
     e->pitch = t->pitch; e->palette = tpal; e->hash = hash; e->last_use = s_gpu11.frame;
     e->checked = s_gpu11.frame + 1;
@@ -974,8 +1032,13 @@ static ID3D11ShaderResourceView *gpu_texture(int st, int cube)
     tex_pool_put(e->tex, e->srv);               /* reused for a later texture of the same shape */
     e->tex = NULL; e->srv = NULL;
     if (!cube && tex_override_wants(t) && d3d8_format_dxt_block_bytes(t->color)) {
-        uint32_t ow = 0, oh = 0;
-        const uint32_t *img = g_xbox_tex_override(t->color, t->width, t->height, tex_content_hash(t), NULL, &ow, &oh);
+        uint32_t ow = 0, oh = 0, *dec = NULL;
+        const uint32_t *img;
+        if (g_xbox_tex_dump_wanted)                  /* only to dump it */
+            __try { dec = dxt_decode((const uint8_t *)xbox_GetMemoryOffset() + t->offset, t->width, t->height, t->color); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { dec = NULL; }
+        img = g_xbox_tex_override(t->color, t->width, t->height, tex_content_hash(t), dec, &ow, &oh);
+        free(dec);
         if (img && tex_upload_override(e, t, tpal, hash, img, ow, oh))
             return e->srv;
     }
