@@ -604,6 +604,8 @@ static uint32_t gpu_tex_bytes(const Texture *t)
     return t->width * t->height * (t->color == 0x0B || t->color == 0x00 || t->color == 0x13 ? 1u : 4u);
 }
 
+#include "nv2a_gpu_prompts.inc.c"   /* PlayStation button icons on the game's button sheet */
+
 static uint32_t gpu_tex_hash(const Texture *t)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -621,6 +623,8 @@ static uint32_t gpu_tex_hash(const Texture *t)
     if (t->color == 0x0B && t->palette)
         for (i = 0; i < 1024; i += env_cached("RECOMP_TEX_FULLHASH") ? 4 : 16)
             h = (h ^ *(const uint32_t *)(mem + t->palette + i)) * 16777619u;
+    if (t->color == 0x0B && t->width == 128 && t->height == 128)
+        h ^= (uint32_t)prompt_style() * 0x5BD1E995u;   /* the button sheet follows the prompt style */
     return h;
 }
 
@@ -942,6 +946,8 @@ static ID3D11ShaderResourceView *gpu_texture(int st, int cube)
                         xbox_unswizzle_rect(idx, src, t->width, t->height, 1);
                         for (k2 = 0; k2 < n; k2++)
                             dst[k2] = pal[idx[k2]];
+                        if (t->width == 128 && t->height == 128 && f == 0)
+                            prompt_patch(dst, t->offset);   /* button icons (nv2a_gpu_prompts.inc.c) */
                     } else {
                         xbox_unswizzle_rect(dst, src, t->width, t->height, 4);
                         if (t->color == 0x07) {
@@ -994,7 +1000,7 @@ decoded:
      * mid-grey), textures of 128x128 and up, first 400. */
     if (env_cached("RECOMP_GPU_TEXDUMP") && gpu_texdump_match(t, n)) {   /* _ADDR: only that texture */
         static unsigned dumped;
-        if (dumped < 400) {
+        if (dumped < (env_cached("RECOMP_GPU_TEXDUMP_ADDR") && !strcmp(env_cached("RECOMP_GPU_TEXDUMP_ADDR"), "all") ? 3000u : 400u)) {
             char path[512];
             FILE *df;
             snprintf(path, sizeof path, "%s%03u_%08X_fmt%02X_pal%08X_%ux%u%s.bmp",
@@ -1267,6 +1273,8 @@ static int gpu_texdump_match(const Texture *t, uint32_t n)
     unsigned fmt, w, h;
     if (!f)
         return n >= 128u * 128u;
+    if (!strcmp(f, "all"))                     /* every size (icons, glyph atlases) */
+        return 1;
     if (sscanf(f, "%x:%ux%u", &fmt, &w, &h) == 3)
         return t->color == fmt && t->width == w && t->height == h;
     return strtoul(f, NULL, 16) == t->offset;

@@ -99,6 +99,17 @@ static int ggl_stat_slot(void)
     return t_stat;
 }
 
+/* The title's main game thread (the one polling the controllers; set by the
+ * title's input layer) and how long a thread has waited for the lock in all,
+ * in QPC ticks -- the frame-statistics hitch log reports the game thread's. */
+volatile DWORD g_xbox_game_tid;
+LONGLONG xbox_ggl_waited_qpc(DWORD tid)
+{
+    for (int i = 0; i < GGL_STAT_SLOTS; i++)
+        if (g_stat[i].tid == tid) return g_stat[i].waited;
+    return 0;
+}
+
 static LONGLONG qpc_now(void)
 {
     LARGE_INTEGER v;
@@ -215,6 +226,8 @@ static void ggl_acquire_raw(void)
     int slot = ggl_stat_slot();
     DWORD tid = GetCurrentThreadId();
     AcquireSRWLockExclusive(&g_lock);
+    DWORD held_by = g_owner;                     /* who we end up waiting on (hitch diagnosis) */
+    unsigned int held_site = g_owner_last_site;
     if (g_owner != 0 || g_nwait > 0) {
         unsigned long long seq = g_next_seq++;
         int me = g_nwait < GGL_MAX_WAITERS ? g_nwait++ : GGL_MAX_WAITERS - 1;
@@ -234,6 +247,14 @@ static void ggl_acquire_raw(void)
     if (slot >= 0) {
         g_stat[slot].waited += t_acquired_at - asked;
         InterlockedIncrement(&g_stat[slot].grants);
+    }
+    {   /* A long wait for the lock stalls whichever frame this thread is
+         * building: say who held it (first 200, waits over 10 ms). */
+        static volatile LONG logged;
+        LONGLONG ms = (t_acquired_at - asked) * 1000 / g_qpc_freq;
+        if (ms >= 10 && held_by && held_by != tid && InterlockedIncrement(&logged) <= 200)
+            fprintf(stderr, "  [GGL] thread %lu waited %lld ms for thread %lu (its last guest site 0x%08X)\n",
+                    (unsigned long)tid, ms, (unsigned long)held_by, held_site);
     }
 }
 

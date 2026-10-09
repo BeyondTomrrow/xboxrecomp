@@ -16,6 +16,7 @@
  */
 
 #include <dxgi1_2.h>
+#include <dxgi1_5.h>     /* IDXGIFactory5: tearing / variable refresh */
 #include "../input/xinput_xbox.h"
 
 /* src/video/fb_present.c: the window this presents into. */
@@ -182,6 +183,7 @@ static struct {
     ID3D11ShaderResourceView *toast_srv;
     int toast_w, toast_h, toast_built;
     int fullscreen_state;
+    int tearing;                /* DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING in use */
     /* fps */
     LARGE_INTEGER t0, freq;
     int frames, fps;
@@ -387,6 +389,23 @@ static int pr_swapchain(void)
         d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         d.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
         if (fac) {
+            /* Variable refresh (G-Sync / FreeSync, 2026-10-09): with tearing
+             * allowed and VSync off, a frame reaches the screen the moment it
+             * is ready, so the game's 60 frames a second stay even on a 120 or
+             * 144 Hz display instead of juddering against its refresh. Only when
+             * the system supports it (Windows 10 1709+, a VRR-capable driver). */
+            IDXGIFactory5 *f5 = NULL;
+            BOOL tearing = FALSE;
+            if (SUCCEEDED(IDXGIFactory2_QueryInterface(fac, &IID_IDXGIFactory5, (void **)&f5))) {
+                if (FAILED(IDXGIFactory5_CheckFeatureSupport(f5, DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearing, sizeof tearing)))
+                    tearing = FALSE;
+                IDXGIFactory5_Release(f5);
+            }
+            s_pr.tearing = tearing && !getenv("NFL2K5_NO_TEARING");
+            if (s_pr.tearing) d.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+            fprintf(stderr, "  [PRESENT] variable refresh / tearing %s\n", s_pr.tearing ? "available" : "not available");
+        }
+        if (fac) {
             HRESULT hr = IDXGIFactory2_CreateSwapChainForHwnd(fac, (IUnknown *)s_gpu11.dev, hw, &d, NULL, NULL, &s_pr.sc);
             if (FAILED(hr))
                 fprintf(stderr, "  [PRESENT] swap chain failed 0x%08lX\n", (unsigned long)hr);
@@ -412,7 +431,7 @@ static int pr_swapchain(void)
         pr_release_bb();
         ID3D11DeviceContext_OMSetRenderTargets(s_gpu11.ctx, 0, NULL, NULL);
         ID3D11DeviceContext_Flush(s_gpu11.ctx);
-        if (FAILED(IDXGISwapChain1_ResizeBuffers(s_pr.sc, 0, w, h, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH)))
+        if (FAILED(IDXGISwapChain1_ResizeBuffers(s_pr.sc, 0, w, h, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH | (s_pr.tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0))))
             return 0;
         if (FAILED(IDXGISwapChain1_GetBuffer(s_pr.sc, 0, &IID_ID3D11Texture2D, (void **)&bb)))
             return 0;
@@ -1442,7 +1461,10 @@ static int pr_present(uint32_t guest)
     {
         LARGE_INTEGER a, b, fq;
         QueryPerformanceCounter(&a);
-        IDXGISwapChain1_Present(s_pr.sc, s_vs.vsync ? 1u : 0u, 0);
+        /* Tearing is only allowed with VSync off and not in exclusive
+         * fullscreen (DXGI rejects the flag there). */
+        IDXGISwapChain1_Present(s_pr.sc, s_vs.vsync ? 1u : 0u,
+                                (!s_vs.vsync && s_pr.tearing && s_vs.mode != VM_FULLSCREEN) ? DXGI_PRESENT_ALLOW_TEARING : 0);
         QueryPerformanceCounter(&b);
         perf_on_present(s_vs.scale, (float)((double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)s_perf.freq.QuadPart));
         QueryPerformanceFrequency(&fq);

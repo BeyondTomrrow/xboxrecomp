@@ -153,9 +153,12 @@ static void perf_memory(void)
  * the time Present itself blocked. */
 extern volatile LONG64 g_xbox_read_qpc, g_xbox_read_bytes, g_xbox_read_count;
 extern volatile LONG64 g_pb_exec_qpc, g_pb_qwait_qpc, g_pb_capture_qpc;   /* xbox_memory_layout.c */
+extern volatile DWORD g_xbox_game_tid;                                       /* xbox_ggl.c */
+LONGLONG xbox_ggl_waited_qpc(DWORD tid);
 static void perf_hitch(float ms, float present_ms)
 {
-    static LONG64 rq, rb, rc, ex, qw, cp;
+    static LONG64 rq, rb, rc, ex, qw, cp, gw;
+    LONG64 lw = g_xbox_game_tid ? xbox_ggl_waited_qpc(g_xbox_game_tid) : 0;
     static uint32_t draws, texup, surfs;
     static LONG ps;
     static unsigned logged;
@@ -165,12 +168,12 @@ static void perf_hitch(float ms, float present_ms)
     if (ms > 25.0f && s_perf.n > 1800 && logged < 400) {
         logged++;
         fprintf(stderr, "  [HITCH] %.1f ms: present %.1f ms, reads %lld (%lld KB, %.1f ms), tex uploads %u, new targets %u, "
-                        "ps ready %ld, draws %u; render thread %.1f ms, queue wait %.1f ms, capture %.1f ms\n",
+                        "ps ready %ld, draws %u; render thread %.1f ms, queue wait %.1f ms, capture %.1f ms, game thread lock wait %.1f ms\n",
                 ms, present_ms, (long long)(c - rc), (long long)((b - rb) >> 10), (double)(q - rq) * f,
                 s_gpu11.tex_uploads - texup, s_gpu11.surf_creates - surfs, s_ps_ready - ps, s_gpu11.draws - draws,
-                (double)(e - ex) * f, (double)(w - qw) * f, (double)(k - cp) * f);
+                (double)(e - ex) * f, (double)(w - qw) * f, (double)(k - cp) * f, (double)(lw - gw) * f);
     }
-    rq = q; rb = b; rc = c; ex = e; qw = w; cp = k;
+    rq = q; rb = b; rc = c; ex = e; qw = w; cp = k; gw = lw;
     draws = s_gpu11.draws; texup = s_gpu11.tex_uploads; surfs = s_gpu11.surf_creates; ps = s_ps_ready;
 }
 
