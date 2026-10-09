@@ -239,7 +239,32 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     return STATUS_SUCCESS;
 }
 
+/* Time and bytes spent in guest file reads (frame statistics: the hitch log
+ * in nv2a_gpu_perf.inc.c reports them per slow frame). */
+volatile LONG64 g_xbox_read_qpc, g_xbox_read_bytes, g_xbox_read_count;
+
+static NTSTATUS xbox_NtReadFile_impl(
+    HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
+    PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
+    PLARGE_INTEGER ByteOffset);
+
 NTSTATUS __stdcall xbox_NtReadFile(
+    HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
+    PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
+    PLARGE_INTEGER ByteOffset)
+{
+    LARGE_INTEGER a, b;
+    NTSTATUS st;
+    QueryPerformanceCounter(&a);
+    st = xbox_NtReadFile_impl(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock, Buffer, Length, ByteOffset);
+    QueryPerformanceCounter(&b);
+    InterlockedAdd64(&g_xbox_read_qpc, b.QuadPart - a.QuadPart);
+    InterlockedAdd64(&g_xbox_read_bytes, Length);
+    InterlockedIncrement64(&g_xbox_read_count);
+    return st;
+}
+
+static NTSTATUS xbox_NtReadFile_impl(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
     PLARGE_INTEGER ByteOffset)

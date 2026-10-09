@@ -271,7 +271,9 @@ static void idx_overflow_note(const char *how, uint32_t dropped)
     }
 }
 
-#define NV_MAX_INLINE   4096            /* dwords of INLINE_ARRAY per batch */
+/* Dwords of INLINE_ARRAY per batch. Was 4096 (an emulator cap, not the
+ * NV2A's): longer inline draws lost their tail. xemu buffers 0x1FFFF. */
+#define NV_MAX_INLINE   0x20000
 
 /* Texture stage 0, decoded from what the title programmed.
  *
@@ -3544,7 +3546,17 @@ uint32_t nv2a_pb_exec_run(uint32_t subch, uint32_t method, int noninc, const uin
             return n;                                   /* outside BEGIN/END: dropped, as per word */
         room = NV_MAX_INLINE - s_gpu.inline_count;
         if (room > n - 1) room = n - 1;
+        else if (room < n - 1) {
+            static int warned;
+            if (!warned++) fprintf(stderr, "  [GPU] INLINE_ARRAY batch over %u dwords: tail dropped\n", NV_MAX_INLINE);
+        }
         memcpy(&s_gpu.inline_buf[s_gpu.inline_count], w + 1, room * 4);
+        {   /* evidence for docs/XBOX-LIMITATION-AUDIT.md: did the old 4096 cap ever bite? */
+            static int noted;
+            if (s_gpu.inline_count <= 4096 && s_gpu.inline_count + room > 4096 && !noted++)
+                fprintf(stderr, "  [GPU] INLINE_ARRAY batch past 4096 dwords (%u): the old cap would have cut it\n",
+                        s_gpu.inline_count + room);
+        }
         s_gpu.inline_count += room;
         return n;
     }

@@ -147,8 +147,35 @@ static void perf_memory(void)
     }
 }
 
+/* A slow frame (> 25 ms once play is under way): what happened during it, so
+ * hitches can be attributed -- guest file reads (kernel_file.c), texture
+ * uploads, new render targets, pixel shader variants made ready, draws, and
+ * the time Present itself blocked. */
+extern volatile LONG64 g_xbox_read_qpc, g_xbox_read_bytes, g_xbox_read_count;
+extern volatile LONG64 g_pb_exec_qpc, g_pb_qwait_qpc, g_pb_capture_qpc;   /* xbox_memory_layout.c */
+static void perf_hitch(float ms, float present_ms)
+{
+    static LONG64 rq, rb, rc, ex, qw, cp;
+    static uint32_t draws, texup, surfs;
+    static LONG ps;
+    static unsigned logged;
+    LONG64 q = g_xbox_read_qpc, b = g_xbox_read_bytes, c = g_xbox_read_count;
+    LONG64 e = g_pb_exec_qpc, w = g_pb_qwait_qpc, k = g_pb_capture_qpc;
+    double f = 1000.0 / (double)s_perf.freq.QuadPart;
+    if (ms > 25.0f && s_perf.n > 1800 && logged < 400) {
+        logged++;
+        fprintf(stderr, "  [HITCH] %.1f ms: present %.1f ms, reads %lld (%lld KB, %.1f ms), tex uploads %u, new targets %u, "
+                        "ps ready %ld, draws %u; render thread %.1f ms, queue wait %.1f ms, capture %.1f ms\n",
+                ms, present_ms, (long long)(c - rc), (long long)((b - rb) >> 10), (double)(q - rq) * f,
+                s_gpu11.tex_uploads - texup, s_gpu11.surf_creates - surfs, s_ps_ready - ps, s_gpu11.draws - draws,
+                (double)(e - ex) * f, (double)(w - qw) * f, (double)(k - cp) * f);
+    }
+    rq = q; rb = b; rc = c; ex = e; qw = w; cp = k;
+    draws = s_gpu11.draws; texup = s_gpu11.tex_uploads; surfs = s_gpu11.surf_creates; ps = s_ps_ready;
+}
+
 /* Called once per present, after the swap chain's Present returned. */
-static void perf_on_present(int scale)
+static void perf_on_present(int scale, float present_ms)
 {
     LARGE_INTEGER now;
     float ms;
@@ -167,6 +194,7 @@ static void perf_on_present(int scale)
     s_perf.n++;
     s_perf.win_frames++; s_perf.win_ft_sum += ms; if (ms > s_perf.win_ft_max) s_perf.win_ft_max = ms;
     s_perf.pub_frames++; s_perf.pub_ft_sum += ms;
+    perf_hitch(ms, present_ms);
     if (!s_perf.csv_tried) {
         const char *p = getenv("NFL2K5_FRAMETIME_CSV");
         s_perf.csv_tried = 1;

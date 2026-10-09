@@ -927,10 +927,18 @@ static ID3D11ShaderResourceView *gpu_texture(int st, int cube)
                     uint32_t *dst = pix + (size_t)f * n;
                     const uint8_t *src = mem + t->offset + f * face_bytes;
                     if (t->color == 0x0B) {
-                        static uint8_t idx[1024 * 1024];
+                        /* Grows to the largest paletted texture seen; was a
+                         * fixed 1024x1024, so a bigger one (the NV2A allows
+                         * 4096x4096) failed to decode. */
+                        static uint8_t *idx;
+                        static size_t idx_cap;
                         const uint32_t *pal = (const uint32_t *)(mem + t->palette);
                         uint32_t k2;
-                        if (n > sizeof idx) { ok = 0; break; }
+                        if (n > idx_cap) {
+                            uint8_t *g = (uint8_t *)realloc(idx, n);
+                            if (!g) { ok = 0; break; }
+                            idx = g; idx_cap = n;
+                        }
                         xbox_unswizzle_rect(idx, src, t->width, t->height, 1);
                         for (k2 = 0; k2 < n; k2++)
                             dst[k2] = pal[idx[k2]];

@@ -675,6 +675,32 @@ static void menu_activate(int item)
     s_pr.ovl_valid = 0;
 }
 
+/* ---- settings pages (2026-10-09) -----------------------------------------
+ * The F1 page shows one page at a time; LB/RB (Page Up/Page Down) switch.
+ * Page 0 is Video; the title adds its own (src/nfl2k5_controls.c adds
+ * Controls) with xbox_MenuAddPage. A page that is waiting for input of its
+ * own -- binding a button -- returns nonzero from busy(), and the menu then
+ * leaves the controller to it. */
+typedef struct XboxMenuPage {
+    const char *title;
+    int (*count)(void);
+    void (*label)(int row, char *name, char *val, size_t n);
+    void (*change)(int row, int dir);
+    void (*activate)(int row);
+    int (*busy)(void);
+} XboxMenuPage;
+static int video_page_count(void) { return MI_COUNT; }
+static const XboxMenuPage k_video_page = { "VIDEO SETTINGS", video_page_count, menu_label, menu_change, menu_activate, NULL };
+#define MENU_MAX_PAGES 6
+static const XboxMenuPage *s_pages[MENU_MAX_PAGES] = { &k_video_page };
+static int s_npages = 1, s_menu_page;
+void xbox_MenuAddPage(const XboxMenuPage *p) { if (p && s_npages < MENU_MAX_PAGES) s_pages[s_npages++] = p; }
+int (*g_xbox_menu_pad)(XBOX_GAMEPAD *g);    /* set by the title's controller layer */
+void xbox_MenuInvalidate(void) { s_pr.ovl_valid = 0; }
+int xbox_MenuIsOpen(void) { return s_menu_open != 0; }
+static const XboxMenuPage *menu_page(void) { return s_pages[s_menu_page % s_npages]; }
+static int menu_rows(void) { int n = menu_page()->count(); return n > 0 ? n : 1; }
+
 /* ---- the in-game Video Settings screen ----------------------------------
  * src/nfl2k5_video_menu.c adds "Video Settings" to the game's own Options
  * menu; its rows are these settings as indexed value lists. Called from the
@@ -860,14 +886,25 @@ static void menu_key(unsigned vk)
     }
     if (!s_menu_open)
         return;
-    switch (vk) {
-    case VK_UP:     s_menu_sel = (s_menu_sel + MI_COUNT - 1) % MI_COUNT; break;
-    case VK_DOWN:   s_menu_sel = (s_menu_sel + 1) % MI_COUNT; break;
-    case VK_LEFT:   menu_change(s_menu_sel, -1); break;
-    case VK_RIGHT:  menu_change(s_menu_sel, 1); break;
-    case VK_RETURN: case VK_SPACE: menu_activate(s_menu_sel); break;
-    case VK_ESCAPE: InterlockedExchange(&s_menu_open, 0); InterlockedExchange(&g_xbox_input_blocked, 0); break;
-    default: return;
+    {
+        const XboxMenuPage *pg = menu_page();
+        int rows = menu_rows();
+        if (pg->busy && pg->busy()) {                /* the page is reading input itself */
+            if (vk == VK_ESCAPE && pg->activate) pg->activate(-1);   /* -1: cancel */
+            s_pr.ovl_valid = 0;
+            return;
+        }
+        switch (vk) {
+        case VK_UP:     s_menu_sel = (s_menu_sel + rows - 1) % rows; break;
+        case VK_DOWN:   s_menu_sel = (s_menu_sel + 1) % rows; break;
+        case VK_LEFT:   if (pg->change) pg->change(s_menu_sel, -1); break;
+        case VK_RIGHT:  if (pg->change) pg->change(s_menu_sel, 1); break;
+        case VK_RETURN: case VK_SPACE: if (pg->activate) pg->activate(s_menu_sel); break;
+        case VK_PRIOR:  s_menu_page = (s_menu_page + s_npages - 1) % s_npages; s_menu_sel = 0; break;
+        case VK_NEXT:   s_menu_page = (s_menu_page + 1) % s_npages; s_menu_sel = 0; break;
+        case VK_ESCAPE: InterlockedExchange(&s_menu_open, 0); InterlockedExchange(&g_xbox_input_blocked, 0); break;
+        default: return;
+        }
     }
     s_pr.ovl_valid = 0;
 }
@@ -879,12 +916,24 @@ static void menu_pad(void)
     static DWORD repeat_at;
     XBOX_INPUT_STATE st;
     WORD b, down;
-    if (xbox_InputGetState(0, &st) != 0)
+    /* The title's controller layer (any pad, remapped) when it has one. */
+    extern int (*g_xbox_menu_pad)(XBOX_GAMEPAD *g);
+    if (g_xbox_menu_pad) {
+        memset(&st, 0, sizeof st);
+        if (!g_xbox_menu_pad(&st.Gamepad))
+            return;
+    } else if (xbox_InputGetState(0, &st) != 0)
         return;
     b = st.Gamepad.wButtons;
     if (st.Gamepad.bAnalogButtons[0] > 128) b |= 0x1000;   /* A */
     if (st.Gamepad.bAnalogButtons[1] > 128) b |= 0x2000;   /* B */
+    if (st.Gamepad.bAnalogButtons[4] > 128) b |= 0x4000;   /* LB (Black) */
+    if (st.Gamepad.bAnalogButtons[5] > 128) b |= 0x8000;   /* RB (White) */
     down = (WORD)(b & ~prev);
+    if (s_menu_open && menu_page()->busy && menu_page()->busy()) {   /* the page reads the pad itself */
+        prev = b;
+        return;
+    }
     if ((b & 0x30) == 0x30 && (down & 0x30)) {             /* Back + Start */
         menu_key(VK_F1);
         prev = b;
@@ -902,6 +951,8 @@ static void menu_pad(void)
         if (down & 0x08) menu_key(VK_RIGHT);
         if (down & 0x1000) menu_key(VK_RETURN);
         if (down & 0x2000) menu_key(VK_ESCAPE);
+        if (down & 0x4000) menu_key(VK_PRIOR);
+        if (down & 0x8000) menu_key(VK_NEXT);
     }
     prev = b;
 }
@@ -910,7 +961,8 @@ static void menu_pad(void)
  * upload it; alpha is made from a colour key. */
 static void pr_build_overlay(void)
 {
-    const int W = 720, H = 560;
+    /* Tall enough for the open page's rows (32 px each), at least the old 560. */
+    const int W = 760, H = s_menu_open && 90 + menu_rows() * 32 + 80 > 560 ? 90 + menu_rows() * 32 + 80 : 560;
     BITMAPINFO bi;
     void *bits = NULL;
     HDC dc;
@@ -945,12 +997,21 @@ static void pr_build_overlay(void)
         FillRect(dc, &tr, bar);
         of = (HFONT)SelectObject(dc, fb);
         SetTextColor(dc, RGB(255, 255, 255));
-        TextOutA(dc, 40, 30, "VIDEO SETTINGS", 14);
+        TextOutA(dc, 40, 30, menu_page()->title, (int)strlen(menu_page()->title));
+        if (s_npages > 1) {                          /* which page, and how to switch */
+            char pg[48];
+            SIZE ps;
+            SelectObject(dc, fs);
+            snprintf(pg, sizeof pg, "LB / RB  page %d of %d", s_menu_page % s_npages + 1, s_npages);
+            GetTextExtentPoint32A(dc, pg, (int)strlen(pg), &ps);
+            TextOutA(dc, W - 40 - ps.cx, 36, pg, (int)strlen(pg));
+        }
         SelectObject(dc, fs);
-        for (i = 0; i < MI_COUNT; i++) {
-            char name[64], val[64];
+        for (i = 0; i < menu_rows(); i++) {
+            char name[64], val[96];
             int y = 90 + i * 32;
-            menu_label(i, name, val, sizeof val);
+            name[0] = val[0] = 0;
+            menu_page()->label(i, name, val, sizeof val);
             if (i == s_menu_sel) {
                 RECT sr = { 30, y - 2, W - 30, y + 30 };
                 FillRect(dc, &sr, selb);
@@ -1383,7 +1444,7 @@ static int pr_present(uint32_t guest)
         QueryPerformanceCounter(&a);
         IDXGISwapChain1_Present(s_pr.sc, s_vs.vsync ? 1u : 0u, 0);
         QueryPerformanceCounter(&b);
-        perf_on_present(s_vs.scale);
+        perf_on_present(s_vs.scale, (float)((double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)s_perf.freq.QuadPart));
         QueryPerformanceFrequency(&fq);
         if ((b.QuadPart - a.QuadPart) * 1000 / fq.QuadPart > 200)
             fprintf(stderr, "  [PRESENT] Present took %lld ms (thread %lu)\n",

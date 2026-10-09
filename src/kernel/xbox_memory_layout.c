@@ -1053,6 +1053,9 @@ static volatile LONG s_q_len, s_q_busy;
 static SRWLOCK s_q_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE s_q_space = CONDITION_VARIABLE_INIT;
 #define PB_QUEUE_MAX 48              /* submissions the title may run ahead */
+/* Frame statistics (nv2a_gpu_perf.inc.c hitch log): render-thread execution
+ * time, game-thread time waiting for queue space, and capture time. */
+volatile LONG64 g_pb_exec_qpc, g_pb_qwait_qpc, g_pb_capture_qpc;
 
 static DWORD WINAPI pb_async_thread(LPVOID param)
 {
@@ -1074,14 +1077,14 @@ static DWORD WINAPI pb_async_thread(LPVOID param)
             WaitForSingleObject(s_async_ev, 2);
             continue;
         }
-        if (pb_profile_enabled()) QueryPerformanceCounter(&t0);
+        QueryPerformanceCounter(&t0);
         AcquireSRWLockExclusive(&s_pb_exec_lock);
         nv2a_pb_exec_linear(r->w, r->n);
         ReleaseSRWLockExclusive(&s_pb_exec_lock);
-        if (pb_profile_enabled()) {
-            QueryPerformanceCounter(&t1);
+        QueryPerformanceCounter(&t1);
+        InterlockedAdd64(&g_pb_exec_qpc, t1.QuadPart - t0.QuadPart);
+        if (pb_profile_enabled())
             pb_profile_sample(t1.QuadPart - t0.QuadPart);
-        }
         AcquireSRWLockExclusive(&s_snap_lock);
         s_snap_done = r->snap;
         s_snap_done_valid = 1;
@@ -1166,7 +1169,9 @@ void xbox_Nv2aKick(void)
             static uint32_t last_put;
             PbRec *r = (PbRec *)calloc(1, sizeof *r);
             volatile uint32_t *getp = (volatile uint32_t *)((char *)g_nv2a_memory + NV2A_USER_DMA_GET);
+            LARGE_INTEGER c0, c1, c2;
             if (!r) return;
+            QueryPerformanceCounter(&c0);
             r->snap = snap;
             if (last_put && snap.put != last_put) {
                 int ok = 1;
@@ -1179,9 +1184,13 @@ void xbox_Nv2aKick(void)
             }
             last_put = snap.put;
             *getp = snap.put;
+            QueryPerformanceCounter(&c1);
             AcquireSRWLockExclusive(&s_q_lock);
             while (s_q_len >= PB_QUEUE_MAX)
                 SleepConditionVariableSRW(&s_q_space, &s_q_lock, 50, 0);
+            QueryPerformanceCounter(&c2);
+            InterlockedAdd64(&g_pb_capture_qpc, c1.QuadPart - c0.QuadPart);
+            InterlockedAdd64(&g_pb_qwait_qpc, c2.QuadPart - c1.QuadPart);
             if (s_q_tail) s_q_tail->next = r; else s_q_head = r;
             s_q_tail = r;
             InterlockedIncrement(&s_q_len);
