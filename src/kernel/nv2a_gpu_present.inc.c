@@ -38,7 +38,7 @@ typedef struct {
     int mode;               /* VM_* */
     int res_w, res_h;       /* windowed client size / fullscreen mode */
     int aspect;             /* AR_* */
-    int scale;              /* internal resolution multiplier, 1..12 */
+    int scale;              /* internal resolution multiplier, 1..16 (device may step down safely) */
     int filter;             /* SF_* */
     int vsync;
     int brightness;         /* percent */
@@ -48,6 +48,7 @@ typedef struct {
     int aniso;              /* 1 (off), 2, 4, 8, 16 */
     int fps_limit;          /* frame-rate cap in Hz: 30, 60, 120; 0 unlimited; -1 original (game's own 30/60) */
     int widescreen;         /* built-in Hor+ widescreen: the picture fills the window */
+    int lighting;           /* 0 classic, 1 enhanced, 2 maximum */
 } VideoSettings;
 
 /* NFL 2K5 draws several full-screen backdrops only inside the 640-pixel
@@ -85,10 +86,12 @@ static void vs_load(void)
         else if (!strcmp(key, "aniso")) s_vs.aniso = v;
         else if (!strcmp(key, "fps_limit")) s_vs.fps_limit = v;
         else if (!strcmp(key, "widescreen")) s_vs.widescreen = v != 0;
+        else if (!strcmp(key, "lighting")) s_vs.lighting = v;
     }
     fclose(f);
     if (s_vs.scale < 1) s_vs.scale = 1;
-    if (s_vs.scale > 12) s_vs.scale = 12;   /* 12x = 8640x5760 */
+    if (s_vs.scale > 16) s_vs.scale = 16;   /* stable maximum for the supported display modes */
+    if (s_vs.lighting < 0 || s_vs.lighting > 2) s_vs.lighting = 0;
     if (s_vs.filter < SF_BILINEAR || s_vs.filter > SF_ENHANCED) s_vs.filter = SF_ENHANCED;
     if (s_vs.crop < 0) s_vs.crop = 0;
     if (s_vs.crop > 40) s_vs.crop = 40;
@@ -107,7 +110,7 @@ static void vs_save(void)
                "mode = %d\nresolution = %dx%d\n"
                "; aspect: 0 fill the screen (a wider view when it is wider than 16:9), 1 stretch, 2 16:9 with bars, 3 21:9, 4 32:9, 5 zoom to fill\n"
                "aspect = %d\n"
-               "; scale: internal resolution = 720x480 times this (1..12; 12 = 8640x5760)\n"
+               "; scale: internal resolution = 720x480 times this (1..16; hardware/display limits step it down safely)\n"
                "scale = %d\n"
                "; filter: 0 bilinear, 1 sharp bilinear, 2 nearest, 3 enhanced\n"
                "filter = %d\nvsync = %d\nbrightness = %d\ngamma = %d\ncrop = %d\nshow_fps = %d\naniso = %d\n"
@@ -115,9 +118,11 @@ static void vs_save(void)
                "; simulates at most 60 frames a second); -1 original: the game's own 30/60 per camera\n"
                "fps_limit = %d\n"
                "; widescreen: 1 fills the screen with a wider view (built-in widescreen), 0 the original 4:3 picture\n"
-               "widescreen = %d\n",
+               "widescreen = %d\n"
+               "; lighting: 0 classic Xbox, 1 enhanced material response, 2 maximum material response\n"
+               "lighting = %d\n",
             s_vs.mode, s_vs.res_w, s_vs.res_h, s_vs.aspect, s_vs.scale, s_vs.filter, s_vs.vsync,
-            s_vs.brightness, s_vs.gamma, s_vs.crop, s_vs.show_fps, s_vs.aniso, s_vs.fps_limit, s_vs.widescreen);
+            s_vs.brightness, s_vs.gamma, s_vs.crop, s_vs.show_fps, s_vs.aniso, s_vs.fps_limit, s_vs.widescreen, s_vs.lighting);
     fclose(f);
 }
 
@@ -283,10 +288,11 @@ static int pr_init(void)
     {   /* NFL2K5_RENDER_SCALE overrides the saved scale for this run only
          * (performance captures); the ini is left alone. */
         const char *e = getenv("NFL2K5_RENDER_SCALE");
-        if (e && atoi(e) >= 1 && atoi(e) <= 12) s_vs.scale = atoi(e);
+        if (e && atoi(e) >= 1 && atoi(e) <= 16) s_vs.scale = atoi(e);
     }
     g_render_scale = (uint32_t)s_vs.scale;
     g_aniso = (uint32_t)s_vs.aniso;
+    g_lighting_profile = (uint32_t)s_vs.lighting;
     return s_pr.ok;
 }
 
@@ -600,7 +606,7 @@ static void pr_draw_hud(float gx, float gy, float gw, float gh)
 
 /* ---- the settings page -------------------------------------------------- */
 
-enum { MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_FILTER, MI_VSYNC, MI_BRIGHT, MI_GAMMA, MI_CROP,
+enum { MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_LIGHTING, MI_FILTER, MI_VSYNC, MI_BRIGHT, MI_GAMMA, MI_CROP,
        MI_ANISO, MI_FPS, MI_LIMIT, MI_RESET, MI_CLOSE, MI_COUNT };
 static const int k_fps_limits[] = { 30, 60, 120, 0, -1 };
 #define FPS_LIMITS 5
@@ -617,6 +623,7 @@ static void menu_label(int item, char *name, char *val, size_t n)
     static const char *aspects[] = { "Fill screen (widens to fit)", "Stretch to screen", "16:9 (black bars)", "21:9 widescreen",
                                      "32:9 widescreen", "Zoom to fill (crop)" };
     static const char *filters[] = { "Bilinear", "Sharp bilinear", "Nearest (pixelated)", "Enhanced sharp" };
+    static const char *lighting[] = { "Classic Xbox", "Enhanced", "Maximum" };
     val[0] = 0;
     switch (item) {
     case MI_MODE:   strcpy(name, "Display mode"); snprintf(val, n, "%s", modes[s_vs.mode % 3]); break;
@@ -625,6 +632,7 @@ static void menu_label(int item, char *name, char *val, size_t n)
     case MI_ASPECT: strcpy(name, "Aspect ratio"); snprintf(val, n, "%s", aspects[s_vs.aspect % 6]); break;
     case MI_SCALE:  strcpy(name, "Internal resolution");
                     snprintf(val, n, "%dx  (%d x %d)", s_vs.scale, 720 * s_vs.scale, 480 * s_vs.scale); break;
+    case MI_LIGHTING: strcpy(name, "Lighting and materials"); snprintf(val, n, "%s", lighting[s_vs.lighting % 3]); break;
     case MI_FILTER: strcpy(name, "Upscaling filter"); snprintf(val, n, "%s", filters[s_vs.filter % 4]); break;
     case MI_VSYNC:  strcpy(name, "VSync"); snprintf(val, n, "%s", s_vs.vsync ? "On" : "Off"); break;
     case MI_BRIGHT: strcpy(name, "Brightness"); snprintf(val, n, "%d%%", s_vs.brightness); break;
@@ -656,7 +664,8 @@ static void menu_change(int item, int dir)
         InterlockedExchange(&s_vs_dirty, 1);
         break;
     case MI_ASPECT: s_vs.aspect = (s_vs.aspect + 6 + dir) % 6; break;
-    case MI_SCALE:  s_vs.scale += dir; if (s_vs.scale < 1) s_vs.scale = 12; if (s_vs.scale > 12) s_vs.scale = 1; break;
+    case MI_SCALE:  s_vs.scale += dir; if (s_vs.scale < 1) s_vs.scale = 16; if (s_vs.scale > 16) s_vs.scale = 1; break;
+    case MI_LIGHTING: s_vs.lighting = (s_vs.lighting + 3 + dir) % 3; break;
     case MI_FILTER: s_vs.filter = (s_vs.filter + 4 + dir) % 4; break;
     case MI_VSYNC:  s_vs.vsync = !s_vs.vsync; break;
     case MI_BRIGHT: s_vs.brightness += 5 * dir; if (s_vs.brightness < 50) s_vs.brightness = 50;
@@ -725,7 +734,7 @@ static int menu_rows(void) { int n = menu_page()->count(); return n > 0 ? n : 1;
  * menu; its rows are these settings as indexed value lists. Called from the
  * game thread: changes mark the swap chain for re-applying on the next flip
  * and are saved at once. */
-static const int k_vm_items[] = { MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_FILTER, MI_VSYNC,
+static const int k_vm_items[] = { MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_LIGHTING, MI_FILTER, MI_VSYNC,
                                   MI_BRIGHT, MI_GAMMA, MI_CROP, MI_ANISO, MI_FPS, MI_LIMIT };
 #define VM_COUNT ((int)(sizeof k_vm_items / sizeof k_vm_items[0]))
 static const int k_vm_aniso[] = { 1, 2, 4, 8, 16 };
@@ -734,7 +743,7 @@ int xbox_VideoSettingCount(void) { return VM_COUNT; }
 
 const char *xbox_VideoSettingName(int i)
 {
-    static const char *names[] = { "Display Mode", "Resolution", "Widescreen", "Aspect Ratio", "Render Scale",
+    static const char *names[] = { "Display Mode", "Resolution", "Widescreen", "Aspect Ratio", "Render Scale", "Lighting & Materials",
                                    "Upscaling Filter", "VSync", "Brightness", "Gamma",
                                    "Overscan Crop", "Texture Filtering", "Show FPS", "Frame Rate Cap" };
     return (i >= 0 && i < VM_COUNT) ? names[i] : "";
@@ -753,7 +762,8 @@ int xbox_VideoSettingValues(int i)
     case MI_FILTER: return 4;
     case MI_RES:    res_build(); return s_nres ? s_nres : 1;
     case MI_ASPECT: return 6;
-    case MI_SCALE:  return 12;
+    case MI_SCALE:  return 16;
+    case MI_LIGHTING: return 3;
     case MI_VSYNC: case MI_FPS: case MI_WIDE: return 2;
     case MI_BRIGHT: case MI_GAMMA: return 21;
     case MI_CROP: case MI_ANISO: return 5;
@@ -774,6 +784,7 @@ static int vm_get(const VideoSettings *vs, int item)
         return 0;
     case MI_ASPECT: return vs->aspect;
     case MI_SCALE:  return vs->scale - 1;
+    case MI_LIGHTING: return vs->lighting;
     case MI_FILTER: return vs->filter;
     case MI_VSYNC:  return vs->vsync ? 1 : 0;
     case MI_BRIGHT: return (vs->brightness - 50) / 5;
@@ -800,6 +811,7 @@ static void vm_set(VideoSettings *vs, int item, int idx)
     case MI_RES:    res_build(); if (idx < s_nres) { vs->res_w = s_res[idx][0]; vs->res_h = s_res[idx][1]; } break;
     case MI_ASPECT: vs->aspect = idx; break;
     case MI_SCALE:  vs->scale = idx + 1; break;
+    case MI_LIGHTING: vs->lighting = idx; break;
     case MI_FILTER: vs->filter = idx; break;
     case MI_VSYNC:  vs->vsync = idx; break;
     case MI_BRIGHT: vs->brightness = 50 + 5 * idx; break;
@@ -818,6 +830,7 @@ void xbox_VideoSettingValueName(int i, int idx, char *buf, size_t n)
     static const char *aspects[] = { "Fill Screen", "Stretch", "16:9 Bars", "21:9 Wide",
                                      "32:9 Wide", "Zoom to Fill" };
     static const char *filters[] = { "Bilinear", "Sharp Bilinear", "Nearest", "Enhanced Sharp" };
+    static const char *lighting[] = { "Classic Xbox", "Enhanced", "Maximum" };
     VideoSettings v = s_vs;
     int item;
     buf[0] = 0;
@@ -829,6 +842,7 @@ void xbox_VideoSettingValueName(int i, int idx, char *buf, size_t n)
     case MI_RES:    snprintf(buf, n, "%d x %d", v.res_w, v.res_h); break;
     case MI_ASPECT: snprintf(buf, n, "%s", aspects[v.aspect % 6]); break;
     case MI_SCALE:  snprintf(buf, n, "%dx (%d x %d)", v.scale, 720 * v.scale, 480 * v.scale); break;
+    case MI_LIGHTING: snprintf(buf, n, "%s", lighting[v.lighting % 3]); break;
     case MI_FILTER: snprintf(buf, n, "%s", filters[v.filter % 4]); break;
     case MI_VSYNC:  snprintf(buf, n, "%s", v.vsync ? "On" : "Off"); break;
     case MI_BRIGHT: snprintf(buf, n, "%d%%", v.brightness); break;
@@ -1336,6 +1350,7 @@ static int pr_present(uint32_t guest)
         pr_apply_mode();
     g_render_scale = (uint32_t)s_vs.scale;     /* surfaces follow on their next use */
     g_aniso = (uint32_t)s_vs.aniso;
+    g_lighting_profile = (uint32_t)s_vs.lighting;
     s_ana_ar = pr_anamorphic_update();
     g_wide_ar = s_ana_ar > 0.0f ? 0.0f : pr_wanted_wide_ar();
     menu_pad();

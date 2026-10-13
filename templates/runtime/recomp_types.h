@@ -1130,6 +1130,9 @@ static uint32_t recomp_cr3;
 #define ebx g_ebx
 #define esi g_esi
 #define edi g_edi
+/* Direct/raw generated builds already operate on the shared registers. */
+#define RECOMP_REGS_OUT() ((void)0)
+#define RECOMP_REGS_IN() ((void)0)
 #define RECOMP_CALL(fn) fn()
 #endif
 

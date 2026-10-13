@@ -53,6 +53,7 @@ typedef struct {
     ID3D11DepthStencilView *dsv;
     ID3D11Texture2D *staging;
     uint32_t scale;                      /* render-target size = guest size x scale */
+    uint32_t requested_scale;            /* legal scale requested when this target was allocated */
     ID3D11Texture2D *down;               /* guest-sized target a scaled surface is read back through */
     ID3D11RenderTargetView *down_rtv;
     ID3D11Texture2D *copy;               /* GPU copy sampled when the target is a texture */
@@ -70,6 +71,9 @@ typedef struct {
  * times its guest size. Set by the presenter; surfaces follow on next use. */
 static uint32_t g_render_scale = 1;
 static uint32_t g_aniso = 1;
+/* 0 preserves the original Xbox combiner output. Optional profiles are
+ * applied after the emulated material/lighting pipeline. */
+static uint32_t g_lighting_profile = 0;
 
 /* Widescreen (Hor+). The game draws a 16:9 picture into its 720x480 surface and
  * never clips its geometry at the left and right edge (the NV2A has a guard
@@ -97,7 +101,7 @@ static uint32_t gpu_wide_ox(uint32_t w, uint32_t h)
 
 /* The scale a target of this guest size (with its widescreen columns) gets:
  * the setting, stepped down until it fits D3D11's 16384 texture limit (a 32:9
- * target at 12x would be 20480 wide). */
+ * target at a higher multiplier can exceed the hardware dimension limit). */
 static uint32_t gpu_fit_scale(uint32_t full_w, uint32_t h)
 {
     uint32_t sc = g_render_scale;
@@ -199,6 +203,7 @@ typedef struct {
     float    fogc[4];                    /* fog colour (RGB) */
     uint32_t depthfmt[4];                /* integer depth bits: 0 floating, 16 or 24 */
     float    depthofs[4];                /* polygon bias, slope factor, render scale */
+    uint32_t lighting[4];                /* optional post-combiner material/lighting profile */
 } GpuConsts;
 
 #include "nv2a_gpu_d3d11_hlsl.inc"   /* k_gpu_hlsl, from nv2a_gpu_d3d11.hlsl */
@@ -503,7 +508,9 @@ static int gpu_bind_surface(void)
         GpuSurface *s = &s_gpu11.surf[i];
         if (s->tex && s->guest == guest) {
             if (s->w == w && s->h == h && s->pitch == s_gpu.pitch
-                    && s->scale == gpu_fit_scale(w + 2 * gpu_wide_ox(w, h), h)
+                    /* Retain a prior lower allocation after an OOM step-down,
+                     * but rebuild if the player changes the requested scale. */
+                    && s->requested_scale == gpu_fit_scale(w + 2 * gpu_wide_ox(w, h), h)
                     && s->ox == gpu_wide_ox(w, h)) {
                 if (s->stale) {             /* the CPU drew into it since */
                     gpu_surface_upload(s);
@@ -529,17 +536,20 @@ static int gpu_bind_surface(void)
         D3D11_TEXTURE2D_DESC td;
         uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
         D3D11_SUBRESOURCE_DATA sd;
-        memset(&td, 0, sizeof td);
         uint32_t ox = gpu_wide_ox(w, h), sc = gpu_fit_scale(w + 2 * ox, h);
+        uint32_t requested_sc = sc;
+retry_surface_create:
+        memset(&td, 0, sizeof td);
         td.Width = (w + 2 * ox) * sc; td.Height = h * sc; td.MipLevels = td.ArraySize = 1;
         td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
         sd.pSysMem = mem + guest; sd.SysMemPitch = s_gpu.pitch; sd.SysMemSlicePitch = 0;
-        if (FAILED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, sc == 1 && !ox ? &sd : NULL, &s->tex)))
-            return -1;
-        ID3D11Device_CreateRenderTargetView(s_gpu11.dev, (ID3D11Resource *)s->tex, NULL, &s->rtv);
-        s->guest = guest; s->w = w; s->h = h; s->pitch = s_gpu.pitch; s->scale = sc; s->ox = ox;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, sc == 1 && !ox ? &sd : NULL, &s->tex)) ||
+                FAILED(ID3D11Device_CreateRenderTargetView(s_gpu11.dev, (ID3D11Resource *)s->tex, NULL, &s->rtv)))
+            goto surface_create_failed;
+        s->guest = guest; s->w = w; s->h = h; s->pitch = s_gpu.pitch;
+        s->scale = sc; s->requested_scale = requested_sc; s->ox = ox;
         s_gpu11.surf_creates++;
         {
             static unsigned wide_logged;
@@ -556,27 +566,36 @@ static int gpu_bind_surface(void)
         td.Width = w; td.Height = h;
         if (ox) {                              /* the original-width centre (see gpu_readback) */
             td.Width = w * sc; td.Height = h * sc;
-            ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, NULL, &s->ctr);
-            if (s->ctr)
-                ID3D11Device_CreateRenderTargetView(s_gpu11.dev, (ID3D11Resource *)s->ctr, NULL, &s->ctr_rtv);
+            if (FAILED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, NULL, &s->ctr)) || !s->ctr ||
+                    FAILED(ID3D11Device_CreateRenderTargetView(s_gpu11.dev, (ID3D11Resource *)s->ctr, NULL, &s->ctr_rtv)))
+                goto surface_create_failed;
             td.Width = w; td.Height = h;
         }
         if (sc > 1 || ox) {                    /* guest-sized: readback goes through it */
-            ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, NULL, &s->down);   /* td has RT|SRV */
-            if (s->down)
-                ID3D11Device_CreateRenderTargetView(s_gpu11.dev, (ID3D11Resource *)s->down, NULL, &s->down_rtv);
+            if (FAILED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, NULL, &s->down)) || !s->down ||
+                    FAILED(ID3D11Device_CreateRenderTargetView(s_gpu11.dev, (ID3D11Resource *)s->down, NULL, &s->down_rtv)))
+                goto surface_create_failed;
             gpu_surface_upload(s);
         }
         td.Usage = D3D11_USAGE_STAGING; td.BindFlags = 0; td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, NULL, &s->staging);
+        if (FAILED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, NULL, &s->staging)) || !s->staging)
+            goto surface_create_failed;
         td.Width = (w + 2 * ox) * sc; td.Height = h * sc;
         td.Usage = D3D11_USAGE_DEFAULT; td.CPUAccessFlags = 0;
         td.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT; td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
-        ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, NULL, &s->ds);
-        ID3D11Device_CreateDepthStencilView(s_gpu11.dev, (ID3D11Resource *)s->ds, NULL, &s->dsv);
+        if (FAILED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, NULL, &s->ds)) || !s->ds ||
+                FAILED(ID3D11Device_CreateDepthStencilView(s_gpu11.dev, (ID3D11Resource *)s->ds, NULL, &s->dsv)) || !s->dsv)
+            goto surface_create_failed;
         ID3D11DeviceContext_ClearDepthStencilView(s_gpu11.ctx, s->dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
         s->dirty = 0;
+        if (sc != requested_sc)
+            fprintf(stderr, "  [GPU11] render target requested %ux, allocated %ux after memory fallback\n", requested_sc, sc);
         return free_i;
+surface_create_failed:
+        gpu_release_surface(s);
+        if (sc > 1) { sc--; goto retry_surface_create; }
+        fprintf(stderr, "  [GPU11] could not allocate %ux%u render target even at 1x\n", w + 2 * ox, h);
+        return -1;
     }
 }
 
@@ -2018,6 +2037,7 @@ static int gpu_draw_batch_unlocked_body(int flat2d)
         c.depthofs[1] = s_vp.poly_offset_scale;
     }
     c.depthofs[2] = (float)surf->scale;
+    c.lighting[0] = g_lighting_profile;
     if (env_cached("RECOMP_GPU_DEPTH_TRACE")) {
         static uint32_t seen[64];
         static unsigned used;

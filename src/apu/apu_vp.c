@@ -81,6 +81,7 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
  * ============================================================ */
 
 static void voice_resampler_reset(uint16_t v);
+static void voice_resampler_stream_ready(uint16_t v);
 static uint8_t s_adpcm_cbo_valid[MCPX_HW_MAX_VOICES];   /* defined with voice_get_samples */
 static uint8_t s_adpcm_shift[MCPX_HW_MAX_VOICES];
 static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
@@ -470,9 +471,16 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                        (argument & NV1BA0_PIO_SET_VOICE_TAR_PITCH_STEP) >> 16);
         break;
     case NV1BA0_PIO_SET_VOICE_CFG_BUF_BASE:
+        /* A new base address is a seek/rebind, not a volume update.  Discard
+         * queued source samples and ADPCM alignment from the previous buffer
+         * so a restarted ambience or commentary stream cannot play stale
+         * audio before the new data. */
+        voice_resampler_reset((uint16_t)d->regs[NV_PAPU_FECV]);
+        s_adpcm_cbo_valid[(uint16_t)d->regs[NV_PAPU_FECV]] = 0;
+        s_adpcm_shift[(uint16_t)d->regs[NV_PAPU_FECV]] = 0;
         voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
-                       NV_PAVS_VOICE_CUR_PSL_START,
-                       NV_PAVS_VOICE_CUR_PSL_START_BA, argument);
+                        NV_PAVS_VOICE_CUR_PSL_START,
+                        NV_PAVS_VOICE_CUR_PSL_START_BA, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_CFG_BUF_LBO:
         if (getenv("RECOMP_APU_VOICE_LOG"))
@@ -488,9 +496,15 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             fprintf(stderr, "[VOICE] %03X set cbo %06X (was %06X, t=%lu)\n", (unsigned)d->regs[NV_PAPU_FECV], argument,
                     voice_get_mask(d, (uint16_t)d->regs[NV_PAPU_FECV], NV_PAVS_VOICE_PAR_OFFSET, NV_PAVS_VOICE_PAR_OFFSET_CBO),
                     GetTickCount());
+        /* CBO is explicitly moved by DirectSound when a voice is recycled or
+         * resumed.  The resampler owns a separate FIFO, so it must follow the
+         * guest cursor rather than replaying prefetched samples. */
+        voice_resampler_reset((uint16_t)d->regs[NV_PAPU_FECV]);
+        s_adpcm_cbo_valid[(uint16_t)d->regs[NV_PAPU_FECV]] = 0;
+        s_adpcm_shift[(uint16_t)d->regs[NV_PAPU_FECV]] = 0;
         voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
-                       NV_PAVS_VOICE_PAR_OFFSET,
-                       NV_PAVS_VOICE_PAR_OFFSET_CBO, argument);
+                        NV_PAVS_VOICE_PAR_OFFSET,
+                        NV_PAVS_VOICE_PAR_OFFSET_CBO, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_CFG_BUF_EBO:
         if (getenv("RECOMP_APU_VOICE_LOG"))
@@ -540,6 +554,12 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
         d->vp.ssl[current_voice].count[ssl] =
             (uint8_t)GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_COUNT);
+        /* Persistent voices use SSL A/B as a producer queue.  An empty
+         * packet is temporary silence, not end-of-stream; wake a resampler
+         * that reached that temporary gap as soon as the title submits more
+         * descriptors. */
+        if (d->vp.ssl[current_voice].count[ssl])
+            voice_resampler_stream_ready((uint16_t)current_voice);
         break;
     }
     case NV1BA0_PIO_SET_VOICE_SSL_B: {
@@ -555,6 +575,8 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
         d->vp.ssl[current_voice].count[ssl] =
             (uint8_t)GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_COUNT);
+        if (d->vp.ssl[current_voice].count[ssl])
+            voice_resampler_stream_ready((uint16_t)current_voice);
         break;
     }
 
@@ -1178,6 +1200,22 @@ static void voice_resampler_reset(uint16_t v)
 {
     memset(&s_rs[v], 0, sizeof(s_rs[v]));
     s_rs[v].pos = 1.0;
+}
+
+/* Unlike a one-shot voice, a persistent SSL voice is allowed to run out of
+ * descriptors while its producer refills A or B.  voice_resample records that
+ * temporary starvation in ended so it does not spin reading an empty list.
+ * The next SSL submission must clear it; VOICE_ON is not sent for every crowd
+ * or ambience packet.  Keep the interpolation history for a smooth restart,
+ * but discard the empty FIFO state. */
+static void voice_resampler_stream_ready(uint16_t v)
+{
+    VoiceResampler *r = &s_rs[v];
+    if (r->ended) {
+        r->ended = false;
+        r->fifo_i = 0;
+        r->fifo_n = 0;
+    }
 }
 
 static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],

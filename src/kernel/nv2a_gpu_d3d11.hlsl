@@ -61,6 +61,7 @@ cbuffer C : register(b0) {
     float4 fogc;          // fog colour; the factor arrives in wz.y
     uint4 depthfmt;       // x: 0 floating depth, or integer depth bit count
     float4 depthofs;      // x: polygon bias, y: slope factor, z: render scale
+    uint4 lighting;       // x: 0 classic, 1 enhanced, 2 maximum material response
 };
 
 // A specialised variant (gpu_ps_shader in nv2a_gpu_d3d11.inc.c) inserts,
@@ -398,6 +399,18 @@ float4 shade(PIn i)
         else if (alpha.y == 0x205u) ok = a8 != ref;
         else if (alpha.y == 0x206u) ok = a8 >= ref;
         if (!ok) discard;
+    }
+    /* Opt-in presentation finish. Opaque-only and post-combiner means HUD,
+     * fog, alpha testing, and transparency keep their authored Xbox path.
+     * COLOR1 is the original NV2A specular input, so helmet and metal
+     * highlights are retained without inventing normal maps. */
+    if (lighting.x != 0u && o.a >= 0.995) {
+        float strength = lighting.x == 1u ? 0.16 : 0.30;
+        float3 base = saturate(o.rgb);
+        float lum = dot(base, float3(0.2126, 0.7152, 0.0722));
+        float3 vivid = lerp(lum.xxx, base, 1.0 + strength * 0.30);
+        float sheen = max(max(d1.r, d1.g), d1.b);
+        o.rgb = saturate(lerp(base, vivid, strength) + sheen * sheen * strength * 0.12);
     }
     return o;
 }
