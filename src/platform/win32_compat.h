@@ -121,6 +121,7 @@ BOOL InitOnceComplete(PINIT_ONCE once, DWORD flags, LPVOID context);
 /* ---- Condition variables (paired with a CRITICAL_SECTION) ----------- */
 VOID InitializeConditionVariable(PCONDITION_VARIABLE cv);
 BOOL SleepConditionVariableCS(PCONDITION_VARIABLE cv, PCRITICAL_SECTION cs, DWORD ms);
+#define CONDITION_VARIABLE_LOCKMODE_SHARED 1u
 BOOL SleepConditionVariableSRW(PCONDITION_VARIABLE cv, PSRWLOCK lock, DWORD ms, ULONG flags);
 VOID WakeConditionVariable(PCONDITION_VARIABLE cv);
 VOID WakeAllConditionVariable(PCONDITION_VARIABLE cv);
@@ -176,7 +177,7 @@ HANDLE GetCurrentProcess(void);
 DWORD  GetCurrentProcessId(void);
 BOOL   SetThreadPriority(HANDLE h, int priority);
 int    GetThreadPriority(HANDLE h);
-VOID   SwitchToThread(void);
+BOOL   SwitchToThread(void);
 DWORD  QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data);
 
 /* ---- Sleep ------------------------------------------------------------ */
@@ -404,6 +405,7 @@ int   WideCharToMultiByte(UINT cp, DWORD flags, LPCWSTR wide, int wideCount,
 #define ERROR_MR_MID_NOT_FOUND        317u
 #define ERROR_INVALID_ADDRESS         487u
 #define ERROR_IO_PENDING              997u
+#define ERROR_TIMEOUT                 1460u
 #define ERROR_CANCELLED               1223u
 #define ERROR_NO_SYSTEM_RESOURCES     1450u
 #define ERROR_COMMITMENT_LIMIT        1455u
