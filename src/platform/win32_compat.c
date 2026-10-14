@@ -167,6 +167,10 @@ VOID AcquireSRWLockShared(PSRWLOCK lock)     { pthread_rwlock_rdlock(srw_lazy_in
 VOID ReleaseSRWLockShared(PSRWLOCK lock)     { pthread_rwlock_unlock(srw_lazy_init(lock)); }
 VOID AcquireSRWLockExclusive(PSRWLOCK lock)  { pthread_rwlock_wrlock(srw_lazy_init(lock)); }
 VOID ReleaseSRWLockExclusive(PSRWLOCK lock)  { pthread_rwlock_unlock(srw_lazy_init(lock)); }
+BOOLEAN TryAcquireSRWLockExclusive(PSRWLOCK lock)
+{
+    return pthread_rwlock_trywrlock(srw_lazy_init(lock)) == 0;
+}
 
 /* ===================================================================== */
 /* One-time initialisation                                               */
@@ -192,6 +196,38 @@ BOOL InitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN fn, PVOID param, PVOID *
     }
     pthread_mutex_unlock(&once_lock);
     return ok;
+}
+
+/* Begin/Complete form. Ptr: 0 = not started, 1 = running, 2 = done. A caller
+ * that finds it running waits for the initialiser to finish. */
+static pthread_mutex_t s_once_lk = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  s_once_cv = PTHREAD_COND_INITIALIZER;
+
+BOOL InitOnceBeginInitialize(PINIT_ONCE once, DWORD flags, PBOOL pending, LPVOID *context)
+{
+    (void)flags; (void)context;
+    pthread_mutex_lock(&s_once_lk);
+    while ((uintptr_t)once->Ptr == 1)
+        pthread_cond_wait(&s_once_cv, &s_once_lk);
+    if ((uintptr_t)once->Ptr == 2) {
+        *pending = FALSE;
+    } else {
+        once->Ptr = (PVOID)1;
+        *pending = TRUE;
+    }
+    pthread_mutex_unlock(&s_once_lk);
+    return TRUE;
+}
+
+BOOL InitOnceComplete(PINIT_ONCE once, DWORD flags, LPVOID context)
+{
+    (void)context;
+    pthread_mutex_lock(&s_once_lk);
+    /* INIT_ONCE_INIT_FAILED (0x4) leaves it un-run so a later call retries. */
+    once->Ptr = (PVOID)(uintptr_t)((flags & 0x4) ? 0 : 2);
+    pthread_cond_broadcast(&s_once_cv);
+    pthread_mutex_unlock(&s_once_lk);
+    return TRUE;
 }
 
 /* ===================================================================== */
@@ -232,6 +268,35 @@ BOOL SleepConditionVariableCS(PCONDITION_VARIABLE cv, PCRITICAL_SECTION cs, DWOR
     int rc = pthread_cond_timedwait(c, m, &ts);
     if (rc == ETIMEDOUT) { SetLastError(WAIT_TIMEOUT); return FALSE; }
     return TRUE;
+}
+
+/* SRW-lock flavour. A pthread_cond_t needs a mutex, not a rwlock, so each wait
+ * takes a private mutex before dropping the SRW lock; Wake* then signals
+ * without it, so a wake landing in that window is lost and the wait simply
+ * times out (callers loop and use bounded waits, as Win32 allows spurious
+ * wakeups and expects callers to re-check). */
+BOOL SleepConditionVariableSRW(PCONDITION_VARIABLE cv, PSRWLOCK lock, DWORD ms, ULONG flags)
+{
+    static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+    int shared = (flags & 1 /* CONDITION_VARIABLE_LOCKMODE_SHARED */) != 0;
+    BOOL ok = TRUE;
+    cv_lazy_init(cv);
+    pthread_cond_t *c = (pthread_cond_t *)cv->Ptr;
+    pthread_mutex_lock(&m);
+    if (shared) ReleaseSRWLockShared(lock); else ReleaseSRWLockExclusive(lock);
+    if (ms == INFINITE) {
+        pthread_cond_wait(c, &m);
+    } else {
+        struct timespec ts;
+        deadline_from_ms(ms, &ts);
+        if (pthread_cond_timedwait(c, &m, &ts) == ETIMEDOUT) {
+            SetLastError(WAIT_TIMEOUT);
+            ok = FALSE;
+        }
+    }
+    pthread_mutex_unlock(&m);
+    if (shared) AcquireSRWLockShared(lock); else AcquireSRWLockExclusive(lock);
+    return ok;
 }
 
 VOID WakeConditionVariable(PCONDITION_VARIABLE cv)
@@ -324,6 +389,13 @@ DWORD GetCurrentThreadId(void)
 }
 
 DWORD GetCurrentProcessId(void) { return (DWORD)getpid(); }
+DWORD GetThreadId(HANDLE h)
+{
+    w32_object *o = (w32_object *)h;
+    if (h == PSEUDO_CURRENT_THREAD) return GetCurrentThreadId();
+    if (!o || o->kind != K_THREAD) return 0;
+    return o->tid;
+}
 HANDLE GetCurrentThread(void)   { return t_self_obj ? (HANDLE)t_self_obj : PSEUDO_CURRENT_THREAD; }
 HANDLE GetCurrentProcess(void)  { return PSEUDO_CURRENT_PROCESS; }
 
@@ -968,6 +1040,12 @@ BOOL TrySubmitThreadpoolCallback(PTP_SIMPLE_CALLBACK callback,
 /* Waitable timers                                                       */
 /* ===================================================================== */
 
+HANDLE CreateWaitableTimerExW(LPSECURITY_ATTRIBUTES sa, LPCWSTR name, DWORD flags, DWORD access)
+{
+    (void)access;
+    return CreateWaitableTimerW(sa, (flags & 0x1 /* CREATE_WAITABLE_TIMER_MANUAL_RESET */) != 0, name);
+}
+
 HANDLE CreateWaitableTimerW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, LPCWSTR name)
 {
     (void)sa;
@@ -1071,6 +1149,12 @@ static int prot_from_page(DWORD protect)
     }
 }
 
+/* Length registry, defined with the view helpers below. Win32 frees by address
+ * alone -- UnmapViewOfFile takes no length and VirtualFree(MEM_RELEASE) is
+ * documented to take size 0 -- so the length has to be recoverable here or
+ * munmap cannot be called at all. */
+void view_register(void *addr, size_t len);
+size_t view_take(const void *addr);
 #if defined(__APPLE__)
 /* Darwin has no MAP_FIXED_NOREPLACE, and the two mmap options are both wrong
  * for VirtualAlloc: MAP_FIXED silently unmaps whatever already occupies the
@@ -1087,12 +1171,6 @@ static int prot_from_page(DWORD protect)
  * Memory from mach_vm_map is released by munmap like any other, because the
  * BSD and Mach halves of Darwin share one VM map, so VirtualFree is unchanged.
  */
-/* Length registry, defined with the view helpers below. Win32 frees by address
- * alone -- UnmapViewOfFile takes no length and VirtualFree(MEM_RELEASE) is
- * documented to take size 0 -- so the length has to be recoverable here or
- * munmap cannot be called at all. */
-void view_register(void *addr, size_t len);
-size_t view_take(const void *addr);
 
 static void *mach_map_fixed(void *address, size_t size, int prot)
 {

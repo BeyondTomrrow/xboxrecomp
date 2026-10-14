@@ -377,6 +377,7 @@ static void ac97_clear_reset_bits(void)
     }
 }
 
+#ifdef _WIN32
 static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
 {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
@@ -418,8 +419,13 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
 /* Arm the trap. Called once the MCPX aperture exists, and only alongside the
  * rest of RECOMP_AC97_READY: a title that never gets as far as resetting a
  * channel has nothing to gain from it, and the page fault costs something. */
+#endif /* _WIN32 */
 static void ac97_arm_write_trap(void)
 {
+#ifndef _WIN32
+    /* The reset-bit trap needs the x86 trap flag in a Windows VEH. */
+    return;
+#else
     DWORD old;
 
     if (!g_mcpx_memory || g_ac97_page)
@@ -443,6 +449,7 @@ static void ac97_arm_write_trap(void)
     fprintf(stderr, "  AC97: bus-master writes trapped at 0x%08X"
                     " (channel reset completes on write)\n",
             XBOX_MCPX_BASE + AC97_NABM_OFFSET);
+#endif /* _WIN32 */
 }
 
 static const uint32_t MCPX_COUNTERS[] = {

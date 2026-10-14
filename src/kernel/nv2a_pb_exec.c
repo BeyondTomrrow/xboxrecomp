@@ -24,7 +24,7 @@
  * has not given us any vertices". RECOMP_FB_DUMP=<prefix> writes the surface to
  * <prefix>NNN.bmp, so the result can be looked at without a display.
  */
-#include <windows.h>
+#include "platform/xbox_winnt.h"
 #include <float.h>
 #include <math.h>
 #include <stdio.h>
@@ -3637,7 +3637,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              * recorded pushbuffer whose fixups land after we ran it. */
             static uint32_t zva[8], zdraw[8], nz, zdone;
             {
-                extern volatile uint32_t g_nv2a_pb_last_word_va;
+                extern uint32_t g_nv2a_pb_last_word_va;
                 const uint8_t *gm = (const uint8_t *)xbox_GetMemoryOffset();
                 if (method == 0x1B00 && param == 0 && nz < 8) {
                     zva[nz] = g_nv2a_pb_last_word_va; zdraw[nz] = s_gpu.draws; nz++;

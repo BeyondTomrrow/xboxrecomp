@@ -9,14 +9,22 @@
 #ifndef APU_ENV_H
 #define APU_ENV_H
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <pthread.h>
+#endif
 #include <stdlib.h>
 #include <stdint.h>
 
 static const char *apu_env_cached(const char *name)
 {
     static struct { const char *volatile name; const char *value; } tab[256];
+#ifdef _WIN32
     static SRWLOCK lock = SRWLOCK_INIT;
+#else
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+#endif
     uintptr_t k = (uintptr_t)name;
     unsigned start = (unsigned)(((k >> 3) * 2654435761u) >> 8) & 255u, h, i;
     for (i = 0, h = start; i < 256; i++, h = (h + 1) & 255u) {
@@ -24,17 +32,25 @@ static const char *apu_env_cached(const char *name)
         if (n == name) return tab[h].value;
         if (!n) break;
     }
+#ifdef _WIN32
     AcquireSRWLockExclusive(&lock);
+#else
+    pthread_mutex_lock(&lock);
+#endif
     for (i = 0, h = start; i < 256; i++, h = (h + 1) & 255u) {
         if (tab[h].name == name) break;
         if (!tab[h].name) {
             tab[h].value = getenv(name);
-            MemoryBarrier();
+            __sync_synchronize();
             tab[h].name = name;
             break;
         }
     }
+#ifdef _WIN32
     ReleaseSRWLockExclusive(&lock);
+#else
+    pthread_mutex_unlock(&lock);
+#endif
     return i < 256 ? tab[h].value : getenv(name);
 }
 #define getenv(name) apu_env_cached(name)

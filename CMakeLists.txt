@@ -20,6 +20,10 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 # Common definitions for all targets
+if(UNIX)
+    # ucontext REG_* names (MMIO fault hooks), and other glibc extensions
+    add_compile_definitions(_GNU_SOURCE)
+endif()
 add_compile_definitions(
     WIN32_LEAN_AND_MEAN
     NOMINMAX

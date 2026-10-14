@@ -7,9 +7,11 @@
  */
 
 #include <SDL3/SDL.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "video_player.h"   /* xbox_FramebufferDumpBmp */
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 

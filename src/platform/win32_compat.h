@@ -92,6 +92,8 @@ LONG InterlockedExchangeAdd(volatile LONG *Addend, LONG Value);
 LONG InterlockedCompareExchange(volatile LONG *Dest, LONG Exchange, LONG Comparand);
 LONGLONG InterlockedCompareExchange64(volatile LONGLONG *Dest, LONGLONG Exchange, LONGLONG Comparand);
 PVOID InterlockedCompareExchangePointer(PVOID volatile *Dest, PVOID Exchange, PVOID Comparand);
+#define InterlockedAdd64(p, v) __atomic_add_fetch((volatile LONGLONG *)(p), (LONGLONG)(v), __ATOMIC_SEQ_CST)
+#define MemoryBarrier()        __atomic_thread_fence(__ATOMIC_SEQ_CST)
 
 /* ---- Critical sections ------------------------------------------------- */
 VOID InitializeCriticalSection(LPCRITICAL_SECTION cs);
@@ -107,13 +109,19 @@ VOID AcquireSRWLockShared(PSRWLOCK lock);
 VOID ReleaseSRWLockShared(PSRWLOCK lock);
 VOID AcquireSRWLockExclusive(PSRWLOCK lock);
 VOID ReleaseSRWLockExclusive(PSRWLOCK lock);
+BOOLEAN TryAcquireSRWLockExclusive(PSRWLOCK lock);
 
 /* ---- One-time initialisation ------------------------------------------- */
 BOOL InitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN fn, PVOID param, PVOID *context);
+/* Begin/Complete form (synchronous only): *pending is TRUE for the one caller
+ * that must run the initialisation; other callers block until it completes. */
+BOOL InitOnceBeginInitialize(PINIT_ONCE once, DWORD flags, PBOOL pending, LPVOID *context);
+BOOL InitOnceComplete(PINIT_ONCE once, DWORD flags, LPVOID context);
 
 /* ---- Condition variables (paired with a CRITICAL_SECTION) ----------- */
 VOID InitializeConditionVariable(PCONDITION_VARIABLE cv);
 BOOL SleepConditionVariableCS(PCONDITION_VARIABLE cv, PCRITICAL_SECTION cs, DWORD ms);
+BOOL SleepConditionVariableSRW(PCONDITION_VARIABLE cv, PSRWLOCK lock, DWORD ms, ULONG flags);
 VOID WakeConditionVariable(PCONDITION_VARIABLE cv);
 VOID WakeAllConditionVariable(PCONDITION_VARIABLE cv);
 
@@ -162,6 +170,7 @@ DWORD  ResumeThread(HANDLE h);
 DWORD  SuspendThread(HANDLE h);
 BOOL   TerminateThread(HANDLE h, DWORD exitCode);
 DWORD  GetCurrentThreadId(void);
+DWORD  GetThreadId(HANDLE thread);
 HANDLE GetCurrentThread(void);
 HANDLE GetCurrentProcess(void);
 DWORD  GetCurrentProcessId(void);
@@ -188,6 +197,8 @@ BOOL   TrySubmitThreadpoolCallback(PTP_SIMPLE_CALLBACK callback,
 /* ---- Waitable timers --------------------------------------------------- */
 typedef VOID (*PTIMERAPCROUTINE)(PVOID arg, DWORD lowValue, DWORD highValue);
 HANDLE CreateWaitableTimerW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, LPCWSTR name);
+#define TIMER_ALL_ACCESS 0x1F0003u
+HANDLE CreateWaitableTimerExW(LPSECURITY_ATTRIBUTES sa, LPCWSTR name, DWORD flags, DWORD access);
 BOOL   SetWaitableTimer(HANDLE h, const LARGE_INTEGER *dueTime, LONG period,
                         PTIMERAPCROUTINE completion, PVOID arg, BOOL resume);
 BOOL   CancelWaitableTimer(HANDLE h);
@@ -432,6 +443,15 @@ VOID RtlUnwind(PVOID TargetFrame, PVOID TargetIp,
                PEXCEPTION_RECORD ExceptionRecord, PVOID ReturnValue);
 VOID RaiseException(DWORD code, DWORD flags, DWORD nargs, const ULONG_PTR *args);
 
+/* MSVC __try/__except compile-shim. The guarded block always runs and the
+ * handler never does: a bad guest pointer that SEH would have skipped faults
+ * instead. Guarded call sites are listed by `grep -rn __try src`. */
+#ifndef __try
+#define __try              if (1)
+#define __except(filter)   else if (0)
+#define GetExceptionCode() 0u
+#endif
+
 /* Win32 VEH: opaque PEXCEPTION_POINTERS + AddVectoredExceptionHandler stub.
  * On Linux the equivalent goes through sigaction(SIGSEGV/SIGFPE) +
  * ucontext_t; for now we accept the registration and never fire. */
@@ -444,6 +464,7 @@ ULONG RemoveVectoredExceptionHandler(PVOID Handle);
 #define EXCEPTION_EXECUTE_HANDLER       1
 #define EXCEPTION_CONTINUE_EXECUTION  (-1)
 #define EXCEPTION_ACCESS_VIOLATION       0xC0000005u
+#define EXCEPTION_SINGLE_STEP            0x80000004u
 #define EXCEPTION_STACK_OVERFLOW         0xC00000FDu
 #define EXCEPTION_ILLEGAL_INSTRUCTION    0xC000001Du
 #define EXCEPTION_INT_DIVIDE_BY_ZERO     0xC0000094u

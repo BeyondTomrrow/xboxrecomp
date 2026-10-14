@@ -43,7 +43,7 @@ void xbox_ggl_reacquire(int depth); /* restore a depth from release_all */
 void xbox_ggl_preempt_point(unsigned int guest_site); /* kernel-call boundary: maybe yield */
 void xbox_ggl_set_priority(int prio); /* this thread; higher wins, default 0 */
 
-#ifndef XBOX_GGL_IMPL
+#if defined(_WIN32) && !defined(XBOX_GGL_IMPL)
 #include <windows.h>
 void  xbox_ggl_Sleep(DWORD ms);
 DWORD xbox_ggl_SleepEx(DWORD ms, BOOL alertable);

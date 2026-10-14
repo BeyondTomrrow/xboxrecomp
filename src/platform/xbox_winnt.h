@@ -80,6 +80,8 @@ static inline void xbox_path_normalize(char *p)
 #include <stddef.h>
 #include <stdarg.h>
 #include <string.h>   /* windows.h users relied on string.h being visible */
+#include <wchar.h>
+#define _wcsicmp wcscasecmp   /* host wchar_t strings (paths), not Xbox WCHAR */
 
 #ifdef __cplusplus
 extern "C" {

@@ -29,8 +29,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
-#include <windows.h>
 #ifdef _WIN32
+#include <windows.h>
 #include "apu_env.h"     /* cached getenv: debug switches are read per voice */
 #endif
 

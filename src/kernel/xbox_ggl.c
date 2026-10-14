@@ -1,4 +1,17 @@
 /* Global guest lock -- see xbox_ggl.h for why. */
+
+#ifndef _WIN32
+/* The global guest lock is a Windows-host scheduling aid (RECOMP_GGL=1, off by
+ * default). POSIX hosts run without it: every entry point is a no-op. */
+#include "xbox_ggl.h"
+int  xbox_ggl_enabled(void) { return 0; }
+void xbox_ggl_enter(void) {}
+void xbox_ggl_leave(void) {}
+int  xbox_ggl_release_all(void) { return 0; }
+void xbox_ggl_reacquire(int depth) { (void)depth; }
+void xbox_ggl_preempt_point(unsigned int guest_site) { (void)guest_site; }
+void xbox_ggl_set_priority(int prio) { (void)prio; }
+#else
 #define XBOX_GGL_IMPL
 #include <windows.h>
 #include <dbghelp.h>
@@ -395,3 +408,4 @@ BOOL xbox_ggl_SleepConditionVariableSRW(PCONDITION_VARIABLE cv, PSRWLOCK l, DWOR
     GGL_BLOCKING(r = SleepConditionVariableSRW(cv, l, ms, flags));
     return r;
 }
+#endif /* _WIN32 */
