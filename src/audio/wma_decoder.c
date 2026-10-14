@@ -3,39 +3,17 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(_WIN32)
-#define COBJMACROS
-#include <windows.h>
-#include <mfapi.h>
-#include <mfidl.h>
-#include <mfreadwrite.h>
-#include <mferror.h>
-
-static wchar_t *wma_to_wide(const char *s)
-{
-    int len;
-    wchar_t *w;
-    if (!s) return NULL;
-    len = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
-    if (len <= 0) return NULL;
-    w = (wchar_t *)malloc((size_t)len * sizeof(wchar_t));
-    if (!w) return NULL;
-    if (!MultiByteToWideChar(CP_UTF8, 0, s, -1, w, len)) {
-        free(w);
-        return NULL;
-    }
-    return w;
-}
-
 static int wma_append(XboxWmaPcm *out, size_t *capacity,
                       const uint8_t *data, size_t size)
 {
     size_t needed;
     size_t next;
     uint8_t *grown;
+
     if (size == 0) return 0;
     if (out->size > (size_t)-1 - size) return -1;
     needed = out->size + size;
+
     if (needed > *capacity) {
         next = *capacity ? *capacity : 64 * 1024;
         while (next < needed) {
@@ -50,9 +28,36 @@ static int wma_append(XboxWmaPcm *out, size_t *capacity,
         out->data = grown;
         *capacity = next;
     }
+
     memcpy(out->data + out->size, data, size);
     out->size += size;
     return 0;
+}
+
+#if defined(_WIN32)
+
+#define COBJMACROS
+#include <windows.h>
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
+#include <mferror.h>
+
+static wchar_t *wma_to_wide(const char *s)
+{
+    int len;
+    wchar_t *w;
+
+    if (!s) return NULL;
+    len = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
+    if (len <= 0) return NULL;
+    w = (wchar_t *)malloc((size_t)len * sizeof(wchar_t));
+    if (!w) return NULL;
+    if (!MultiByteToWideChar(CP_UTF8, 0, s, -1, w, len)) {
+        free(w);
+        return NULL;
+    }
+    return w;
 }
 
 static int wma_read_format(IMFSourceReader *reader, XboxWmaPcm *out)
@@ -74,6 +79,7 @@ static int wma_read_format(IMFSourceReader *reader, XboxWmaPcm *out)
         hr = IMFMediaType_GetUINT32(type, &MF_MT_AUDIO_BITS_PER_SAMPLE, &bits);
 
     IMFMediaType_Release(type);
+
     if (FAILED(hr) || rate == 0 || channels == 0 || bits == 0 ||
         channels > 0xFFFFu || bits > 0xFFFFu)
         return -1;
@@ -103,8 +109,6 @@ int xbox_wma_decode_file(const char *path, XboxWmaPcm *out)
     size_t capacity = 0;
     int result = -1;
 
-    /* The public contract says every failure leaves a non-NULL output cleared,
-     * including argument validation failures. */
     if (!out) return -1;
     memset(out, 0, sizeof(*out));
     if (!path) return -1;
@@ -126,8 +130,6 @@ int xbox_wma_decode_file(const char *path, XboxWmaPcm *out)
     hr = MFCreateSourceReaderFromURL(wpath, NULL, &reader);
     if (FAILED(hr) || !reader) goto done;
 
-    /* Decode only the first audio stream and ask Media Foundation to convert
-     * the compressed source into ordinary interleaved PCM. */
     IMFSourceReader_SetStreamSelection(
         reader, (DWORD)MF_SOURCE_READER_ALL_STREAMS, FALSE);
     hr = IMFSourceReader_SetStreamSelection(
@@ -136,6 +138,7 @@ int xbox_wma_decode_file(const char *path, XboxWmaPcm *out)
 
     hr = MFCreateMediaType(&pcm_type);
     if (FAILED(hr) || !pcm_type) goto done;
+
     hr = IMFMediaType_SetGUID(pcm_type, &MF_MT_MAJOR_TYPE, &MFMediaType_Audio);
     if (SUCCEEDED(hr))
         hr = IMFMediaType_SetGUID(pcm_type, &MF_MT_SUBTYPE, &MFAudioFormat_PCM);
@@ -175,11 +178,6 @@ int xbox_wma_decode_file(const char *path, XboxWmaPcm *out)
                 if (sample) IMFSample_Release(sample);
                 goto done;
             }
-            /* One XboxWmaPcm describes one interleaved PCM format.  Appending
-             * samples in a new format and then overwriting the metadata would
-             * return a buffer whose first segment is mislabeled.  A format
-             * notification is harmless when the negotiated PCM properties are
-             * unchanged; otherwise fail once bytes have already been emitted. */
             if (out->size != 0 && !wma_same_format(out, &changed)) {
                 if (sample) IMFSample_Release(sample);
                 goto done;
@@ -194,6 +192,7 @@ int xbox_wma_decode_file(const char *path, XboxWmaPcm *out)
             BYTE *bytes = NULL;
             DWORD max_len = 0;
             DWORD cur_len = 0;
+
             hr = IMFSample_ConvertToContiguousBuffer(sample, &buffer);
             if (FAILED(hr) || !buffer) {
                 IMFSample_Release(sample);
@@ -234,13 +233,79 @@ done:
     return result;
 }
 
-#else
+#else /* POSIX: Decode WMA/ASF to 16-bit 44.1 kHz Stereo PCM via FFmpeg pipe */
+
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+extern char **environ;
 
 int xbox_wma_decode_file(const char *path, XboxWmaPcm *out)
 {
-    (void)path;
-    if (out) memset(out, 0, sizeof(*out));
-    return -1;
+    int pipefd[2];
+    posix_spawn_file_actions_t actions;
+    pid_t pid = 0;
+    size_t capacity = 0;
+    uint8_t chunk[16384];
+    ssize_t n;
+    int status = 0;
+
+    if (!out) return -1;
+    memset(out, 0, sizeof(*out));
+    if (!path) return -1;
+
+    if (pipe(pipefd) != 0)
+        return -1;
+
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addclose(&actions, pipefd[0]);
+    posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
+    posix_spawn_file_actions_addclose(&actions, pipefd[1]);
+
+    const char *argv[] = {
+        "ffmpeg",
+        "-nostdin",
+        "-v", "error",
+        "-i", path,
+        "-vn",
+        "-f", "s16le",
+        "-acodec", "pcm_s16le",
+        "-ar", "44100",
+        "-ac", "2",
+        "pipe:1",
+        NULL
+    };
+
+    if (posix_spawnp(&pid, "ffmpeg", &actions, NULL, (char *const *)argv, environ) != 0) {
+        posix_spawn_file_actions_destroy(&actions);
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+
+    posix_spawn_file_actions_destroy(&actions);
+    close(pipefd[1]); /* Close write end in parent */
+
+    while ((n = read(pipefd[0], chunk, sizeof(chunk))) > 0) {
+        if (wma_append(out, &capacity, chunk, (size_t)n) != 0) {
+            close(pipefd[0]);
+            waitpid(pid, &status, 0);
+            xbox_wma_pcm_free(out);
+            return -1;
+        }
+    }
+    close(pipefd[0]);
+
+    if (waitpid(pid, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0 || out->size == 0) {
+        xbox_wma_pcm_free(out);
+        return -1;
+    }
+
+    out->sample_rate = 44100;
+    out->channels = 2;
+    out->bits_per_sample = 16;
+    return 0;
 }
 
 #endif

@@ -241,53 +241,7 @@ static inline void src_float_to_short_array(const float *in, int16_t *out,
     }
 }
 
-/* ============================================================
- * SDL Audio stubs
- *
- * The monitor output uses SDL. We stub it; actual audio output
- * will be connected via WASAPI separately.
- * ============================================================ */
 
-typedef void SDL_AudioStream;
-typedef uint32_t SDL_AudioDeviceID;
-
-#define SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK 0
-#define SDL_AUDIO_S16LE 0x8010
-#define SDL_AUDIO_BYTESIZE(fmt) (((fmt) & 0xFF) / 8)
-#define SDL_INIT_AUDIO 0x00000010
-
-typedef struct SDL_AudioSpec {
-    int freq;
-    int format;
-    int channels;
-} SDL_AudioSpec;
-
-static inline int SDL_Init(uint32_t flags) { (void)flags; return 0; }
-static inline const char *SDL_GetError(void) { return "SDL stubbed"; }
-static inline int SDL_GetAudioStreamQueued(SDL_AudioStream *stream) {
-    (void)stream; return -1;
-}
-static inline int SDL_PutAudioStreamData(SDL_AudioStream *stream,
-                                          const void *buf, int len) {
-    (void)stream; (void)buf; (void)len; return 0;
-}
-static inline SDL_AudioStream *SDL_OpenAudioDeviceStream(
-    SDL_AudioDeviceID dev, const SDL_AudioSpec *spec, void *cb, void *ud) {
-    (void)dev; (void)spec; (void)cb; (void)ud; return NULL;
-}
-static inline SDL_AudioDeviceID SDL_GetAudioStreamDevice(SDL_AudioStream *s) {
-    (void)s; return 0;
-}
-static inline int SDL_GetAudioDeviceFormat(SDL_AudioDeviceID dev,
-                                            SDL_AudioSpec *spec, int *frames) {
-    (void)dev; (void)spec; (void)frames; return 0;
-}
-static inline void SDL_ResumeAudioDevice(SDL_AudioDeviceID dev) { (void)dev; }
-static inline void SDL_DestroyAudioStream(SDL_AudioStream *s) { (void)s; }
-static inline void SDL_SetAudioStreamGain(SDL_AudioStream *s, float g) {
-    (void)s; (void)g;
-}
-static inline int SDL_GetNumLogicalCPUCores(void) { return 1; }
 
 /* ============================================================
  * VM state / migration stubs

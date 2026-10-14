@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(xboxrecomp VERSION 0.9.0 LANGUAGES C)
+if(NOT WIN32)
+    find_package(SDL3 REQUIRED)
+endif()
 
 # Xbox Static Recompilation Runtime Library
 # Provides link-time libraries for statically recompiled Xbox games.
@@ -59,16 +62,27 @@ add_subdirectory(src/video)
 
 # ── Umbrella target ───────────────────────────────────────────
 
-# Convenience target that links all runtime libraries
+if(NOT WIN32)
+    target_link_libraries(xbox_video PUBLIC SDL3::SDL3 pthread)
+    target_link_libraries(xbox_input PUBLIC SDL3::SDL3)
+    target_link_libraries(xbox_dsound PUBLIC SDL3::SDL3)
+    target_link_libraries(xbox_kernel PUBLIC SDL3::SDL3)
+endif()
+
 add_library(xboxrecomp INTERFACE)
 target_link_libraries(xboxrecomp INTERFACE
-    xbox_kernel
-    xbox_d3d8
-    xbox_dsound
-    xbox_input
-    xbox_usb
-    xbox_apu
-    xbox_nv2a
-    xbox_video
+        xbox_kernel
+        xbox_d3d8
+        xbox_dsound
+        xbox_input
+        xbox_usb
+        xbox_apu
+        xbox_nv2a
+        xbox_video
 )
+
+if(NOT WIN32)
+    target_link_libraries(xboxrecomp INTERFACE SDL3::SDL3 pthread dl m)
+endif()
+
 

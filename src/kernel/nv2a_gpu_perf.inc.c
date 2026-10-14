@@ -1,41 +1,31 @@
-/* ── Frame statistics (2026-10-09) ─────────────────────────────────────────
+/* ── Frame statistics (Cross-platform: Windows PDH/DXGI + Linux POSIX) ─────
  *
- * Included into nv2a_gpu_present.inc.c. Measures what a PC benchmark reports:
- *
- *   - frame time: the interval between presents, in a ring of the last
- *     PERF_RING frames -> average FPS, 1% and 0.1% lows (the FPS of the
- *     99th / 99.9th percentile frame time), worst frame;
- *   - GPU time per frame: the 3D engine's busy share (Windows' GPU Engine
- *     counter for this process) times the frame time;
- *   - CPU: process CPU time per presented frame (all threads), and the time
- *     the render thread spends between presents executing the pushbuffer;
- *   - memory: working set, private bytes, and the adapter's local video
- *     memory in use (DXGI 1.4 budget query).
- *
- * Every 10 s the window's numbers go to the log as one [BENCH] line, which
- * tools/bench.ps1 parses. NFL2K5_FRAMETIME_CSV=<file> also writes every
- * frame (present time, frame ms, GPU ms) for graphs. The Show FPS overlay
- * reads the same numbers (perf_overlay_text).
+ * Included into nv2a_gpu_present.inc.c.
  */
 
+#if defined(_WIN32)
 #include <dxgi1_4.h>
 #include <psapi.h>
 #include <pdh.h>
 #include <pdhmsg.h>
 #pragma comment(lib, "pdh.lib")
+#else
+#include <time.h>
+#include <unistd.h>
+#endif
 
-/* GPU busy time: Windows' per-process "GPU Engine" 3D utilisation counter
- * (what Task Manager shows). D3D11 timestamps around a frame turned out to
- * span command-buffer flushes, not GPU work, so they are not used for it. */
 static struct {
+#if defined(_WIN32)
     PDH_HQUERY q;
     PDH_HCOUNTER c;
+#endif
     int state;                          /* 0 untried, 1 ok, -1 unavailable */
     float util;                         /* percent, last second */
 } s_gpuctr;
 
 static void perf_gpu_counter(void)
 {
+#if defined(_WIN32)
     if (s_gpuctr.state == 0) {
         wchar_t path[128];
         s_gpuctr.state = -1;
@@ -61,6 +51,9 @@ static void perf_gpu_counter(void)
             s_gpuctr.util = (float)(sum > 100.0 ? 100.0 : sum);
         }
     }
+#else
+    s_gpuctr.state = -1;
+#endif
 }
 
 #define PERF_RING 4096                /* frames kept for the percentiles (~68 s at 60) */
@@ -84,15 +77,23 @@ static struct {
     ULONGLONG pub_cpu0;
     FILE *csv;
     int csv_tried;
+#if defined(_WIN32)
     IDXGIAdapter3 *adapter3;
+#endif
     int adapter_tried;
 } s_perf;
 
 static ULONGLONG perf_process_cpu(void)
 {
+#if defined(_WIN32)
     FILETIME c, e, k, u;
     if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) return 0;
     return ((ULONGLONG)k.dwHighDateTime << 32 | k.dwLowDateTime) + ((ULONGLONG)u.dwHighDateTime << 32 | u.dwLowDateTime);
+#else
+    struct timespec ts;
+    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts) != 0) return 0;
+    return (ULONGLONG)ts.tv_sec * 10000000ULL + (ULONGLONG)(ts.tv_nsec / 100);
+#endif
 }
 
 static int perf_cmp_float(const void *a, const void *b)
@@ -101,8 +102,6 @@ static int perf_cmp_float(const void *a, const void *b)
     return x < y ? -1 : x > y;
 }
 
-/* FPS at the given percentiles of the last `last` frame times (0 = the whole
- * ring): 0.99 -> 1% low, 0.999 -> 0.1% low. */
 static void perf_percentiles(unsigned last, float *low1, float *low01, float *worst)
 {
     static float tmp[PERF_RING];
@@ -121,6 +120,7 @@ static void perf_percentiles(unsigned last, float *low1, float *low01, float *wo
 
 static void perf_memory(void)
 {
+#if defined(_WIN32)
     PROCESS_MEMORY_COUNTERS_EX pm;
     memset(&pm, 0, sizeof pm);
     pm.cb = sizeof pm;
@@ -128,7 +128,7 @@ static void perf_memory(void)
         s_perf.ws_mb = (unsigned)(pm.WorkingSetSize >> 20);
         s_perf.priv_mb = (unsigned)(pm.PrivateUsage >> 20);
     }
-    if (!s_perf.adapter_tried) {
+    if (!s_perf.adapter_tried && s_gpu11.dev) {
         IDXGIDevice *dd = NULL;
         IDXGIAdapter *ad = NULL;
         s_perf.adapter_tried = 1;
@@ -145,16 +145,25 @@ static void perf_memory(void)
         if (SUCCEEDED(IDXGIAdapter3_QueryVideoMemoryInfo(s_perf.adapter3, 0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vi)))
             s_perf.vram_mb = (unsigned)(vi.CurrentUsage >> 20);
     }
+#else
+    FILE *f = fopen("/proc/self/statm", "r");
+    if (f) {
+        unsigned long size_pages = 0, resident_pages = 0;
+        long page_sz = sysconf(_SC_PAGESIZE);
+        if (fscanf(f, "%lu %lu", &size_pages, &resident_pages) == 2 && page_sz > 0) {
+            s_perf.ws_mb   = (unsigned)((resident_pages * (unsigned long)page_sz) >> 20);
+            s_perf.priv_mb = (unsigned)((size_pages * (unsigned long)page_sz) >> 20);
+        }
+        fclose(f);
+    }
+#endif
 }
 
-/* A slow frame (> 25 ms once play is under way): what happened during it, so
- * hitches can be attributed -- guest file reads (kernel_file.c), texture
- * uploads, new render targets, pixel shader variants made ready, draws, and
- * the time Present itself blocked. */
 extern volatile LONG64 g_xbox_read_qpc, g_xbox_read_bytes, g_xbox_read_count;
-extern volatile LONG64 g_pb_exec_qpc, g_pb_qwait_qpc, g_pb_capture_qpc;   /* xbox_memory_layout.c */
-extern volatile DWORD g_xbox_game_tid;                                       /* xbox_ggl.c */
+extern volatile LONG64 g_pb_exec_qpc, g_pb_qwait_qpc, g_pb_capture_qpc;
+extern volatile DWORD g_xbox_game_tid;
 LONGLONG xbox_ggl_waited_qpc(DWORD tid);
+
 static void perf_hitch(float ms, float present_ms)
 {
     static LONG64 rq, rb, rc, ex, qw, cp, gw, tx, tcx;
@@ -171,14 +180,13 @@ static void perf_hitch(float ms, float present_ms)
         fprintf(stderr, "  [HITCH] %.1f ms: present %.1f ms, reads %lld (%lld KB, %.1f ms), tex uploads %u (%.1f ms, create %.1f), new targets %u, "
                         "ps ready %ld, draws %u; render thread %.1f ms, queue wait %.1f ms, capture %.1f ms, game thread lock wait %.1f ms\n",
                 ms, present_ms, (long long)(c - rc), (long long)((b - rb) >> 10), (double)(q - rq) * f,
-                s_gpu11.tex_uploads - texup, (double)(tq - tx) * f, (double)(tc - tcx) * f, s_gpu11.surf_creates - surfs, s_ps_ready - ps, s_gpu11.draws - draws,
+                s_gpu11.tex_uploads - texup, (double)(tq - tx) * f, (double)(tc - tcx) * f, s_gpu11.surf_creates - surfs, (long)(s_ps_ready - ps), s_gpu11.draws - draws,
                 (double)(e - ex) * f, (double)(w - qw) * f, (double)(k - cp) * f, (double)(lw - gw) * f);
     }
     rq = q; rb = b; rc = c; ex = e; qw = w; cp = k; gw = lw; tx = tq; tcx = tc;
     draws = s_gpu11.draws; texup = s_gpu11.tex_uploads; surfs = s_gpu11.surf_creates; ps = s_ps_ready;
 }
 
-/* Called once per present, after the swap chain's Present returned. */
 static void perf_on_present(int scale, float present_ms)
 {
     LARGE_INTEGER now;
@@ -209,7 +217,6 @@ static void perf_on_present(int scale, float present_ms)
         fprintf(s_perf.csv, "%.3f,%.3f,%.3f,%d\n",
                 (double)now.QuadPart * 1000.0 / (double)s_perf.freq.QuadPart, ms, s_perf.gpu_ms, scale);
 
-    /* Overlay numbers, once a second. */
     if (now.QuadPart - s_perf.pub_t0.QuadPart >= s_perf.freq.QuadPart) {
         ULONGLONG cpu = perf_process_cpu();
         float worst;
@@ -217,21 +224,19 @@ static void perf_on_present(int scale, float present_ms)
         s_perf.ft_avg = s_perf.pub_frames ? (float)(s_perf.pub_ft_sum / s_perf.pub_frames) : 0;
         s_perf.cpu_ms = s_perf.pub_frames ? (float)((cpu - s_perf.pub_cpu0) / 10000.0 / s_perf.pub_frames) : 0;
         perf_gpu_counter();
-        /* GPU ms per frame = the 3D engine's busy share of each frame. */
         s_perf.gpu_ms = s_gpuctr.state == 1 ? s_gpuctr.util / 100.0f * s_perf.ft_avg : -1.0f;
         if (s_perf.gpu_ms >= 0) { s_perf.win_gpu_sum += s_perf.gpu_ms; s_perf.win_gpu_n++; }
-        perf_percentiles(600, &s_perf.low1, &s_perf.low01, &worst);   /* the last ~10 s */
+        perf_percentiles(600, &s_perf.low1, &s_perf.low01, &worst);
         s_perf.ft_max = worst;
         perf_memory();
         s_perf.pub_t0 = now; s_perf.pub_frames = 0; s_perf.pub_ft_sum = 0; s_perf.pub_cpu0 = cpu;
         if (s_perf.csv) fflush(s_perf.csv);
     }
-    /* The log line, every 10 s, over that window. */
     if (now.QuadPart - s_perf.win_t0.QuadPart >= 10 * s_perf.freq.QuadPart) {
         ULONGLONG cpu = perf_process_cpu();
         double secs = (double)(now.QuadPart - s_perf.win_t0.QuadPart) / (double)s_perf.freq.QuadPart;
         float low1, low01, worst;
-        perf_percentiles(s_perf.win_frames, &low1, &low01, &worst);   /* this window's frames only */
+        perf_percentiles(s_perf.win_frames, &low1, &low01, &worst);
         fprintf(stderr, "  [BENCH] fps %.1f low1 %.1f low01 %.1f ft_avg %.2f ft_max %.1f gpu_ms %.2f gpu_util %.0f cpu_ms %.2f "
                         "ws_mb %u priv_mb %u vram_mb %u scale %d frames %u\n",
                 s_perf.win_frames / secs, low1, low01, s_perf.win_frames ? s_perf.win_ft_sum / s_perf.win_frames : 0.0,
@@ -243,7 +248,6 @@ static void perf_on_present(int scale, float present_ms)
     }
 }
 
-/* Text for the Show FPS overlay: two lines. */
 static int perf_overlay_text(char *l1, size_t n1, char *l2, size_t n2, int fps)
 {
     snprintf(l1, n1, "%d FPS  %.1f ms", fps, s_perf.ft_avg);
@@ -251,6 +255,7 @@ static int perf_overlay_text(char *l1, size_t n1, char *l2, size_t n2, int fps)
         snprintf(l2, n2, "1%% low %.0f   GPU %.1f ms   CPU %.1f ms   VRAM %u MB",
                  s_perf.low1, s_perf.gpu_ms, s_perf.cpu_ms, s_perf.vram_mb);
     else
-        snprintf(l2, n2, "1%% low %.0f   CPU %.1f ms   VRAM %u MB", s_perf.low1, s_perf.cpu_ms, s_perf.vram_mb);
+        snprintf(l2, n2, "1%% low %.0f   CPU %.1f ms   VRAM %u MB",
+                 s_perf.low1, s_perf.cpu_ms, s_perf.vram_mb);
     return 1;
 }

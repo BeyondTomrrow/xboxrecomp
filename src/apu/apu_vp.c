@@ -369,7 +369,11 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                 /* Guest return addresses on the calling thread's stack: who
                  * pauses/resumes the voice (the FE method runs on the guest
                  * thread that wrote the MMIO register). */
-                extern __declspec(thread) uint32_t g_esp;
+                #if defined(_MSC_VER)
+                    extern __declspec(thread) uint32_t g_esp;
+                #else
+                    extern __thread uint32_t g_esp;
+                #endif
                 extern ptrdiff_t xbox_GetMemoryOffset(void);
                 const uint8_t *gm = (const uint8_t *)xbox_GetMemoryOffset();
                 int shown = 0;

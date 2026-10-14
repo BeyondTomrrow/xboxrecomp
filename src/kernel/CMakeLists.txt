@@ -26,6 +26,7 @@ set(KERNEL_SOURCES
     recomp_trace.c
     nv2a_pb_scan.c
     nv2a_pb_exec.c
+        nv2a_gpu_sdl3.inc.c
 )
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})

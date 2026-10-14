@@ -19,11 +19,26 @@
 #include <dxgi1_5.h>     /* IDXGIFactory5: tearing / variable refresh */
 #include "../input/xinput_xbox.h"
 
+
+
 /* src/video/fb_present.c: the window this presents into. */
 extern void *xbox_FramebufferWindowHwnd(void);
 extern void xbox_FramebufferSetGpuPresent(int on);
 extern void xbox_FramebufferSetKeyHook(void (*hook)(unsigned vk));
 extern void xbox_FramebufferApplyMode(int mode, int w, int h);
+
+#include <SDL3/SDL.h>
+
+static HWND xbox_GetNativeHwnd(void)
+{
+    SDL_Window *win = (SDL_Window *)xbox_FramebufferWindowHwnd();
+    if (!win) return NULL;
+    return (HWND)SDL_GetPointerProperty(
+        SDL_GetWindowProperties(win),
+        SDL_PROP_WINDOW_WIN32_HWND_POINTER,
+        NULL
+    );
+}
 
 int  xbox_ggl_release_all(void);
 void xbox_ggl_reacquire(int depth);
@@ -372,7 +387,7 @@ static void pr_release_bb(void)
 static int pr_swapchain(void)
 {
     gpu_state_invalidate();     /* binds its own state: the next draw resends all */
-    HWND hw = (HWND)xbox_FramebufferWindowHwnd();
+    HWND hw = xbox_GetNativeHwnd();
     RECT cr;
     UINT w, h;
     if (!hw)

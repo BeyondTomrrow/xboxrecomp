@@ -33,3 +33,7 @@ target_link_libraries(xbox_nv2a PRIVATE platform)
 if(WIN32)
     target_link_libraries(xbox_nv2a PRIVATE kernel32)
 endif()
+
+if(NOT WIN32)
+    target_link_libraries(xbox_nv2a PRIVATE SDL3::SDL3)
+endif()

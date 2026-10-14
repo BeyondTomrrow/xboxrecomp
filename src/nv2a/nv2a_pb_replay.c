@@ -197,9 +197,10 @@ static const char *single_items[] = { "RACE", "TIME ATTACK", "ROAD RAGE", "CRASH
 /* Find the game's window for title updates. Any top-level window whose
  * title ends with "- Static Recompilation" matches; falls back to the active
  * window. The lookup is generic, not tied to one title. */
+
+#if defined(_WIN32)
 static BOOL CALLBACK find_recomp_window(HWND hwnd, LPARAM lParam)
 {
-    (void)lParam;
     char title[256];
     if (GetWindowTextA(hwnd, title, sizeof(title)) > 0) {
         size_t len = strlen(title);
@@ -219,6 +220,10 @@ static HWND find_recomp_window_hwnd(void)
     EnumWindows(find_recomp_window, (LPARAM)&hwnd);
     return hwnd;
 }
+#else
+#include <SDL3/SDL.h>
+extern void *xbox_FramebufferWindowHwnd(void);
+#endif
 
 static void update_menu_title(int menu, int cursor)
 {
@@ -227,13 +232,13 @@ static void update_menu_title(int menu, int cursor)
     const char *sel = "";
 
     switch (menu) {
-    case MENU_MAIN:
-    case MENU_SINGLE_EVENT:
-        sel = (menu == MENU_MAIN && cursor < 5) ? main_items[cursor]
-            : (cursor < 4)                      ? single_items[cursor] : "";
-        break;
-    default:
-        break;
+        case MENU_MAIN:
+        case MENU_SINGLE_EVENT:
+            sel = (menu == MENU_MAIN && cursor < 5) ? main_items[cursor]
+                : (cursor < 4)                      ? single_items[cursor] : "";
+            break;
+        default:
+            break;
     }
 
     if (sel[0])
@@ -241,11 +246,16 @@ static void update_menu_title(int menu, int cursor)
     else
         snprintf(title, sizeof(title), "Push Buffer Replay - %s", name);
 
-    /* Find and update the game window */
+#if defined(_WIN32)
     HWND hwnd = find_recomp_window_hwnd();
     if (!hwnd) hwnd = GetActiveWindow();
     if (hwnd) SetWindowTextA(hwnd, title);
+#else
+    SDL_Window *win = (SDL_Window *)xbox_FramebufferWindowHwnd();
+    if (win) SDL_SetWindowTitle(win, title);
+#endif
 }
+
 
 /*
  * Called once per frame when replay is active.

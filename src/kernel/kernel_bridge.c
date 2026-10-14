@@ -44,6 +44,12 @@ int xbox_verbose(void)
     return v;
 }
 #include <float.h>
+#if !defined(_WIN32)
+#include <fenv.h>
+#ifndef _clearfp
+#define _clearfp() feclearexcept(FE_ALL_EXCEPT)
+#endif
+#endif
 /* Section B string helpers: wcslen helper, case folding.
  * ctype.h/wctype.h are not pulled in by the platform headers on either host. */
 #include <string.h>

@@ -27,6 +27,7 @@
  * buffer; fog is not applied; no mipmaps (level 0 only).
  */
 #define COBJMACROS
+#if defined(_WIN32)
 #include <d3d11.h>
 #include <d3d11_1.h>     /* ID3D11Device1: shared HUD textures */
 #include <d3dcompiler.h>
@@ -208,12 +209,38 @@ typedef struct {
 
 #include "nv2a_gpu_d3d11_hlsl.inc"   /* k_gpu_hlsl, from nv2a_gpu_d3d11.hlsl */
 
+enum {
+    RENDERER_CPU     = 0,
+    RENDERER_D3D11   = 1,
+    RENDERER_SDL_GPU = 2
+};
+
+static int gpu_renderer_mode(void)
+{
+    static int mode = -1;
+    if (mode < 0) {
+        const char *r = getenv("RECOMP_RENDERER");
+        const char *g = getenv("RECOMP_GPU");
+        if (r && (! _stricmp(r, "cpu") || ! _stricmp(r, "sw") || ! _stricmp(r, "0")))
+            mode = RENDERER_CPU;
+        else if (r && (! _stricmp(r, "sdl") || ! _stricmp(r, "sdl3") || ! _stricmp(r, "sdl_gpu")))
+            mode = RENDERER_SDL_GPU;
+        else if (r && (! _stricmp(r, "d3d11") || ! _stricmp(r, "dx11")))
+            mode = RENDERER_D3D11;
+        else if (g && strcmp(g, "0") == 0)
+            mode = RENDERER_CPU;
+        else
+            mode = (g && *g) ? RENDERER_D3D11 : RENDERER_CPU;
+        fprintf(stderr, "  [GPU] Runtime renderer mode: %s\n",
+                mode == RENDERER_D3D11 ? "D3D11" :
+                mode == RENDERER_SDL_GPU ? "SDL3_GPU" : "CPU Software");
+    }
+    return mode;
+}
+
 static int gpu_enabled(void)
 {
-    static int on = -1;
-    if (on < 0)
-        on = getenv("RECOMP_GPU") && strcmp(getenv("RECOMP_GPU"), "0") != 0;
-    return on;
+    return gpu_renderer_mode() != RENDERER_CPU;
 }
 
 /* RECOMP_GPU_DEBUG=1: the D3D11 debug layer, with its messages printed after
@@ -2538,3 +2565,6 @@ static void gpu_flip(void)
 {
     gpu_lock(); gpu_flip_unlocked(); LeaveCriticalSection(&s_gpu_lock);
 }
+#else
+#include "nv2a_gpu_sdl3.inc.c"
+#endif

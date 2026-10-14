@@ -17,6 +17,14 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#if !defined(_WIN32)
+#include <alloca.h>
+#ifndef _alloca
+#define _alloca alloca
+#endif
+#else
+#include <malloc.h>
+#endif
 
 /* D3D8 device — we include the full header for COM vtable access */
 #include "../d3d/d3d8_xbox.h"

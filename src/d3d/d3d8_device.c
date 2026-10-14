@@ -18,6 +18,12 @@
 #include "d3d8_internal.h"
 #include <stdio.h>
 #include <string.h>
+#ifdef D3D8_RUNTIME_DISPATCH
+#define xbox_Direct3DCreate8 d3d8_d3d11_Direct3DCreate8
+#define xbox_GetD3DDevice    d3d8_d3d11_GetD3DDevice
+#define d3d8_GetDevice       d3d8_d3d11_GetDevice
+#define d3d8_PresentFrame    d3d8_d3d11_PresentFrame
+#endif
 
 /* ================================================================
  * Internal device state
