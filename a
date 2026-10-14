@@ -1,0 +1,12 @@
+CMakeLists.txt
+src/apu/apu_dsp.c
+src/apu/apu_env.h
+src/kernel/CMakeLists.txt
+src/kernel/nv2a_pb_exec.c
+src/kernel/xbox_ggl.c
+src/kernel/xbox_ggl.h
+src/kernel/xbox_memory_layout.c
+src/platform/win32_compat.c
+src/platform/win32_compat.h
+src/platform/xbox_winnt.h
+src/video/fb_present.c

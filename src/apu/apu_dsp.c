@@ -31,6 +31,10 @@
 #include <math.h>
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include "platform/xbox_winnt.h"
+#endif
+#ifdef _WIN32
 #include "apu_env.h"     /* cached getenv: debug switches are read per voice */
 #endif
 
