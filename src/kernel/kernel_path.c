@@ -824,6 +824,16 @@ static BOOL xbox_partition_device_path(const char *xbox_path, char *out, DWORD n
     return TRUE;
 }
 
+/* xbox_LastHostPath() for POSIX: the bridge prints it with a failed open
+ * and filters the title's .uh cache probes by its extension (without it,
+ * every probe logs). Widened byte-for-byte, like the Windows reader of it. */
+static void posix_note_host_path(const char *p)
+{
+    size_t i = 0;
+    for (; p[i] && i + 1 < MAX_PATH; i++) s_last_host_path_shared[i] = (wchar_t)(unsigned char)p[i];
+    s_last_host_path_shared[i] = 0;
+}
+
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size)
 {
     const char* remainder = NULL;
@@ -839,12 +849,12 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
 
     if (xbox_partition_device_path(xbox_path, host_path_buf, buf_size)) {
         fprintf(stderr, "  [PATH] %s -> partition image\n", xbox_path);
-        return TRUE;
+        { posix_note_host_path(host_path_buf); return TRUE; }
     }
 
     if (title_dir_path(xbox_path, host_path_buf, buf_size)) {
         resolve_case(host_path_buf, buf_size);
-        return TRUE;
+        { posix_note_host_path(host_path_buf); return TRUE; }
     }
 
     {
@@ -869,7 +879,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     for (char* p = host_path_buf; *p; p++)
         if (*p == '\\') *p = '/';
     resolve_case(host_path_buf, buf_size);
-    return TRUE;
+    { posix_note_host_path(host_path_buf); return TRUE; }
 
 translate:
     {
@@ -900,7 +910,7 @@ translate:
 
         resolve_case(host_path_buf, buf_size);
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
-        return TRUE;
+        { posix_note_host_path(host_path_buf); return TRUE; }
     }
 }
 
