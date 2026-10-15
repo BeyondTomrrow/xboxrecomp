@@ -3,6 +3,7 @@
 #ifndef _WIN32
 /* The global guest lock is a Windows-host scheduling aid (RECOMP_GGL=1, off by
  * default). POSIX hosts run without it: every entry point is a no-op. */
+#include <stdint.h>
 #include "xbox_ggl.h"
 int  xbox_ggl_enabled(void) { return 0; }
 void xbox_ggl_enter(void) {}
@@ -11,6 +12,7 @@ int  xbox_ggl_release_all(void) { return 0; }
 void xbox_ggl_reacquire(int depth) { (void)depth; }
 void xbox_ggl_preempt_point(unsigned int guest_site) { (void)guest_site; }
 void xbox_ggl_set_priority(int prio) { (void)prio; }
+volatile uint32_t g_xbox_game_tid;   /* DWORD; set by the title (input HLE), diagnostics only */
 #else
 #define XBOX_GGL_IMPL
 #include <windows.h>
