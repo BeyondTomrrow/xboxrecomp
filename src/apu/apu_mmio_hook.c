@@ -91,15 +91,104 @@ static int decode_modrm_len(const uint8_t *ip, int has_rex_b)
 {
     uint8_t modrm = *ip;
     int mod = (modrm >> 6) & 3;
-    int rm = (modrm & 7) | (has_rex_b ? 8 : 0);
+    int rm = modrm & 7;            /* REX.B never changes the encoding length */
     int len = 1;
+    (void)has_rex_b;
 
     if (mod == 3) return 1;
-    if ((rm & 7) == 4) len += 1;
-    if (mod == 0 && (rm & 7) == 5) len += 4;
+    if (rm == 4) {
+        /* SIB. Base 5 with mod 0 means disp32 and no base register. */
+        uint8_t sib = ip[1];
+        len += 1;
+        if (mod == 0 && (sib & 7) == 5) len += 4;
+    }
+    if (mod == 0 && rm == 5) len += 4;          /* RIP-relative disp32 */
     else if (mod == 1) len += 1;
     else if (mod == 2) len += 4;
     return len;
+}
+
+/* ---- ALU forms GCC emits at -O2 (memory operand = the MMIO register) ----
+ * -O0 code only ever loads/stores MMIO with mov, so the decoder above was
+ * enough; optimised code folds the access into test/cmp/or/and/add/sub/xor
+ * with an immediate or register operand. Flags follow the x86 definitions
+ * (CF PF AF ZF SF OF); the guest code branches on them. */
+#define EF_CF 0x0001u
+#define EF_PF 0x0004u
+#define EF_AF 0x0010u
+#define EF_ZF 0x0040u
+#define EF_SF 0x0080u
+#define EF_OF 0x0800u
+#define EF_ARITH (EF_CF | EF_PF | EF_AF | EF_ZF | EF_SF | EF_OF)
+
+enum { ALU_ADD, ALU_OR, ALU_ADC, ALU_SBB, ALU_AND, ALU_SUB, ALU_XOR, ALU_CMP, ALU_TEST };
+
+static uint64_t size_mask(int size) { return size == 8 ? ~0ULL : ((1ULL << (size * 8)) - 1); }
+
+static uint32_t flags_result(uint64_t r, int size)
+{
+    uint32_t f = 0;
+    r &= size_mask(size);
+    if (r == 0) f |= EF_ZF;
+    if (r >> (size * 8 - 1) & 1) f |= EF_SF;
+    if (!(__builtin_popcount((unsigned)(r & 0xFF)) & 1)) f |= EF_PF;
+    return f;
+}
+
+/* Returns 1 and the result when the op writes its destination (not CMP/TEST). */
+static int alu_apply(int op, uint64_t a, uint64_t b, int size, uint32_t *eflags, uint64_t *out)
+{
+    uint64_t m = size_mask(size), r;
+    uint32_t f;
+    int sign = size * 8 - 1;
+    a &= m; b &= m;
+    switch (op) {
+    case ALU_ADD:
+        r = (a + b) & m;
+        f = flags_result(r, size);
+        if (r < a) f |= EF_CF;
+        if ((((a ^ r) & (b ^ r)) >> sign) & 1) f |= EF_OF;
+        if ((a ^ b ^ r) & 0x10) f |= EF_AF;
+        break;
+    case ALU_SUB: case ALU_CMP:
+        r = (a - b) & m;
+        f = flags_result(r, size);
+        if (a < b) f |= EF_CF;
+        if ((((a ^ b) & (a ^ r)) >> sign) & 1) f |= EF_OF;
+        if ((a ^ b ^ r) & 0x10) f |= EF_AF;
+        break;
+    case ALU_OR:  r = a | b; f = flags_result(r, size); break;
+    case ALU_XOR: r = a ^ b; f = flags_result(r, size); break;
+    case ALU_AND: case ALU_TEST: r = a & b; f = flags_result(r, size); break;
+    default: return -1;                                  /* ADC/SBB: not emulated */
+    }
+    *eflags = (*eflags & ~EF_ARITH) | f;
+    *out = r;
+    return op != ALU_CMP && op != ALU_TEST;
+}
+
+/* Register operand of a ModRM `reg` field, honouring 8-bit AH/CH/DH/BH
+ * (regs 4-7 without a REX prefix) and 32-bit writes zero-extending. */
+static uint64_t reg_read(ApuCpuContext ctx, int reg, int size, int has_rex)
+{
+    if (size == 1 && !has_rex && reg >= 4 && reg < 8)
+        return (*ctx_reg64(ctx, reg - 4) >> 8) & 0xFF;
+    return *ctx_reg64(ctx, reg) & size_mask(size);
+}
+
+static void reg_write(ApuCpuContext ctx, int reg, int size, int has_rex, uint64_t v)
+{
+    uint64_t *d;
+    if (size == 1 && !has_rex && reg >= 4 && reg < 8) {
+        d = ctx_reg64(ctx, reg - 4);
+        *d = (*d & ~0xFF00ULL) | ((v & 0xFF) << 8);
+        return;
+    }
+    d = ctx_reg64(ctx, reg);
+    if (size == 1)      *d = (*d & ~0xFFULL) | (v & 0xFF);
+    else if (size == 2) *d = (*d & ~0xFFFFULL) | (v & 0xFFFF);
+    else if (size == 4) *d = v & 0xFFFFFFFFULL;
+    else                *d = v;
 }
 
 static bool apu_decode_and_handle(ApuCpuContext ctx, uint32_t mmio_offset, int is_write)
@@ -210,25 +299,7 @@ static bool apu_decode_and_handle(ApuCpuContext ctx, uint32_t mmio_offset, int i
         return true;
     }
 
-    if (opcode[0] == 0x39 || opcode[0] == 0x38) {
-        if (opcode[0] == 0x38) access_size = 1;
-        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
-        int reg = ((opcode[1] >> 3) & 7) | (rex_r ? 8 : 0);
-        uint64_t mem_val = mcpx_apu_mmio_read(g_apu_state, mmio_offset, access_size);
-        uint64_t reg_val = *ctx_reg64(ctx, reg);
-        if (access_size <= 4) {
-            mem_val &= (1ULL << (access_size * 8)) - 1;
-            reg_val &= (1ULL << (access_size * 8)) - 1;
-        }
-        uint64_t result = mem_val - reg_val;
-        *eflags_ptr &= ~(0x0001u | 0x0040u | 0x0080u | 0x0800u);
-        if (result == 0) *eflags_ptr |= 0x0040u;
-        if (mem_val < reg_val) *eflags_ptr |= 0x0001u;
-        if (result & (1ULL << (access_size * 8 - 1))) *eflags_ptr |= 0x0080u;
-        *rip_ptr += prefix_len + 1 + modrm_len;
-        g_apu_mmio_read_count++;
-        return true;
-    }
+    /* CMP r/m, reg (38/39): handled by the register ALU forms below, which set OF too. */
 
     if (opcode[0] == 0x09 || opcode[0] == 0x08) {
         if (opcode[0] == 0x08) access_size = 1;
@@ -252,6 +323,68 @@ static bool apu_decode_and_handle(ApuCpuContext ctx, uint32_t mmio_offset, int i
         *rip_ptr += prefix_len + 1 + modrm_len;
         g_apu_mmio_write_count++;
         return true;
+    }
+
+    /* Group 1 with an immediate: 80 /n ib, 81 /n iw|id, 83 /n ib (sign-extended). */
+    if (opcode[0] == 0x80 || opcode[0] == 0x81 || opcode[0] == 0x83) {
+        int size = opcode[0] == 0x80 ? 1 : access_size;
+        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
+        int op = (opcode[1] >> 3) & 7;
+        const uint8_t *immp = opcode + 1 + modrm_len;
+        int imm_len = opcode[0] == 0x81 ? (size == 2 ? 2 : 4) : 1;
+        int64_t imm = imm_len == 1 ? (int8_t)immp[0]
+                    : imm_len == 2 ? (int16_t)(immp[0] | immp[1] << 8)
+                    : (int32_t)(immp[0] | immp[1] << 8 | immp[2] << 16 | (uint32_t)immp[3] << 24);
+        uint64_t mem_val = mcpx_apu_mmio_read(g_apu_state, mmio_offset, size), r;
+        int wb = alu_apply(op, mem_val, (uint64_t)imm, size, eflags_ptr, &r);
+        if (wb >= 0) {
+            if (wb) { mcpx_apu_mmio_write(g_apu_state, mmio_offset, r, size); g_apu_mmio_write_count++; }
+            else g_apu_mmio_read_count++;
+            *rip_ptr += prefix_len + 1 + modrm_len + imm_len;
+            return true;
+        }
+    }
+
+    /* TEST r/m, imm: F6 /0 ib, F7 /0 iw|id. */
+    if ((opcode[0] == 0xF6 || opcode[0] == 0xF7) && ((opcode[1] >> 3) & 7) == 0) {
+        int size = opcode[0] == 0xF6 ? 1 : access_size;
+        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
+        const uint8_t *immp = opcode + 1 + modrm_len;
+        int imm_len = size == 1 ? 1 : size == 2 ? 2 : 4;
+        int64_t imm = imm_len == 1 ? immp[0]
+                    : imm_len == 2 ? (immp[0] | immp[1] << 8)
+                    : (int32_t)(immp[0] | immp[1] << 8 | immp[2] << 16 | (uint32_t)immp[3] << 24);
+        uint64_t mem_val = mcpx_apu_mmio_read(g_apu_state, mmio_offset, size), r;
+        alu_apply(ALU_TEST, mem_val, (uint64_t)imm, size, eflags_ptr, &r);
+        *rip_ptr += prefix_len + 1 + modrm_len + imm_len;
+        g_apu_mmio_read_count++;
+        return true;
+    }
+
+    /* Register ALU forms: op r/m, reg (00/01 08/09 20/21 28/29 30/31 38/39)
+     * and op reg, r/m (02/03 0A/0B 22/23 2A/2B 32/33 3A/3B). The r/m, reg
+     * OR/AND/CMP and TEST forms handled above keep their old paths. */
+    {
+        uint8_t o = opcode[0];
+        int fam = o >> 3, low = o & 7;
+        static const int fam_op[8] = { ALU_ADD, ALU_OR, ALU_ADC, ALU_SBB, ALU_AND, ALU_SUB, ALU_XOR, ALU_CMP };
+        if (o < 0x40 && low <= 3) {
+            int size = (low & 1) ? access_size : 1;
+            int to_reg = (low & 2) != 0;
+            int modrm_len = decode_modrm_len(opcode + 1, rex_b);
+            int reg = ((opcode[1] >> 3) & 7) | (rex_r ? 8 : 0);
+            uint64_t mem_val = mcpx_apu_mmio_read(g_apu_state, mmio_offset, size), r;
+            uint64_t reg_val = reg_read(ctx, reg, size, has_rex);
+            int wb = to_reg ? alu_apply(fam_op[fam], reg_val, mem_val, size, eflags_ptr, &r)
+                            : alu_apply(fam_op[fam], mem_val, reg_val, size, eflags_ptr, &r);
+            if (wb >= 0) {
+                if (wb && to_reg) reg_write(ctx, reg, size, has_rex, r);
+                else if (wb) { mcpx_apu_mmio_write(g_apu_state, mmio_offset, r, size); g_apu_mmio_write_count++; }
+                if (!wb || to_reg) g_apu_mmio_read_count++;
+                *rip_ptr += prefix_len + 1 + modrm_len;
+                return true;
+            }
+        }
     }
 
     g_apu_mmio_decode_fail++;
