@@ -338,10 +338,8 @@ typedef enum { K_EVENT, K_SEM, K_MUTEX, K_THREAD, K_TIMER, K_HEAP,
 
 #define W32_MAX_APC 16
 
-/* Every live object starts with W32_OBJ_MAGIC so a value that is not one of
- * our handles (a raw guest dispatcher-object address, say) can be refused
- * the way Win32 refuses it -- WAIT_FAILED / ERROR_INVALID_HANDLE -- instead
- * of being locked as if it were a pthread mutex. Cleared on free. */
+/* Debug aid: live objects carry W32_OBJ_MAGIC (cleared on free). Handle
+ * validation does NOT read it -- see the registry below obj_alloc. */
 #define W32_OBJ_MAGIC 0x57334F42u   /* "BO3W" */
 
 typedef struct w32_object {
@@ -424,6 +422,78 @@ DWORD GetThreadId(HANDLE h)
 HANDLE GetCurrentThread(void)   { return t_self_obj ? (HANDLE)t_self_obj : PSEUDO_CURRENT_THREAD; }
 HANDLE GetCurrentProcess(void)  { return PSEUDO_CURRENT_PROCESS; }
 
+/* Live-object registry. Win32 validates a handle by looking it up in the
+ * process handle table, never by reading memory at the handle's value; the
+ * kernel bridge relies on that, passing raw guest addresses (some unmapped)
+ * to waits and expecting ERROR_INVALID_HANDLE back. Open addressing over
+ * pointer keys; lookups take the lock but never dereference the handle. */
+static pthread_mutex_t s_reg_lock = PTHREAD_MUTEX_INITIALIZER;
+static uintptr_t *s_reg;            /* 0 = empty, 1 = tombstone */
+static size_t     s_reg_cap, s_reg_used, s_reg_live;
+
+static size_t reg_hash(uintptr_t k) { k ^= k >> 33; k *= 0xff51afd7ed558ccdULL; k ^= k >> 33; return (size_t)k; }
+
+static void reg_insert_nolock(uintptr_t k)
+{
+    size_t i = reg_hash(k) & (s_reg_cap - 1);
+    while (s_reg[i] > 1) i = (i + 1) & (s_reg_cap - 1);
+    if (s_reg[i] == 0) s_reg_used++;
+    s_reg[i] = k;
+    s_reg_live++;
+}
+
+static void reg_grow_nolock(void)
+{
+    uintptr_t *old = s_reg;
+    size_t old_cap = s_reg_cap, ncap = s_reg_cap ? s_reg_cap : 1024;
+    while (s_reg_live * 2 >= ncap) ncap *= 2;
+    s_reg = (uintptr_t *)calloc(ncap, sizeof *s_reg);
+    s_reg_cap = ncap;
+    s_reg_used = s_reg_live = 0;
+    for (size_t i = 0; i < old_cap; i++)
+        if (old[i] > 1) reg_insert_nolock(old[i]);
+    free(old);
+}
+
+static void reg_add(const void *p)
+{
+    pthread_mutex_lock(&s_reg_lock);
+    if (!s_reg || (s_reg_used + 1) * 2 >= s_reg_cap) reg_grow_nolock();
+    reg_insert_nolock((uintptr_t)p);
+    pthread_mutex_unlock(&s_reg_lock);
+}
+
+static void reg_remove(const void *p)
+{
+    uintptr_t k = (uintptr_t)p;
+    pthread_mutex_lock(&s_reg_lock);
+    if (s_reg) {
+        size_t i = reg_hash(k) & (s_reg_cap - 1);
+        while (s_reg[i] != 0) {
+            if (s_reg[i] == k) { s_reg[i] = 1; s_reg_live--; break; }
+            i = (i + 1) & (s_reg_cap - 1);
+        }
+    }
+    pthread_mutex_unlock(&s_reg_lock);
+}
+
+static int reg_contains(const void *p)
+{
+    uintptr_t k = (uintptr_t)p;
+    int found = 0;
+    if (k <= 1) return 0;
+    pthread_mutex_lock(&s_reg_lock);
+    if (s_reg) {
+        size_t i = reg_hash(k) & (s_reg_cap - 1);
+        while (s_reg[i] != 0) {
+            if (s_reg[i] == k) { found = 1; break; }
+            i = (i + 1) & (s_reg_cap - 1);
+        }
+    }
+    pthread_mutex_unlock(&s_reg_lock);
+    return found;
+}
+
 static w32_object *obj_alloc(w32_kind kind)
 {
     w32_object *o = (w32_object *)calloc(1, sizeof(w32_object));
@@ -433,6 +503,7 @@ static w32_object *obj_alloc(w32_kind kind)
     pthread_mutex_init(&o->lock, NULL);
     pthread_cond_init(&o->cond, NULL);
     pthread_cond_init(&o->gate, NULL);
+    reg_add(o);
     return o;
 }
 
@@ -448,6 +519,7 @@ static void obj_release(w32_object *o)
     } else if (o->kind == K_WAITABLE_TIMER) {
         /* Waitable timers: no special cleanup needed */
     }
+    reg_remove(o);
     o->magic = 0;
     pthread_mutex_destroy(&o->lock);
     pthread_cond_destroy(&o->cond);
@@ -611,8 +683,8 @@ static DWORD wait_single(w32_object *o, DWORD ms)
 
 static int w32_is_object(HANDLE h)
 {
-    return h && h != PSEUDO_CURRENT_THREAD && h != PSEUDO_CURRENT_PROCESS &&
-           ((const w32_object *)h)->magic == W32_OBJ_MAGIC;
+    /* Registry lookup only: h may be an unmapped address. */
+    return h && h != PSEUDO_CURRENT_THREAD && h != PSEUDO_CURRENT_PROCESS && reg_contains(h);
 }
 
 DWORD WaitForSingleObject(HANDLE h, DWORD ms)
