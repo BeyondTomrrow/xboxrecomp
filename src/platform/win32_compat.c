@@ -338,7 +338,14 @@ typedef enum { K_EVENT, K_SEM, K_MUTEX, K_THREAD, K_TIMER, K_HEAP,
 
 #define W32_MAX_APC 16
 
+/* Every live object starts with W32_OBJ_MAGIC so a value that is not one of
+ * our handles (a raw guest dispatcher-object address, say) can be refused
+ * the way Win32 refuses it -- WAIT_FAILED / ERROR_INVALID_HANDLE -- instead
+ * of being locked as if it were a pthread mutex. Cleared on free. */
+#define W32_OBJ_MAGIC 0x57334F42u   /* "BO3W" */
+
 typedef struct w32_object {
+    uint32_t        magic;
     w32_kind        kind;
     LONG            refcount;
     pthread_mutex_t lock;
@@ -420,6 +427,7 @@ HANDLE GetCurrentProcess(void)  { return PSEUDO_CURRENT_PROCESS; }
 static w32_object *obj_alloc(w32_kind kind)
 {
     w32_object *o = (w32_object *)calloc(1, sizeof(w32_object));
+    o->magic    = W32_OBJ_MAGIC;
     o->kind     = kind;
     o->refcount = 1;
     pthread_mutex_init(&o->lock, NULL);
@@ -440,6 +448,7 @@ static void obj_release(w32_object *o)
     } else if (o->kind == K_WAITABLE_TIMER) {
         /* Waitable timers: no special cleanup needed */
     }
+    o->magic = 0;
     pthread_mutex_destroy(&o->lock);
     pthread_cond_destroy(&o->cond);
     pthread_cond_destroy(&o->gate);
@@ -600,10 +609,20 @@ static DWORD wait_single(w32_object *o, DWORD ms)
     return result;
 }
 
+static int w32_is_object(HANDLE h)
+{
+    return h && h != PSEUDO_CURRENT_THREAD && h != PSEUDO_CURRENT_PROCESS &&
+           ((const w32_object *)h)->magic == W32_OBJ_MAGIC;
+}
+
 DWORD WaitForSingleObject(HANDLE h, DWORD ms)
 {
     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS)
         return WAIT_OBJECT_0;
+    if (!w32_is_object(h)) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return WAIT_FAILED;
+    }
     return wait_single((w32_object *)h, ms);
 }
 
@@ -629,6 +648,15 @@ DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
     struct timespec ts;
     int timed = (ms != INFINITE);
     if (timed) deadline_from_ms(ms, &ts);
+
+    /* Win32 fails the whole wait up front if any handle is invalid. */
+    for (DWORD i = 0; i < count; i++) {
+        HANDLE h = handles[i];
+        if (h && h != PSEUDO_CURRENT_THREAD && h != PSEUDO_CURRENT_PROCESS && !w32_is_object(h)) {
+            SetLastError(ERROR_INVALID_HANDLE);
+            return WAIT_FAILED;
+        }
+    }
 
     for (;;) {
         if (alertable && drain_apcs() > 0)
