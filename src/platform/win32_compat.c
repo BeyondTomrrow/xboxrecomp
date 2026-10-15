@@ -85,6 +85,7 @@ PVOID InterlockedCompareExchangePointer(PVOID volatile *p, PVOID xchg, PVOID cmp
 VOID InitializeCriticalSection(LPCRITICAL_SECTION cs)
 {
     memset(cs, 0, sizeof(*cs));
+    cs->LockCount = -1;   /* Win32: -1 = free */
     pthread_mutex_t *m = (pthread_mutex_t *)malloc(sizeof(pthread_mutex_t));
     pthread_mutexattr_t attr;
     pthread_mutexattr_init(&attr);
@@ -100,17 +101,33 @@ VOID InitializeCriticalSectionAndSpinCount(LPCRITICAL_SECTION cs, DWORD spin)
     cs->SpinCount = spin;
 }
 
+/* Ownership fields follow Win32: while held, OwningThread is the owner's
+ * thread id and RecursionCount its depth; both clear on the last Leave.
+ * The kernel layer reads them (xbox_RtlCriticalSectionOwnedByCurrentThread
+ * gates NFL 2K5's scheduler pump on it). Written only by the owner, under
+ * the mutex. */
+static void cs_note_acquired(LPCRITICAL_SECTION cs)
+{
+    if (cs->RecursionCount++ == 0) {
+        cs->OwningThread = (HANDLE)(uintptr_t)GetCurrentThreadId();
+        cs->LockCount = 0;
+    }
+}
+
 VOID EnterCriticalSection(LPCRITICAL_SECTION cs)
 {
     if (!cs->LockSemaphore) InitializeCriticalSection(cs);
     pthread_mutex_lock((pthread_mutex_t *)cs->LockSemaphore);
-    cs->RecursionCount++;
+    cs_note_acquired(cs);
 }
 
 VOID LeaveCriticalSection(LPCRITICAL_SECTION cs)
 {
     if (!cs->LockSemaphore) return;
-    cs->RecursionCount--;
+    if (cs->RecursionCount > 0 && --cs->RecursionCount == 0) {
+        cs->OwningThread = NULL;
+        cs->LockCount = -1;
+    }
     pthread_mutex_unlock((pthread_mutex_t *)cs->LockSemaphore);
 }
 
@@ -118,7 +135,7 @@ BOOL TryEnterCriticalSection(LPCRITICAL_SECTION cs)
 {
     if (!cs->LockSemaphore) InitializeCriticalSection(cs);
     if (pthread_mutex_trylock((pthread_mutex_t *)cs->LockSemaphore) == 0) {
-        cs->RecursionCount++;
+        cs_note_acquired(cs);
         return TRUE;
     }
     return FALSE;
@@ -277,12 +294,22 @@ BOOL SleepConditionVariableCS(PCONDITION_VARIABLE cv, PCRITICAL_SECTION cs, DWOR
     if (!cs->LockSemaphore) InitializeCriticalSection(cs);
     pthread_mutex_t *mutex = (pthread_mutex_t *)cs->LockSemaphore;
     int rc;
+    /* The wait releases the section: whoever takes it meanwhile must see it
+     * unowned, and this thread gets its depth back on wake. */
+    LONG depth = cs->RecursionCount;
+    HANDLE owner = cs->OwningThread;
+    cs->RecursionCount = 0;
+    cs->OwningThread = NULL;
+    cs->LockCount = -1;
     if (ms == INFINITE) rc = pthread_cond_wait(&value->condition, mutex);
     else {
         struct timespec deadline;
         deadline_from_ms(ms, &deadline);
         rc = pthread_cond_timedwait(&value->condition, mutex, &deadline);
     }
+    cs->RecursionCount = depth;
+    cs->OwningThread = owner;
+    cs->LockCount = 0;
     if (rc) { SetLastError(rc == ETIMEDOUT ? ERROR_TIMEOUT : ERROR_GEN_FAILURE); return FALSE; }
     return TRUE;
 }
