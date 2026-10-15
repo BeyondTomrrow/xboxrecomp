@@ -455,4 +455,26 @@ static int  gpu_enabled(void)              { return 1; }
 static void gpu_cpu_access(void)           {}
 static int  gpu_draw_batch(int flat2d)     { (void)flat2d; return 0; }
 static int  gpu_clear(uint32_t param)      { (void)param; return 0; }
-static void gpu_flip(void)                 { sdl_pr_flip(); }
+/* Presenting: fb_present.c's SDL renderer already shows the finished frame
+ * (nv2a_pb_exec repoints it at every FLIP_STALL) and owns the window's
+ * surface. Claiming the same window for an SDL_GPU device on top of that is
+ * refused on Wayland ("surface already exists"), and the compositor then
+ * drops the whole display connection. So the SDL_GPU presenter is opt-in
+ * (RECOMP_SDL_GPU_PRESENT=1); by default a flip only applies pending video
+ * setting changes. */
+static void gpu_flip(void)
+{
+    static int use_gpu = -1;
+    if (use_gpu < 0) {
+        const char *v = getenv("RECOMP_SDL_GPU_PRESENT");
+        use_gpu = v && *v && strcmp(v, "0") != 0;
+        if (!use_gpu)
+            xbox_VideoSettingsLoad();
+    }
+    if (use_gpu) {
+        sdl_pr_flip();
+        return;
+    }
+    if (xbox_FramebufferWindowHwnd() && SDL_CompareAndSwapAtomicInt(&s_vs_dirty, 1, 0))
+        xbox_FramebufferApplyMode(s_vs.mode, s_vs.res_w, s_vs.res_h);
+}
