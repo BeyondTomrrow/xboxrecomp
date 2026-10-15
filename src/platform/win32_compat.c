@@ -313,35 +313,6 @@ BOOL SleepConditionVariableSRW(PCONDITION_VARIABLE cv, PSRWLOCK lock, DWORD ms, 
     return TRUE;
 }
 
-/* SRW-lock flavour. A pthread_cond_t needs a mutex, not a rwlock, so each wait
- * takes a private mutex before dropping the SRW lock; Wake* then signals
- * without it, so a wake landing in that window is lost and the wait simply
- * times out (callers loop and use bounded waits, as Win32 allows spurious
- * wakeups and expects callers to re-check). */
-BOOL SleepConditionVariableSRW(PCONDITION_VARIABLE cv, PSRWLOCK lock, DWORD ms, ULONG flags)
-{
-    static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
-    int shared = (flags & 1 /* CONDITION_VARIABLE_LOCKMODE_SHARED */) != 0;
-    BOOL ok = TRUE;
-    cv_lazy_init(cv);
-    pthread_cond_t *c = (pthread_cond_t *)cv->Ptr;
-    pthread_mutex_lock(&m);
-    if (shared) ReleaseSRWLockShared(lock); else ReleaseSRWLockExclusive(lock);
-    if (ms == INFINITE) {
-        pthread_cond_wait(c, &m);
-    } else {
-        struct timespec ts;
-        deadline_from_ms(ms, &ts);
-        if (pthread_cond_timedwait(c, &m, &ts) == ETIMEDOUT) {
-            SetLastError(WAIT_TIMEOUT);
-            ok = FALSE;
-        }
-    }
-    pthread_mutex_unlock(&m);
-    if (shared) AcquireSRWLockShared(lock); else AcquireSRWLockExclusive(lock);
-    return ok;
-}
-
 VOID WakeConditionVariable(PCONDITION_VARIABLE cv)
 {
     w32_condition *value = cv_lazy_init(cv);
