@@ -820,8 +820,15 @@ HANDLE CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stackSize,
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    if (stackSize)
-        pthread_attr_setstacksize(&attr, stackSize < 65536 ? 65536 : stackSize);
+    /* Win32: stackSize is the initial *commit*; the reservation comes from
+     * the executable (/STACK, 16 MB for the game targets), so a thread can
+     * always grow that far. Recompiled code calls natively and goes deep, so
+     * honouring a guest's 64 KB request literally overflowed on the first
+     * interrupt. Reserve at least 16 MB; Linux commits stack pages lazily. */
+    {
+        const SIZE_T reserve = (SIZE_T)16 << 20;
+        pthread_attr_setstacksize(&attr, stackSize > reserve ? stackSize : reserve);
+    }
 
     if (pthread_create(&o->thread, &attr, thread_trampoline, o) != 0) {
         pthread_attr_destroy(&attr);
