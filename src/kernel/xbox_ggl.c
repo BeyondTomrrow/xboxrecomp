@@ -1,26 +1,23 @@
 /* Global guest lock -- see xbox_ggl.h for why. */
 
-#ifndef _WIN32
-/* The global guest lock is a Windows-host scheduling aid (RECOMP_GGL=1, off by
- * default). POSIX hosts run without it: every entry point is a no-op. */
-#include <stdint.h>
-#include "xbox_ggl.h"
-int  xbox_ggl_enabled(void) { return 0; }
-void xbox_ggl_enter(void) {}
-void xbox_ggl_leave(void) {}
-int  xbox_ggl_release_all(void) { return 0; }
-void xbox_ggl_reacquire(int depth) { (void)depth; }
-void xbox_ggl_preempt_point(unsigned int guest_site) { (void)guest_site; }
-void xbox_ggl_set_priority(int prio) { (void)prio; }
-volatile uint32_t g_xbox_game_tid;   /* DWORD; set by the title (input HLE), diagnostics only */
-#else
+/* Every host: NFL 2K5 needs one-guest-thread-at-a-time on Linux as much as
+ * on Windows (lost resumes, a starved scheduler pump, ...; see xbox_ggl.h).
+ * Only the stalled-owner PC report below is Windows-specific. */
 #define XBOX_GGL_IMPL
+#ifdef _WIN32
 #include <windows.h>
 #include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
+#else
+#include <stdint.h>
+#include "platform/xbox_winnt.h"
+#include "platform/win32_compat.h"
+#endif
+#include "platform/xbox_winnt.h"   /* XBOX_THREAD_LOCAL */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "xbox_ggl.h"
-#pragma comment(lib, "dbghelp.lib")
 
 static int g_enabled = -1;
 static SRWLOCK g_lock = SRWLOCK_INIT;
@@ -36,18 +33,19 @@ static unsigned long long g_next_seq;
 static struct { DWORD tid; int prio; unsigned long long seq; } g_wait[GGL_MAX_WAITERS];
 static int g_nwait;
 static volatile LONG g_best_waiting_prio = -1000;
-static __declspec(thread) int t_prio;
+static XBOX_THREAD_LOCAL int t_prio;
 static volatile DWORD g_owner;
 static volatile LONGLONG g_owner_since;      /* QPC when the owner got the lock */
 static volatile LONGLONG g_owner_last_point; /* QPC of its last kernel call */
 static volatile unsigned int g_owner_last_site; /* guest return address of that call */
 static LONGLONG g_qpc_freq, g_quantum_ticks;
 
-static __declspec(thread) int t_depth;
+static XBOX_THREAD_LOCAL int t_depth;
 
 /* Resolve the native instruction where a stalled guest-lock owner is
  * actually spinning.  The last kernel return site only identifies the most
  * recent service call and can be far from the bad generated branch. */
+#ifdef _WIN32
 static void ggl_report_owner_pc(DWORD tid)
 {
     HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
@@ -95,12 +93,20 @@ static void ggl_report_owner_pc(DWORD tid)
     }
     fflush(stderr);
 }
+#else
+static void ggl_report_owner_pc(DWORD tid)
+{
+    /* No portable way to sample another thread's PC; the watchdog's guest
+     * return-site report still names the last kernel call. */
+    fprintf(stderr, "  [GGL] owner tid %u (native PC sampling is Windows-only)\n", (unsigned)tid);
+}
+#endif
 
 /* Per-thread accounting, reported by the watchdog every 10 s: how long each
  * guest thread held the guest CPU and how long it queued for it. */
 #define GGL_STAT_SLOTS 32
 static struct { volatile DWORD tid; volatile LONGLONG held, waited; volatile LONG grants; } g_stat[GGL_STAT_SLOTS];
-static __declspec(thread) int t_stat = -1;
+static XBOX_THREAD_LOCAL int t_stat = -1;
 
 static int ggl_stat_slot(void)
 {
@@ -183,6 +189,7 @@ static DWORD WINAPI ggl_watchdog(LPVOID unused)
             reported = owner;
         }
     }
+    return 0;   /* not reached */
 }
 
 int xbox_ggl_enabled(void)
@@ -214,7 +221,7 @@ int xbox_ggl_enabled(void)
     return g_enabled;
 }
 
-static __declspec(thread) LONGLONG t_acquired_at;
+static XBOX_THREAD_LOCAL LONGLONG t_acquired_at;
 
 /* Caller holds g_lock. */
 static void ggl_update_best(void)
@@ -410,4 +417,3 @@ BOOL xbox_ggl_SleepConditionVariableSRW(PCONDITION_VARIABLE cv, PSRWLOCK l, DWOR
     GGL_BLOCKING(r = SleepConditionVariableSRW(cv, l, ms, flags));
     return r;
 }
-#endif /* _WIN32 */
