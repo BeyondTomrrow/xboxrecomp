@@ -451,10 +451,16 @@ static void sdl_pr_flip(void)
 
 /* On non-Windows builds, rasterisation runs through nv2a_pb_exec.c's CPU
  * pipeline and gpu_flip() presents the finished surface via SDL_GPU! */
+/* Hardware rendering through SDL3's GPU API: kernel/sdlgpu/, design in
+ * docs/sdl-gpu-renderer.md. Each entry point returns "not handled" when
+ * the renderer is off or cannot do the work, and the software rasterizer in
+ * nv2a_pb_exec.c takes over. */
+#include "sdlgpu/sdlgpu.inc.c"
+
 static int  gpu_enabled(void)              { return 1; }
-static void gpu_cpu_access(void)           {}
-static int  gpu_draw_batch(int flat2d)     { (void)flat2d; return 0; }
-static int  gpu_clear(uint32_t param)      { (void)param; return 0; }
+static void gpu_cpu_access(void)           { sg_cpu_access(); }
+static int  gpu_draw_batch(int flat2d)     { return sg_draw_batch(flat2d); }
+static int  gpu_clear(uint32_t param)      { return sg_clear(param); }
 /* Presenting: fb_present.c's SDL renderer already shows the finished frame
  * (nv2a_pb_exec repoints it at every FLIP_STALL) and owns the window's
  * surface. Claiming the same window for an SDL_GPU device on top of that is
@@ -465,6 +471,7 @@ static int  gpu_clear(uint32_t param)      { (void)param; return 0; }
 static void gpu_flip(void)
 {
     static int use_gpu = -1;
+    sg_flip();
     if (use_gpu < 0) {
         const char *v = getenv("RECOMP_SDL_GPU_PRESENT");
         use_gpu = v && *v && strcmp(v, "0") != 0;
