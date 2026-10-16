@@ -44,6 +44,10 @@ static struct {
     uint32_t        *rgb;
     uint32_t         width, height;
 
+    /* Set once the user closes the window: the game is ending, and nothing
+     * may start a new window (a clear calls xbox_FramebufferWindowStart). */
+    SDL_AtomicInt    closing;
+
     /* Frame snapshot taken at the title's flip (see xbox_FramebufferSnapshot) */
     SDL_AtomicU32    snap_ms;        /* SDL_GetTicks() of the last snapshot, 0 = none */
 
@@ -225,6 +229,16 @@ static void fb_draw_sdl_fallback(void)
     SDL_RenderPresent(g_fb.fallback_renderer);
 }
 
+static int SDLCALL fb_exit_guard(void *arg)
+{
+    (void)arg;
+    SDL_Delay(3000);
+    fprintf(stderr, "[WINDOW] shutdown stalled for 3 s; ending the process\n");
+    fflush(stderr);
+    _Exit(0);
+    return 0;
+}
+
 static int SDLCALL fb_thread_sdl(void *data)
 {
     int dump_frames = 0;
@@ -277,6 +291,7 @@ static int SDLCALL fb_thread_sdl(void *data)
             if (ev.type == SDL_EVENT_QUIT || ev.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
                 fprintf(stderr, "[WINDOW] SDL quit requested -- shutting down game\n");
                 fflush(stderr);
+                SDL_SetAtomicInt(&g_fb.closing, 1);
                 SDL_SetAtomicInt(&g_fb.running, 0);
             } else if (ev.type == SDL_EVENT_KEY_DOWN) {
                 if (g_fb.key_hook) {
@@ -323,12 +338,23 @@ static int SDLCALL fb_thread_sdl(void *data)
     SDL_UnlockRWLock(g_fb.rgb_lock);
     SDL_DestroyRWLock(g_fb.rgb_lock);
 
+    /* exit() runs the atexit handlers (the icall-feedback dump, driver
+     * teardown) while the game's threads are still running. A GPU driver
+     * tearing down under an active device can stall there, so the process
+     * gets a few seconds and then ends regardless. */
+    {
+        SDL_Thread *guard = SDL_CreateThread(fb_exit_guard, "fb_exit_guard", NULL);
+        if (guard)
+            SDL_DetachThread(guard);
+    }
     exit(0);
     return 0;
 }
 
 static void fb_window_start(void)
 {
+    if (SDL_GetAtomicInt(&g_fb.closing))
+        return;   /* the user closed the window: the game is ending */
     if (SDL_CompareAndSwapAtomicInt(&g_fb.running, 0, 1)) {
         g_fb.thread = SDL_CreateThread(fb_thread_sdl, "fb_thread", NULL);
         if (!g_fb.thread) {
