@@ -189,9 +189,12 @@ static void fb_draw_sdl_fallback(void)
          * while the title clears or redraws it: alternate black frames and
          * half-drawn tiles. Live reads remain the fallback when the title has
          * not flipped for a while (static screens, direct-to-framebuffer
-         * paths), so the window never freezes. */
+         * paths), so the window never freezes. The wait has to exceed the
+         * slowest real frame: with the software renderer a match runs at a
+         * few frames per second, and a 250 ms limit fell back to live reads
+         * between almost every pair of flips. */
         Uint32 snap = SDL_GetAtomicU32(&g_fb.snap_ms);
-        if (!snap || (Uint32)SDL_GetTicks() - snap > 250u)
+        if (!snap || (Uint32)SDL_GetTicks() - snap > 2000u)
             fb_convert(src, pitch, pitch / g_fb.width);
     }
     SDL_UpdateTexture(g_fb.fallback_texture, NULL, g_fb.rgb, (int)(g_fb.width * 4u));
