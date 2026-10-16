@@ -8,9 +8,15 @@
  * reads the executor's state (s_gpu, s_vp, dma_resolve, ...). Every function
  * here runs on the executor's thread, so the renderer keeps no lock.
  *
- * Off unless RECOMP_SDLGPU=1 while milestones land: until draws are on the
- * GPU, GPU clears only add a download before the next software draw.
+ * Off unless RECOMP_SDLGPU=1 while milestones land.
  */
+
+#include <stddef.h>     /* offsetof */
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <SDL3/SDL.h>
 
 #define SG_MAX_SURFACES 8
 
@@ -28,13 +34,41 @@ typedef struct {
     uint32_t        last_use;   /* s_sg.tick when last bound, for eviction */
 } SgSurface;
 
+#define SG_MAX_PIPELINES 32
+
+/* One vertex of a flat 2D triangle (shaders/flat2d.vert). */
+typedef struct {
+    float x, y;          /* surface pixels */
+    float color[4];      /* the triangle's flat colour, RGBA 0..1 */
+    float uv[3];         /* texels; uv[2] = 1 when the triangle is textured */
+} SgVertex;
+
+typedef struct {
+    uint32_t                 key;      /* sg_pipeline_key() of the state it encodes */
+    SDL_GPUGraphicsPipeline *pipe;
+} SgPipeline;
+
 static struct {
     int                    tried;      /* device creation attempted */
     SDL_GPUDevice         *dev;
     SgSurface              surf[SG_MAX_SURFACES];
     uint32_t               tick;
-    SDL_GPUTransferBuffer *download;   /* reused; grows to the largest surface */
+
+    /* Transfers between guest RAM and the GPU, reused and grown on demand. */
+    SDL_GPUTransferBuffer *download;
     uint32_t               download_size;
+    SDL_GPUTransferBuffer *upload;
+    uint32_t               upload_size;
+
+    /* Flat 2D drawing (sdlgpu_draw.inc.c). */
+    int                    draw_ready;   /* shaders loaded: draws can be taken */
+    SDL_GPUShader         *flat2d_vs, *flat2d_fs;
+    SgPipeline             pipes[SG_MAX_PIPELINES];
+    int                    pipe_count;
+    SDL_GPUBuffer         *vertices;
+    uint32_t               vertices_size;
+    SDL_GPUSampler        *point;        /* texelFetch ignores it; SDL needs a pair */
+    SDL_GPUTexture        *white;        /* bound when a batch has no texture */
 } s_sg;
 
 static int sg_wanted(void)
@@ -70,6 +104,9 @@ static int sg_ready(void)
 }
 
 #include "sdlgpu_surface.inc.c"
+#include "sdlgpu_texture.inc.c"
+#include "sdlgpu_pipeline.inc.c"
+#include "sdlgpu_draw.inc.c"
 
 /* ── The five entry points (docs/sdl-gpu-renderer.md, "The contract") ── */
 
@@ -81,8 +118,9 @@ static void sg_cpu_access(void)
 
 static int sg_draw_batch(int flat2d)
 {
-    (void)flat2d;
-    return 0;   /* milestone 1: no draws on the GPU yet */
+    if (!flat2d)
+        return 0;   /* vertex-program (3D) batches: milestone 2 */
+    return sg_ready() && sg_draw_flat2d();
 }
 
 static int sg_clear(uint32_t param)

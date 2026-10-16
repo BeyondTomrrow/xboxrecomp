@@ -125,6 +125,16 @@ static void sg_download(SgSurface *s)
     s->owner = SG_OWNER_GUEST;
 }
 
+/* The guest copy of a surface, rows packed tight, for uploading when the
+ * GPU copy is stale (a software draw or a title write happened since). */
+static void sg_surface_pack(const SgSurface *s, uint8_t *dst)
+{
+    const uint8_t *src = sg_guest_bytes(s->guest);
+    uint32_t row = s->w * 4, y;
+    for (y = 0; y < s->h; y++)
+        memcpy(dst + (size_t)y * row, src + (size_t)y * s->pitch, row);
+}
+
 static void sg_download_all(void)
 {
     int i;

@@ -1,7 +1,7 @@
 # SDL3 GPU renderer (Linux hardware rendering)
 
-Status: milestone 0 done (device, surfaces, colour clears, downloads;
-off unless `RECOMP_SDLGPU=1`). Test: `tests/sdlgpu_posix`.
+Status: milestones 0 and 1 done (clears; flat 2D draws: menus, HUD, text).
+Off unless `RECOMP_SDLGPU=1`. Test: `tests/sdlgpu_posix`.
 
 ## Why
 
@@ -89,7 +89,13 @@ Each one is testable on its own, on real hardware or on Mesa's lavapipe
 0. **Device and surfaces.** Headless device, surface cache with ownership,
    color clears on the GPU, download on flip/CPU access. Test: GPU clear then
    download equals the software clear, byte for byte.
-1. **Flat 2D draws.** Shader pipeline in the build, untextured and textured
+1. **Flat 2D draws** (done). The software 2D path does not run the register
+   combiners: flat colour per triangle, point-sampled texel MODULATE, alpha
+   test, blend. `shaders/flat2d.*` reproduces that exactly; triangle
+   assembly is shared with the software path (`batch_triangles`), and stage
+   0 is decoded through `sample_texture`, so every format is covered. Known,
+   tested differences: blending within 2/255, pixel centres within 1/64 px
+   of an edge. Original plan: Shader pipeline in the build, untextured and textured
    pre-transformed triangles (`flat2d`), alpha blending. Menus and HUD go to
    the GPU. Test: rendered frames match the software rasterizer within a
    small tolerance.

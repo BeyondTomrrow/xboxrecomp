@@ -47,6 +47,34 @@ else()
     # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
     find_package(OpenSSL REQUIRED)
     target_link_libraries(xbox_kernel PUBLIC platform OpenSSL::Crypto)
+
+    # SDL3 GPU renderer shaders (sdlgpu/shaders): GLSL compiled to SPIR-V at
+    # build time and embedded as C arrays. Without glslangValidator the
+    # renderer reports itself unavailable and drawing stays in software.
+    find_program(XBOXRECOMP_GLSLANG glslangValidator)
+    if(XBOXRECOMP_GLSLANG)
+        set(_sg_src ${CMAKE_CURRENT_SOURCE_DIR}/sdlgpu/shaders)
+        set(_sg_out ${CMAKE_CURRENT_BINARY_DIR}/sdlgpu_shaders)
+        set(_sg_headers)
+        foreach(_sg_shader flat2d.vert flat2d.frag)
+            string(REPLACE "." "_" _sg_name ${_sg_shader})
+            add_custom_command(
+                OUTPUT ${_sg_out}/${_sg_name}.h
+                COMMAND ${CMAKE_COMMAND} -E make_directory ${_sg_out}
+                COMMAND ${XBOXRECOMP_GLSLANG} -V --target-env vulkan1.0
+                        --vn k_sg_${_sg_name} -o ${_sg_out}/${_sg_name}.h ${_sg_src}/${_sg_shader}
+                DEPENDS ${_sg_src}/${_sg_shader}
+                COMMENT "SPIR-V: ${_sg_shader}"
+                VERBATIM)
+            list(APPEND _sg_headers ${_sg_out}/${_sg_name}.h)
+        endforeach()
+        add_custom_target(xbox_sdlgpu_shaders DEPENDS ${_sg_headers})
+        add_dependencies(xbox_kernel xbox_sdlgpu_shaders)
+        target_include_directories(xbox_kernel PRIVATE ${_sg_out})
+        target_compile_definitions(xbox_kernel PRIVATE SG_HAVE_SHADERS=1)
+    else()
+        message(STATUS "glslangValidator not found: the SDL3 GPU renderer is unavailable (install glslang)")
+    endif()
 endif()
 
 if(MSVC)

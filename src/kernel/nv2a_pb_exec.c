@@ -1726,9 +1726,64 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
                     textured ? (const float (*)[2])uv : NULL);
 }
 
-static void raster_batch(void)
+/* The triangles of the current batch, in draw order, each with the colour
+ * the 2D path gives it (its first vertex's -- flat shading). Shared by the
+ * software rasterizer and the GPU renderers, so both draw exactly the same
+ * triangles. Points and lines produce none. */
+typedef void (*BatchTriFn)(void *ctx, uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb);
+
+static void batch_triangles(BatchTriFn emit, void *ctx)
 {
     uint32_t i;
+    switch (s_gpu.prim) {
+    case NV_PRIM_TRIANGLES:
+        for (i = 0; i + 2 < s_gpu.idx_count; i += 3)
+            emit(ctx, s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2],
+                           vertex_color(s_gpu.idx[i]));
+        break;
+    case NV_PRIM_TRIANGLE_STRIP:
+        for (i = 0; i + 2 < s_gpu.idx_count; i++)
+            emit(ctx, s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2],
+                           vertex_color(s_gpu.idx[i]));
+        break;
+    case NV_PRIM_TRIANGLE_FAN:
+    case NV_PRIM_POLYGON:
+        for (i = 1; i + 1 < s_gpu.idx_count; i++)
+            emit(ctx, s_gpu.idx[0], s_gpu.idx[i], s_gpu.idx[i+1],
+                           vertex_color(s_gpu.idx[0]));
+        break;
+    case NV_PRIM_QUADS:
+        /* Each group of four is its own quad: two triangles around its first
+         * vertex. */
+        for (i = 0; i + 3 < s_gpu.idx_count; i += 4) {
+            emit(ctx, s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2],
+                           vertex_color(s_gpu.idx[i]));
+            emit(ctx, s_gpu.idx[i], s_gpu.idx[i+2], s_gpu.idx[i+3],
+                           vertex_color(s_gpu.idx[i]));
+        }
+        break;
+    case NV_PRIM_QUAD_STRIP:
+        /* Vertices pair up; each new pair closes a quad with the previous. */
+        for (i = 0; i + 3 < s_gpu.idx_count; i += 2) {
+            emit(ctx, s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+3],
+                           vertex_color(s_gpu.idx[i]));
+            emit(ctx, s_gpu.idx[i], s_gpu.idx[i+3], s_gpu.idx[i+2],
+                           vertex_color(s_gpu.idx[i]));
+        }
+        break;
+    default:
+        break;                             /* points and lines: not yet */
+    }
+}
+
+static void raster_indexed_cb(void *ctx, uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
+{
+    (void)ctx;
+    raster_indexed(i0, i1, i2, argb);
+}
+
+static void raster_batch(void)
+{
     uint32_t before = s_gpu.tris_drawn;
 
     if (s_gpu.idx_count < 3)
@@ -1752,45 +1807,7 @@ static void raster_batch(void)
         }
     }
 
-    switch (s_gpu.prim) {
-    case NV_PRIM_TRIANGLES:
-        for (i = 0; i + 2 < s_gpu.idx_count; i += 3)
-            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2],
-                           vertex_color(s_gpu.idx[i]));
-        break;
-    case NV_PRIM_TRIANGLE_STRIP:
-        for (i = 0; i + 2 < s_gpu.idx_count; i++)
-            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2],
-                           vertex_color(s_gpu.idx[i]));
-        break;
-    case NV_PRIM_TRIANGLE_FAN:
-    case NV_PRIM_POLYGON:
-        for (i = 1; i + 1 < s_gpu.idx_count; i++)
-            raster_indexed(s_gpu.idx[0], s_gpu.idx[i], s_gpu.idx[i+1],
-                           vertex_color(s_gpu.idx[0]));
-        break;
-    case NV_PRIM_QUADS:
-        /* Each group of four is its own quad: two triangles around its first
-         * vertex. */
-        for (i = 0; i + 3 < s_gpu.idx_count; i += 4) {
-            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2],
-                           vertex_color(s_gpu.idx[i]));
-            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+2], s_gpu.idx[i+3],
-                           vertex_color(s_gpu.idx[i]));
-        }
-        break;
-    case NV_PRIM_QUAD_STRIP:
-        /* Vertices pair up; each new pair closes a quad with the previous. */
-        for (i = 0; i + 3 < s_gpu.idx_count; i += 2) {
-            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+3],
-                           vertex_color(s_gpu.idx[i]));
-            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+3], s_gpu.idx[i+2],
-                           vertex_color(s_gpu.idx[i]));
-        }
-        break;
-    default:
-        break;                             /* points and lines: not yet */
-    }
+    batch_triangles(raster_indexed_cb, NULL);
 
     if (s_gpu.tris_drawn && (s_gpu.tris_drawn % 500) == 0)
         fprintf(stderr, "  [GPU] %u triangles rasterised\n", s_gpu.tris_drawn);
