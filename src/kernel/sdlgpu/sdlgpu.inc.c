@@ -47,14 +47,16 @@ static int sg_wanted(void)
     return wanted;
 }
 
-/* Lazily create the device. SDL needs its video subsystem first, which the
- * window thread starts; until then every call falls back to software and
- * creation is retried. */
+/* Lazily create the device once the game window exists. SDL's video
+ * subsystem is started by the window thread, and SDL_WasInit() already
+ * reports it while that start-up is still running: a device requested then
+ * fails with "Video subsystem not initialized". The window is the reliable
+ * signal. Until it exists every call falls back to software. */
 static int sg_ready(void)
 {
     if (s_sg.dev)
         return 1;
-    if (!sg_wanted() || s_sg.tried || !SDL_WasInit(SDL_INIT_VIDEO))
+    if (!sg_wanted() || s_sg.tried || !xbox_FramebufferWindowHwnd())
         return 0;
     s_sg.tried = 1;
     s_sg.dev = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_SPIRV,

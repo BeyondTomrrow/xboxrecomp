@@ -15,6 +15,7 @@ static struct {
 static uint32_t g_clear_rx = 0x0FFF0000u, g_clear_ry = 0x0FFF0000u;
 static uint8_t *g_ram;                                   /* fake guest RAM */
 static void *xbox_GetMemoryOffset(void) { return g_ram; }
+static void *xbox_FramebufferWindowHwnd(void) { return (void *)1; }   /* "the window exists" */
 static uint32_t dma_resolve(uint32_t offset) { return offset; }
 static uint32_t surface_bpp(void) { return s_gpu.clip_w ? s_gpu.pitch / s_gpu.clip_w : 0; }
 static void comb_unpack(uint32_t c, float v[4])
