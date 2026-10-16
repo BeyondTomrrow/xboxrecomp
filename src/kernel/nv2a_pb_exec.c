@@ -80,6 +80,7 @@ static const char *env_cached(const char *name)
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
+extern void xbox_FramebufferSnapshot(uint32_t fb_va, uint32_t pitch);
 extern void xbox_FramebufferWindowStart(void);
 extern void xbox_FramebufferWindowSize(uint32_t w, uint32_t h);
 extern uint32_t g_nv2a_pb_calls;   /* nv2a_pb_scan.c */
@@ -4371,6 +4372,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             }
         }
         xbox_FramebufferWindowSet(dma_resolve(s_gpu.color_offset), s_gpu.pitch);
+        xbox_FramebufferSnapshot(dma_resolve(s_gpu.color_offset), s_gpu.pitch);
         xbox_FramebufferWindowSize(s_gpu.clip_x + s_gpu.clip_w, s_gpu.clip_y + s_gpu.clip_h);
         /* And this is a completed swap, which is what a title's own swap
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */

@@ -44,6 +44,9 @@ static struct {
     uint32_t        *rgb;
     uint32_t         width, height;
 
+    /* Frame snapshot taken at the title's flip (see xbox_FramebufferSnapshot) */
+    SDL_AtomicU32    snap_ms;        /* SDL_GetTicks() of the last snapshot, 0 = none */
+
     /* Presenter handoff & hooks */
     SDL_AtomicInt    gpu_present;
     void (* volatile key_hook)(unsigned vk);
@@ -180,7 +183,17 @@ static void fb_draw_sdl_fallback(void)
     src = (const uint8_t *)((uintptr_t)va + xbox_GetMemoryOffset());
 
     SDL_LockRWLockForWriting(g_fb.rgb_lock);
-    fb_convert(src, pitch, pitch / g_fb.width);
+    {
+        /* Show the frame the title last flipped, copied at the flip. Reading
+         * the guest buffer live on this thread's own 16 ms timer catches it
+         * while the title clears or redraws it: alternate black frames and
+         * half-drawn tiles. Live reads remain the fallback when the title has
+         * not flipped for a while (static screens, direct-to-framebuffer
+         * paths), so the window never freezes. */
+        Uint32 snap = SDL_GetAtomicU32(&g_fb.snap_ms);
+        if (!snap || (Uint32)SDL_GetTicks() - snap > 250u)
+            fb_convert(src, pitch, pitch / g_fb.width);
+    }
     SDL_UpdateTexture(g_fb.fallback_texture, NULL, g_fb.rgb, (int)(g_fb.width * 4u));
     SDL_UnlockRWLock(g_fb.rgb_lock);
 
@@ -341,6 +354,28 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
     SDL_SetAtomicU32(&g_fb.va, pin ? (uint32_t)strtoul(pin, NULL, 0) : fb_va);
     if (pitch)
         SDL_SetAtomicU32(&g_fb.pitch, pitch);
+}
+
+/* The title just flipped this buffer: copy it now, while it is complete,
+ * for the SDL renderer fallback to show. No-op while a GPU presenter owns the
+ * window (those copy at the flip themselves). Called from the GPU thread. */
+void xbox_FramebufferSnapshot(uint32_t fb_va, uint32_t pitch)
+{
+    uint32_t base;
+    uint64_t end;
+
+    if (SDL_GetAtomicInt(&g_fb.gpu_present) || !g_fb.rgb_lock || !fb_va || !pitch)
+        return;
+    SDL_LockRWLockForWriting(g_fb.rgb_lock);
+    base = fb_va & 0x7FFFFFFFu;
+    end  = (uint64_t)base + (uint64_t)pitch * g_fb.height;
+    if (g_fb.rgb && g_fb.width && pitch >= g_fb.width &&
+        (fb_va >= 0x80000000u || fb_va < FB_GUEST_RAM_SIZE) && end <= FB_GUEST_RAM_SIZE) {
+        fb_convert((const uint8_t *)((uintptr_t)fb_va + xbox_GetMemoryOffset()),
+                   pitch, pitch / g_fb.width);
+        SDL_SetAtomicU32(&g_fb.snap_ms, (Uint32)SDL_GetTicks() | 1u);
+    }
+    SDL_UnlockRWLock(g_fb.rgb_lock);
 }
 
 void xbox_FramebufferWindowSize(uint32_t w, uint32_t h)
