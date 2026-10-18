@@ -20,7 +20,9 @@
 
 /* ---- executor stand-ins ------------------------------------------------ */
 typedef struct { int unused; } VertexAttr;
-typedef struct { int valid, enabled; uint32_t width, height, addr_u, addr_v; } TexState;
+typedef struct { int valid, enabled; uint32_t width, height, addr_u, addr_v, color, pitch; } TexState;
+typedef struct { uint8_t *pixels; size_t bytes; int owned; uint32_t palette[256]; int ready; } TextureSnapshot;
+static TextureSnapshot s_texture_snapshot[4];     /* the executor's per-batch stage snapshot */
 static struct {
     uint32_t color_offset, pitch, clear_color;
     uint32_t clip_x, clip_w, clip_y, clip_h;
@@ -265,7 +267,8 @@ int main(void)
         CHECK(px == 0xFF336699u, "quad not at its top-left position (y flipped?): %08X", px);
     }
 
-    s_gpu.tex = (TexState){ 1, 1, 8, 8, 1, 1 };    /* wrap both axes */
+    s_gpu.tex = (TexState){ 1, 1, 8, 8, 1, 1, 0x12, 32 };   /* A8R8G8B8, wrap both axes */
+    s_texture_snapshot[0] = (TextureSnapshot){ (uint8_t *)tex, sizeof tex, 0, { 0 }, 1 };
     g_ntris = 2; quad(0, 0, 0, 64, 48, -3.5f, 0, 28.5f, 24, 0xC0FFFFFFu, 1);
     run_scene("textured, wrapped, modulated, negative u clamps", 0);
 
@@ -296,6 +299,22 @@ int main(void)
     g_ntris = 1;
     g_tris[0] = (Tri){ { {5.3f, 7.1f}, {290.7f, 30.2f}, {120.4f, 230.9f} }, { {0} }, 0xFF8040C0u, 0 };
     run_scene("diagonal triangle", 0);
+
+    /* Texture cache: the same bytes are not uploaded again; changed bytes are. */
+    s_gpu.tex.valid = 1; s_gpu.tex.addr_u = s_gpu.tex.addr_v = 1;
+    g_ntris = 2; quad(0, 0, 0, 32, 32, 0, 0, 8, 8, 0xFFFFFFFFu, 1);
+    run_scene("texture cache: first use", 0);
+    {
+        SgTextureUse use;
+        CHECK(sg_texture_stage0(&use) == 1 && use.upload == NULL, "unchanged texture was decoded again");
+    }
+    tex[9] = 0xFF00FF00u;                            /* the title rewrote one texel in place */
+    {
+        SgTextureUse use;
+        CHECK(sg_texture_stage0(&use) == 1 && use.upload != NULL, "changed texture served stale from the cache");
+    }
+    run_scene("texture cache: rewritten texel", 0);
+    s_gpu.tex.valid = 0;
 
     s_gpu.blend = 1; s_gpu.blend_sf = 0x8003; s_gpu.blend_df = 0x0303;
     g_ntris = 2; quad(0, 0, 0, 10, 10, 0, 0, 0, 0, 0xFFFFFFFFu, 0);

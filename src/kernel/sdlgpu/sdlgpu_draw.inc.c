@@ -133,7 +133,7 @@ static int sg_draw_flat2d(void)
     static SgVertexList list;
     SDL_GPUGraphicsPipeline *pipe;
     SgSurface *s;
-    int tex_state = 0;                   /* sg_texture_decode(); 0 = untextured */
+    SgTextureUse tex = { 0 };            /* tex.tex == NULL: untextured batch */
     uint32_t vbytes, sbytes, tbytes, at;
     uint8_t *stage;
     SDL_GPUCommandBuffer *cmd;
@@ -148,11 +148,8 @@ static int sg_draw_flat2d(void)
     pipe = sg_pipeline_current();
     if (!pipe)
         return 0;                        /* blend state SDL cannot express */
-    if (s_gpu.tex.valid) {
-        tex_state = sg_texture_decode();
-        if (!tex_state)
-            return 0;                    /* unreadable texture: software decides */
-    }
+    if (s_gpu.tex.valid && !sg_texture_stage0(&tex))
+        return 0;                        /* unreadable texture: software decides */
 
     list.count = 0;
     batch_triangles(sg_collect, &list);
@@ -161,7 +158,7 @@ static int sg_draw_flat2d(void)
 
     vbytes = list.count * (uint32_t)sizeof(SgVertex);
     sbytes = s->owner == SG_OWNER_GUEST ? s->w * s->h * 4 : 0;
-    tbytes = tex_state == 1 ? s_sg_stage0.w * s_sg_stage0.h * 4 : 0;
+    tbytes = tex.upload ? tex.w * tex.h * 4 : 0;
     if (!sg_vertex_buffer_reserve(vbytes) || !sg_upload_reserve(vbytes + sbytes + tbytes))
         return 0;
 
@@ -175,7 +172,7 @@ static int sg_draw_flat2d(void)
         at += sbytes;
     }
     if (tbytes)
-        memcpy(stage + at, s_sg_stage0.rgba, tbytes);
+        memcpy(stage + at, tex.upload, tbytes);
     SDL_UnmapGPUTransferBuffer(s_sg.dev, s_sg.upload);
 
     cmd = SDL_AcquireGPUCommandBuffer(s_sg.dev);
@@ -191,10 +188,9 @@ static int sg_draw_flat2d(void)
         }
         if (tbytes) {
             SDL_GPUTextureTransferInfo src = { .transfer_buffer = s_sg.upload, .offset = vbytes + sbytes };
-            SDL_GPUTextureRegion dst = { .texture = s_sg_stage0.tex,
-                                         .w = s_sg_stage0.w, .h = s_sg_stage0.h, .d = 1 };
+            SDL_GPUTextureRegion dst = { .texture = tex.tex, .w = tex.w, .h = tex.h, .d = 1 };
             SDL_UploadToGPUTexture(copy, &src, &dst, false);
-            s_sg_stage0.uploaded = 1;
+            sg_texture_commit(&tex);
         }
         SDL_EndGPUCopyPass(copy);
     }
@@ -207,7 +203,7 @@ static int sg_draw_flat2d(void)
         SDL_Rect clip = { (int)s_gpu.clip_x, (int)s_gpu.clip_y, (int)s_gpu.clip_w, (int)s_gpu.clip_h };
         SDL_GPUBufferBinding vb = { .buffer = s_sg.vertices, .offset = 0 };
         SDL_GPUTextureSamplerBinding tb = {
-            .texture = tex_state ? s_sg_stage0.tex : s_sg.white, .sampler = s_sg.point,
+            .texture = tex.tex ? tex.tex : s_sg.white, .sampler = s_sg.point,
         };
         float surface_size[2] = { (float)s->w, (float)s->h };
         struct { uint32_t tex_size[2], tex_wrap[2], alpha_test, alpha_func, alpha_ref, pad; } shade = {
