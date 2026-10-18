@@ -1,6 +1,7 @@
 Linux-only regression including the actual CPU pushbuffer renderer. Synthetic
-mmap guest memory tests textured alpha blending and deferred dirty-row flush,
-protected/cross-page textures and surfaces, read-only output failure, and vertex
+mmap guest memory tests textured alpha blending drawn in place into ordinary
+read-write guest RAM, protected/cross-page textures and surfaces, read-only
+output staged with a failing write-back, and vertex
 inline/stride bounds. The production guest-copy helper handles page failures;
 no signal handler or fake rendering guard is installed. Unused runtime and SDL
 paths are discarded through function/data section garbage collection. No window,

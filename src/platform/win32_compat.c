@@ -33,6 +33,7 @@ size_t view_take(const void *addr);
 #include <sched.h>
 #include <fenv.h>
 #include <sys/mman.h>
+#include "guest_memory.h"
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #include <sys/stat.h>
@@ -1359,7 +1360,7 @@ static void *mach_map_fixed(void *address, size_t size, int prot)
 }
 #endif
 
-LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD protect)
+static LPVOID virtual_alloc_impl(LPVOID address, SIZE_T size, DWORD allocationType, DWORD protect)
 {
     int prot  = prot_from_page(protect);
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
@@ -1404,7 +1405,14 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
     return p;
 }
 
-BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
+LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD protect)
+{
+    LPVOID result = virtual_alloc_impl(address, size, allocationType, protect);
+    xbox_guest_memory_protection_changed();   /* after the change: see guest_memory.h */
+    return result;
+}
+
+static BOOL virtual_free_impl(LPVOID address, SIZE_T size, DWORD freeType)
 {
     if (freeType & MEM_RELEASE) {
         /* Win32 MEM_RELEASE passes size 0 and frees the whole allocation, so
@@ -1422,10 +1430,24 @@ BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
     return TRUE;
 }
 
-BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldProtect)
+BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
+{
+    BOOL result = virtual_free_impl(address, size, freeType);
+    xbox_guest_memory_protection_changed();   /* after the change: see guest_memory.h */
+    return result;
+}
+
+static BOOL virtual_protect_impl(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldProtect)
 {
     if (oldProtect) *oldProtect = PAGE_READWRITE;
     return mprotect(address, size, prot_from_page(newProtect)) == 0;
+}
+
+BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldProtect)
+{
+    BOOL result = virtual_protect_impl(address, size, newProtect, oldProtect);
+    xbox_guest_memory_protection_changed();   /* after the change: see guest_memory.h */
+    return result;
 }
 
 /* ===================================================================== */

@@ -34,8 +34,8 @@ int main(void)
     assert(sample_stage(1,0,0,&pixel) && pixel==0xFF00FF00u);
     assert(sample_texture(0,0,&pixel) && pixel==0x80FF0000u);
     raster_triangle(a,b,c,0xFFFFFFFFu,uv);
-    assert(fb[0]==0xFF0000FFu); /* Writes remain in host staging before flush. */
-    assert(s_surface_first[0]==0 && s_surface_end[0]>0);
+    /* Ordinary read-write guest RAM is drawn in place (no staging copy). */
+    assert(s_surface_direct && s_surface==guest+page);
     assert(surface_stage_flush(guest));surface_stage_reset();
     assert((fb[0]&0x00FFFFFFu)==0x0080007Fu);
     assert(fb[15]==0xFF0000FFu); /* Outside triangle remains unchanged. */
@@ -53,22 +53,23 @@ int main(void)
     palette[2]=0xFF0000FFu;palette[3]=0xFFFFFFFFu;
     assert(snapshot_textures());
     assert(sample_texture(1,0,&pixel) && pixel==palette[1]);
-    assert(mprotect(guest+page*4,page,PROT_NONE)==0);
+    assert(mprotect(guest+page*4,page,PROT_NONE)==0);xbox_guest_memory_protection_changed();
     assert(!snapshot_textures());
-    assert(mprotect(guest+page*4,page,PROT_READ|PROT_WRITE)==0);
+    assert(mprotect(guest+page*4,page,PROT_READ|PROT_WRITE)==0);xbox_guest_memory_protection_changed();
     s_gpu.tex.color=0x12;s_gpu.tex.width=s_gpu.tex.height=4;
     s_gpu.tex.palette=0;
-    assert(mprotect(guest+page*3,page,PROT_NONE)==0);
+    assert(mprotect(guest+page*3,page,PROT_NONE)==0);xbox_guest_memory_protection_changed();
     s_gpu.tex.offset=(uint32_t)(page*3);assert(!snapshot_textures());
     assert(!sample_texture(0,0,&pixel));
     s_gpu.tex.offset=(uint32_t)(page*3-8);assert(!snapshot_textures());
     s_gpu.color_offset=(uint32_t)(page*3);assert(!surface_stage_begin(guest));
     s_gpu.color_offset=(uint32_t)(page*3-32);assert(!surface_stage_begin(guest));
     s_gpu.color_offset=(uint32_t)page;
-    assert(mprotect(guest+page,page,PROT_READ)==0);
-    assert(surface_stage_begin(guest));put_pixel(guest,4,0,0,0xFFFFFFFFu);
+    /* Read-only output: not drawn in place; staged, and the write-back fails. */
+    assert(mprotect(guest+page,page,PROT_READ)==0);xbox_guest_memory_protection_changed();
+    assert(surface_stage_begin(guest) && !s_surface_direct);put_pixel(guest,4,0,0,0xFFFFFFFFu);
     assert(!surface_stage_flush(guest));surface_stage_reset();
-    assert(mprotect(guest+page,page,PROT_READ|PROT_WRITE)==0);
+    assert(mprotect(guest+page,page,PROT_READ|PROT_WRITE)==0);xbox_guest_memory_protection_changed();
     VertexAttr attr={0};attr.type=2;attr.size=4;attr.stride=16;
     s_gpu.inline_active=1;s_gpu.inline_count=1;
     assert(!fetch_attr(&attr,0,out));
@@ -80,7 +81,7 @@ int main(void)
     attr.offset=(uint32_t)(page*3);assert(!fetch_attr(&attr,0,out));
     attr.offset=(uint32_t)(page*2);memcpy(tex,values,sizeof values);
     assert(fetch_attr(&attr,0,out) && out[2]==3);
-    for (int i=0;i<4;i++) free(s_texture_snapshot[i].pixels);
+    for (int i=0;i<4;i++) if (s_texture_snapshot[i].owned) free(s_texture_snapshot[i].pixels);
     assert(munmap(guest,page*6)==0);
     return 0;
 }

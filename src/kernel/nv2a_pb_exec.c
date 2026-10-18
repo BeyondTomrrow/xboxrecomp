@@ -971,6 +971,8 @@ static Texture s_stage[4];
 #if defined(__linux__)
 typedef struct {
     uint8_t *pixels;
+    size_t bytes;            /* of pixels: the texture's footprint in guest RAM */
+    int owned;               /* pixels is a copy to free, not guest RAM itself */
     uint32_t palette[256];
     int ready;
 } TextureSnapshot;
@@ -982,7 +984,8 @@ static void snapshot_texture(int stage, const Texture *texture)
     TextureSnapshot *snapshot = &s_texture_snapshot[stage];
     uint64_t bytes, bpp, blocks;
     uint32_t format = linear_twin(texture->color);
-    free(snapshot->pixels); snapshot->pixels = NULL; snapshot->ready = 0;
+    if (snapshot->owned) free(snapshot->pixels);
+    snapshot->pixels = NULL; snapshot->owned = 0; snapshot->bytes = 0; snapshot->ready = 0;
     if (!texture->valid || !texture->width || !texture->height ||
         texture->width > 65535 || texture->height > 65535) return;
     blocks = d3d8_format_dxt_block_bytes(texture->color);
@@ -1008,13 +1011,24 @@ static void snapshot_texture(int stage, const Texture *texture)
         }
     }
     if (!bytes || bytes > SIZE_MAX || bytes > UINT64_C(0x100000000) - texture->offset) return;
+    uintptr_t base = (uintptr_t)xbox_GetMemoryOffset();
+    if (texture->color == 0x0B &&
+        (!texture->palette ||
+         !xbox_guest_memory_read(base,texture->palette,snapshot->palette,sizeof snapshot->palette)))
+        return;
+    snapshot->bytes = (size_t)bytes;
+    /* Mapped guest RAM is read in place, as on Windows; a copy per stage per
+     * batch was most of a menu frame's cost on Linux. */
+    if (xbox_guest_memory_direct(base, texture->offset, (size_t)bytes, false)) {
+        snapshot->pixels = (uint8_t *)base + texture->offset;
+        snapshot->ready = 1;
+        return;
+    }
     snapshot->pixels = malloc((size_t)bytes);
     if (!snapshot->pixels) return;
-    uintptr_t base = (uintptr_t)xbox_GetMemoryOffset();
-    if (!xbox_guest_memory_read(base,texture->offset,snapshot->pixels,(size_t)bytes) ||
-        (texture->color == 0x0B && (!texture->palette ||
-         !xbox_guest_memory_read(base,texture->palette,snapshot->palette,sizeof snapshot->palette)))) {
-        free(snapshot->pixels); snapshot->pixels = NULL; return;
+    snapshot->owned = 1;
+    if (!xbox_guest_memory_read(base,texture->offset,snapshot->pixels,(size_t)bytes)) {
+        free(snapshot->pixels); snapshot->pixels = NULL; snapshot->owned = 0; return;
     }
     snapshot->ready = 1;
 }
@@ -1248,12 +1262,19 @@ static void dump_texture_bmp(uint32_t seq)
 #if defined(__linux__)
 static uint32_t *s_surface_first, *s_surface_end;
 static uint32_t s_surface_base, s_surface_rows, s_surface_pitch, s_surface_bpp;
+/* Linux: the staged surface is guest RAM itself (readable and writable,
+ * checked once per batch with xbox_guest_memory_direct) rather than a
+ * checked copy. */
+static int s_surface_direct;
 #endif
 
 static void surface_stage_reset(void)
 {
 #if defined(__linux__)
-    free(s_surface); free(s_surface_first); free(s_surface_end);
+    if (!s_surface_direct)
+        free(s_surface);
+    s_surface_direct = 0;
+    free(s_surface_first); free(s_surface_end);
     s_surface_first=s_surface_end=NULL;
     s_surface_rows=0;
 #endif
@@ -1276,6 +1297,17 @@ static int surface_stage_begin(const uint8_t *mem)
         surface_hits_image(base,(uint32_t)bytes)) return 0;
     if (s_surface) return base==s_surface_base && bottom==s_surface_rows &&
         s_gpu.pitch==s_surface_pitch && bpp==s_surface_bpp;
+    /* The common case: the target is ordinary mapped guest RAM. Draw into it
+     * in place, as on Windows. Staging below copies the whole target in and
+     * the dirty rows back through one syscall per row, on every batch -- the
+     * main cost of a menu frame on Linux before this. */
+    if (xbox_guest_memory_direct((uintptr_t)mem, base, (size_t)bytes, true)) {
+        s_surface=(uint8_t *)mem+base;
+        s_surface_direct=1;
+        s_surface_base=base; s_surface_rows=(uint32_t)bottom;
+        s_surface_pitch=s_gpu.pitch; s_surface_bpp=bpp;
+        return 1;
+    }
     s_surface=(uint8_t *)calloc(1,(size_t)bytes);
     s_surface_first=(uint32_t *)malloc((size_t)bottom*sizeof(uint32_t));
     s_surface_end=(uint32_t *)calloc((size_t)bottom,sizeof(uint32_t));
@@ -1300,7 +1332,7 @@ static int surface_stage_begin(const uint8_t *mem)
 static void surface_stage_dirty(uint32_t y, uint32_t first, uint32_t end)
 {
 #if defined(__linux__)
-    if (!s_surface || y>=s_surface_rows || first>=end) return;
+    if (!s_surface || s_surface_direct || y>=s_surface_rows || first>=end) return;
     if (first<s_surface_first[y]) s_surface_first[y]=first;
     if (end>s_surface_end[y]) s_surface_end[y]=end;
 #else
@@ -1312,7 +1344,7 @@ static int surface_stage_flush(const uint8_t *mem)
 {
 #if defined(__linux__)
     uint32_t y;
-    if (!s_surface) return 1;
+    if (!s_surface || s_surface_direct) return 1;   /* drawn in place */
     for (y=0;y<s_surface_rows;y++) if (s_surface_first[y]!=UINT32_MAX) {
         size_t at=(size_t)y*s_surface_pitch+(size_t)s_surface_first[y]*s_surface_bpp;
         size_t bytes=(size_t)(s_surface_end[y]-s_surface_first[y])*s_surface_bpp;
