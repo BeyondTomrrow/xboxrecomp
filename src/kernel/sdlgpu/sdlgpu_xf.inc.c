@@ -55,6 +55,36 @@ static void sg_collect_xf(void *ctx, const XfVert *a, const XfVert *b, const XfV
     for (k = 0; k < 3; k++)
         if (!(t[k]->w > 1e-3f) || !isfinite(t[k]->w))
             affine = 1;
+    /* RECOMP_SDLGPU_UVTRACE=1: describe large triangles (the field, the
+* stands) once per texture -- what the vertex program hands over, to
+* find why big ground surfaces come out untextured in both renderers. */
+    {
+        static int trace = -1;
+        static uint32_t seen[64];
+        static int nseen;
+        float area = (b->x - a->x) * (c->y - a->y) - (b->y - a->y) * (c->x - a->x);
+        if (trace < 0)
+            trace = getenv("RECOMP_SDLGPU_UVTRACE") != NULL;
+        if (trace && fabsf(area) > 0.05f * 640.0f * 480.0f && nseen < 64) {
+            uint32_t off = s_gpu.tex.valid ? s_gpu.tex.offset : 0;
+            int j, known = 0;
+            for (j = 0; j < nseen; j++)
+                known |= seen[j] == off;
+            if (!known) {
+                seen[nseen++] = off;
+                fprintf(stderr, "  [UVTRACE] tex %08X %ux%u fmt %02X wrap %u/%u valid %d en %d"
+                                " comb %d prog %08X area %.0f\n",
+                        off, s_gpu.tex.width, s_gpu.tex.height, s_gpu.tex.color,
+                        s_gpu.tex.addr_u, s_gpu.tex.addr_v, s_gpu.tex.valid, s_gpu.tex.enabled,
+                        comb_active(), s_comb.stage_prog, area);
+                for (j = 0; j < 3; j++)
+                    fprintf(stderr, "  [UVTRACE]   v%d xy %.1f %.1f z %.0f w %.4f uv %.2f %.2f"
+                                    " col %.2f %.2f %.2f %.2f\n",
+                            j, t[j]->x, t[j]->y, t[j]->z, t[j]->w, t[j]->uv[0], t[j]->uv[1],
+                            t[j]->col[0], t[j]->col[1], t[j]->col[2], t[j]->col[3]);
+            }
+        }
+    }
 
     if (list->count + 3 > list->cap) {
         uint32_t cap = list->cap ? list->cap * 2 : 192;
