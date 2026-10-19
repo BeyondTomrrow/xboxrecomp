@@ -36,6 +36,13 @@ typedef struct {
 
 #define SG_MAX_PIPELINES 32
 
+/* One vertex of a flat 2D triangle (shaders/flat2d.vert). */
+typedef struct {
+    float x, y;          /* surface pixels */
+    float color[4];      /* the triangle's flat colour, RGBA 0..1 */
+    float uv[3];         /* texels; uv[2] = 1 when the triangle is textured */
+} SgVertex;
+
 /* One vertex of a 3D triangle (shaders/xf.vert): an XfVert that already went
  * through the vertex program on the CPU. */
 typedef struct {

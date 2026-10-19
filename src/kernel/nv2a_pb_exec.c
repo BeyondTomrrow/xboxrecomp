@@ -2856,6 +2856,13 @@ static void raster_triangle_xf(const XfVert *a, const XfVert *b, const XfVert *c
     static int no_cull = -1;
     if (no_cull < 0)
         no_cull = getenv("RECOMP_CULL") == NULL;
+
+    /* RECOMP_COMB_TRACE is read once per process, not once per pixel:
+     * getenv() walks the whole environment, and it sat inside the pixel
+     * loop below. */
+    static int comb_trace = -1;
+    if (comb_trace < 0)
+        comb_trace = getenv("RECOMP_COMB_TRACE") != NULL;
     if (s_vp.cull && !no_cull) {
         /* Winding as the NV2A sees it: its window space has y growing
          * upward, so in these y-down screen coordinates a positive area is
