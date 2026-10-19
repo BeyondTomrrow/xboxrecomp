@@ -2979,7 +2979,7 @@ static void raster_triangle_xf(const XfVert *a, const XfVert *b, const XfVert *c
                 }
                 else if (sampled)
                     argb = modulate(texel, argb);
-                if (getenv("RECOMP_COMB_TRACE")) {
+                if (comb_trace) {
                     static unsigned shown_fmt[256];
                     unsigned shown = shown_fmt[s_gpu.tex.color & 0xFF];
                     if (shown < 3 && x == minx + (maxx - minx) / 2 && y == miny + (maxy - miny) / 2) {

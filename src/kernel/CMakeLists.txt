@@ -56,7 +56,7 @@ else()
         set(_sg_src ${CMAKE_CURRENT_SOURCE_DIR}/sdlgpu/shaders)
         set(_sg_out ${CMAKE_CURRENT_BINARY_DIR}/sdlgpu_shaders)
         set(_sg_headers)
-        foreach(_sg_shader flat2d.vert flat2d.frag)
+        foreach(_sg_shader flat2d.vert flat2d.frag xf.vert xf.frag)
             string(REPLACE "." "_" _sg_name ${_sg_shader})
             add_custom_command(
                 OUTPUT ${_sg_out}/${_sg_name}.h
