@@ -254,15 +254,15 @@ static int sg_draw_flat2d(void)
     if (s_gpu.idx_count < 3 || !batch_is_screen_space())
         return 0;                        /* raster_batch keeps its counters */
     if (!sg_draw_init())
-        return 0;
+        return sg_fallback(SG_FB_SHADERS, 0);
     s = sg_surface_current();
     if (!s)
-        return 0;                        /* 16-bit target */
+        return sg_fallback(SG_FB_TARGET, 0);
     pipe = sg_pipeline_current(0);
     if (!pipe)
-        return 0;                        /* blend state SDL cannot express */
+        return sg_fallback(SG_FB_BLEND, 0);
     if (s_gpu.tex.valid && !sg_texture_stage0(&tex))
-        return 0;                        /* unreadable texture: software decides */
+        return sg_fallback(SG_FB_TEXTURE, 0);                    /* unreadable texture: software decides */
 
     list.count = 0;
     batch_triangles(sg_collect, &list);
@@ -284,6 +284,9 @@ static int sg_draw_flat2d(void)
             .vs_uniform = surface_size, .vs_uniform_size = sizeof surface_size,
             .fs_uniform = &shade, .fs_uniform_size = sizeof shade,
         };
-        return sg_submit(&d);
+        if (!sg_submit(&d))
+            return sg_fallback(SG_FB_RESOURCES, 0);
+        s_sg_stats.gpu2d++;
+        return 1;
     }
 }

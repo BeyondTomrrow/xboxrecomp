@@ -227,5 +227,11 @@ static int sg_clear_surface(uint32_t param)
     SDL_SubmitGPUCommandBuffer(cmd);
     if (channels)
         s->owner = SG_OWNER_GPU;         /* the GPU copy is now the newer one */
+    /* Clear the software depth/stencil buffers as well. A 3D batch that
+     * falls back to software tests against s_zbuf; left uncleared it held
+     * depth from long ago and most fallback pixels failed the test and
+     * vanished. (Fallbacks still cannot see depth the GPU drew.) */
+    if (clear_depth || clear_stencil)
+        zbuf_clear_bits(param & 3u);
     return 1;
 }

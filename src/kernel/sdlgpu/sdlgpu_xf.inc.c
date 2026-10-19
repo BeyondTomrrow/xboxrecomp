@@ -122,27 +122,27 @@ static int sg_draw_xf(void)
     if (s_gpu.idx_count < 3)
         return 0;
     if (!sg_draw_init())
-        return 0;
+        return sg_fallback(SG_FB_SHADERS, 1);
     s = sg_surface_current();
     if (!s)
-        return 0;                        /* 16-bit target */
+        return sg_fallback(SG_FB_TARGET, 1);
     pipe = sg_pipeline_current(1);
     if (!pipe)
-        return 0;                        /* blend state SDL cannot express */
+        return sg_fallback(SG_FB_BLEND, 1);                       /* blend state SDL cannot express */
 
     /* Stage 0 is sampled whenever enabled; stages 1..3 only feed the
      * combiners, and only when their stage program is set (as in
      * raster_triangle_xf). */
     if (s_gpu.tex.valid && s_gpu.tex.enabled) {
         if (!sg_texture_for_stage(0, &tex[0]))
-            return 0;
+            return sg_fallback(SG_FB_TEXTURE, 1);
         sampled |= 1u;
     }
     if (comb_active())
         for (st = 1; st < 4; st++)
             if (((s_comb.stage_prog >> (st * 5)) & 0x1Fu) && s_stage[st].valid && s_stage[st].enabled) {
                 if (!sg_texture_for_stage(st, &tex[st]))
-                    return 0;
+                    return sg_fallback(SG_FB_TEXTURE, 1);
                 sampled |= 1u << st;
             }
 
@@ -163,6 +163,9 @@ static int sg_draw_xf(void)
             .fs_uniform = &shade, .fs_uniform_size = sizeof shade,
         };
         sg_xf_shade_fill(&shade, sampled);
-        return sg_submit(&d);
+        if (!sg_submit(&d))
+            return sg_fallback(SG_FB_RESOURCES, 1);
+        s_sg_stats.gpu3d++;
+        return 1;
     }
 }

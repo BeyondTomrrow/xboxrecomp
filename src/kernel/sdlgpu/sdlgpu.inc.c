@@ -103,6 +103,58 @@ static struct {
     SDL_GPUTexture        *white;        /* bound when a batch has no texture */
 } s_sg;
 
+/* ── Statistics: how many batches the GPU took, and why the rest fell back.
+ * Printed every 5 s while the renderer is on; the first thing to read when
+ * a scene is slow (each fallback costs a GPU->RAM download) or drawn wrong. */
+typedef enum {
+    SG_FB_TARGET,        /* 16-bit or otherwise unsupported render target */
+    SG_FB_BLEND,         /* blend state SDL cannot express (CONSTANT_ALPHA) */
+    SG_FB_TEXTURE,       /* a texture stage the decoder could not read */
+    SG_FB_RESOURCES,     /* GPU object creation or transfer failed */
+    SG_FB_SHADERS,       /* shaders missing or failed to load */
+    SG_FB_DISABLED,      /* turned off for testing (RECOMP_SDLGPU_NO3D) */
+    SG_FB_COUNT
+} SgFallback;
+
+static const char *const k_sg_fallback_names[SG_FB_COUNT] = {
+    "target", "blend", "texture", "resources", "shaders", "disabled",
+};
+
+static struct {
+    uint32_t gpu2d, gpu3d;          /* batches drawn on the GPU */
+    uint32_t sw2d, sw3d;            /* batches left to software */
+    uint32_t why[SG_FB_COUNT];
+    uint64_t since_ms;
+} s_sg_stats;
+
+/* Record why a batch stays in software. Returns 0 so callers can
+ * `return sg_fallback(...)`. */
+static int sg_fallback(SgFallback why, int xf)
+{
+    s_sg_stats.why[why]++;
+    if (xf) s_sg_stats.sw3d++; else s_sg_stats.sw2d++;
+    return 0;
+}
+
+static void sg_stats_tick(void)
+{
+    uint64_t now = SDL_GetTicks();
+    int i;
+
+    if (!s_sg_stats.since_ms)
+        s_sg_stats.since_ms = now;
+    if (now - s_sg_stats.since_ms < 5000)
+        return;
+    fprintf(stderr, "  [SDLGPU] 5s: 2D gpu %u sw %u | 3D gpu %u sw %u | fallbacks:",
+            s_sg_stats.gpu2d, s_sg_stats.sw2d, s_sg_stats.gpu3d, s_sg_stats.sw3d);
+    for (i = 0; i < SG_FB_COUNT; i++)
+        if (s_sg_stats.why[i])
+            fprintf(stderr, " %s %u", k_sg_fallback_names[i], s_sg_stats.why[i]);
+    fprintf(stderr, "\n");
+    memset(&s_sg_stats, 0, sizeof s_sg_stats);
+    s_sg_stats.since_ms = now;
+}
+
 static int sg_wanted(void)
 {
     static int wanted = -1;
@@ -158,9 +210,16 @@ static void sg_cpu_access(void)
 
 static int sg_draw_batch(int flat2d)
 {
-    if (!flat2d)
+    if (!flat2d) {
+        /* RECOMP_SDLGPU_NO3D=1 keeps 3D batches in software: tells apart
+         * a 3D-path bug from a 2D or clear one. */
+        static int no3d = -1;
+        if (no3d < 0)
+            no3d = getenv("RECOMP_SDLGPU_NO3D") != NULL;
+        if (no3d)
+            return sg_fallback(SG_FB_DISABLED, 1);
         return sg_ready() && sg_draw_xf();
-    return sg_ready() && sg_draw_flat2d();
+    }
 }
 
 static int sg_clear(uint32_t param)
@@ -172,6 +231,8 @@ static void sg_flip(void)
 {
     /* The presenter shows guest RAM (snapshot at flip), so the frame must be
      * there before nv2a_pb_exec takes that snapshot. */
-    if (s_sg.dev)
+    if (s_sg.dev) {
         sg_download_all();
+        sg_stats_tick();
+    }
 }
