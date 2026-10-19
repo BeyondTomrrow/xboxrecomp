@@ -36,13 +36,14 @@ typedef struct {
 
 #define SG_MAX_PIPELINES 32
 
-/* One vertex of a flat 2D triangle (shaders/flat2d.vert). */
+/* One vertex of a 3D triangle (shaders/xf.vert): an XfVert that already went
+ * through the vertex program on the CPU. */
 typedef struct {
-    float x, y;          /* surface pixels */
-    float color[4];      /* the triangle's flat colour, RGBA 0..1 */
-    float uv[3];         /* texels; uv[2] = 1 when the triangle is textured */
-} SgVertex;
-
+    float pos[4];        /* screen x, y (pixels), z (Z24 depth units), w */
+    float col[4];        /* oD0, RGBA 0..1 */
+    float spec[4];       /* oD1, RGBA 0..1 */
+    float uv[4][2];      /* oT0..oT3, in texels of their stage */
+} SgXfVertex;
 typedef struct {
     uint32_t                 key;      /* sg_pipeline_key() of the state it encodes */
     SDL_GPUGraphicsPipeline *pipe;
@@ -63,6 +64,7 @@ static struct {
     /* Flat 2D drawing (sdlgpu_draw.inc.c). */
     int                    draw_ready;   /* shaders loaded: draws can be taken */
     SDL_GPUShader         *flat2d_vs, *flat2d_fs;
+    SDL_GPUShader         *xf_vs, *xf_fs;
     SgPipeline             pipes[SG_MAX_PIPELINES];
     int                    pipe_count;
     SDL_GPUBuffer         *vertices;
@@ -107,6 +109,7 @@ static int sg_ready(void)
 #include "sdlgpu_texture.inc.c"
 #include "sdlgpu_pipeline.inc.c"
 #include "sdlgpu_draw.inc.c"
+#include "sdlgpu_xf.inc.c"
 
 /* ── The five entry points (docs/sdl-gpu-renderer.md, "The contract") ── */
 
@@ -119,7 +122,7 @@ static void sg_cpu_access(void)
 static int sg_draw_batch(int flat2d)
 {
     if (!flat2d)
-        return 0;   /* vertex-program (3D) batches: milestone 2 */
+        return sg_ready() && sg_draw_xf();
     return sg_ready() && sg_draw_flat2d();
 }
 

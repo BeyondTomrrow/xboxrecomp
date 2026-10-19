@@ -3024,7 +3024,12 @@ static void xf_lerp(XfVert *o, const XfVert *p, const XfVert *q, float t)
  * NFL 2K5's stadium). Undo the divide (x*w is the clip-space coordinate, the
  * same reconstruction xemu does), clip the polygon against w >= eps, divide
  * again and fan out the pieces. */
-static void raster_tri_clip(const XfVert *a, const XfVert *b, const XfVert *c)
+/* Receives each finished 3D triangle: the software rasterizer
+ * (raster_triangle_xf) or a GPU renderer. */
+typedef void (*XfTriFn)(void *ctx, const XfVert *a, const XfVert *b, const XfVert *c);
+
+static void raster_tri_clip(const XfVert *a, const XfVert *b, const XfVert *c,
+                            XfTriFn emit, void *ctx)
 {
     const float eps = 1e-3f;
     XfVert in[3], out[6];
@@ -3035,7 +3040,7 @@ static void raster_tri_clip(const XfVert *a, const XfVert *b, const XfVert *c)
      * matchup pie charts) leave w at 0 or below with valid x/y, and clipping
      * those on w turned them into screen-filling spikes. */
     if (a->ok && b->ok && c->ok) {
-        raster_triangle_xf(a, b, c);
+        emit(ctx, a, b, c);
         return;
     }
     /* Opt-in until checked against xemu: on NFL 2K5's coach-matchup pie
@@ -3104,7 +3109,58 @@ static void raster_tri_clip(const XfVert *a, const XfVert *b, const XfVert *c)
         v->ok = (v->x == v->x) && (v->y == v->y);
     }
     for (i = 1; i + 1 < m; i++)
-        raster_triangle_xf(&out[0], &out[i], &out[i + 1]);
+        emit(ctx, &out[0], &out[i], &out[i + 1]);
+}
+
+/* The triangles of the current vertex-program batch, after the vertex
+ * program and near-plane clipping, in draw order. Shared by the software
+ * rasterizer and the GPU renderers, so both draw exactly the same
+ * triangles (as batch_triangles does for 2D). */
+static void batch_triangles_xf(XfTriFn emit, void *ctx)
+{
+    uint32_t i, n = s_gpu.idx_count;
+    const uint16_t *ix = s_gpu.idx;
+
+    vp_begin_batch();
+#define XV(k) vp_vertex(ix[k])
+    switch (s_gpu.prim) {
+        case NV_PRIM_TRIANGLES:
+            for (i = 0; i + 2 < n; i += 3)
+                raster_tri_clip(XV(i), XV(i + 1), XV(i + 2), emit, ctx);
+            break;
+        case NV_PRIM_TRIANGLE_STRIP:
+            for (i = 0; i + 2 < n; i++) {
+                if (i & 1) raster_tri_clip(XV(i + 1), XV(i), XV(i + 2), emit, ctx);
+                else       raster_tri_clip(XV(i), XV(i + 1), XV(i + 2), emit, ctx);
+            }
+            break;
+        case NV_PRIM_TRIANGLE_FAN:
+        case NV_PRIM_POLYGON:
+            for (i = 1; i + 1 < n; i++)
+                raster_tri_clip(XV(0), XV(i), XV(i + 1), emit, ctx);
+            break;
+        case NV_PRIM_QUADS:
+            for (i = 0; i + 3 < n; i += 4) {
+                raster_tri_clip(XV(i), XV(i + 1), XV(i + 2), emit, ctx);
+                raster_tri_clip(XV(i), XV(i + 2), XV(i + 3), emit, ctx);
+            }
+            break;
+        case NV_PRIM_QUAD_STRIP:
+            for (i = 0; i + 3 < n; i += 2) {
+                raster_tri_clip(XV(i), XV(i + 1), XV(i + 3), emit, ctx);
+                raster_tri_clip(XV(i), XV(i + 3), XV(i + 2), emit, ctx);
+            }
+            break;
+        default:
+            break;                             /* points and lines: not yet */
+    }
+#undef XV
+}
+
+static void raster_xf_cb(void *ctx, const XfVert *a, const XfVert *b, const XfVert *c)
+{
+    (void)ctx;
+    raster_triangle_xf(a, b, c);
 }
 
 /* Batches drawn through a vertex program (3D) since the last present: a
@@ -3115,53 +3171,18 @@ static int s_elements_seen;                 /* this BEGIN has had ARRAY_ELEMENT 
 #include "nv2a_gpu_d3d11.inc.c"
 
 /* Draw the current batch through the vertex program. */
+
 static void raster_batch_xf(void)
 {
-    uint32_t i, n = s_gpu.idx_count;
-    const uint16_t *ix = s_gpu.idx;
-
     if (gpu_enabled()) {
         if (gpu_draw_batch(0))
             return;
         gpu_cpu_access();
     }
-    vp_begin_batch();
     s_vp.batches++;
     if (s_gpu.tex.valid)
         note_texture_use();
-#define XV(k) vp_vertex(ix[k])
-    switch (s_gpu.prim) {
-    case NV_PRIM_TRIANGLES:
-        for (i = 0; i + 2 < n; i += 3)
-            raster_tri_clip(XV(i), XV(i + 1), XV(i + 2));
-        break;
-    case NV_PRIM_TRIANGLE_STRIP:
-        for (i = 0; i + 2 < n; i++) {
-            if (i & 1) raster_tri_clip(XV(i + 1), XV(i), XV(i + 2));
-            else       raster_tri_clip(XV(i), XV(i + 1), XV(i + 2));
-        }
-        break;
-    case NV_PRIM_TRIANGLE_FAN:
-    case NV_PRIM_POLYGON:
-        for (i = 1; i + 1 < n; i++)
-            raster_tri_clip(XV(0), XV(i), XV(i + 1));
-        break;
-    case NV_PRIM_QUADS:
-        for (i = 0; i + 3 < n; i += 4) {
-            raster_tri_clip(XV(i), XV(i + 1), XV(i + 2));
-            raster_tri_clip(XV(i), XV(i + 2), XV(i + 3));
-        }
-        break;
-    case NV_PRIM_QUAD_STRIP:
-        for (i = 0; i + 3 < n; i += 2) {
-            raster_tri_clip(XV(i), XV(i + 1), XV(i + 3));
-            raster_tri_clip(XV(i), XV(i + 3), XV(i + 2));
-        }
-        break;
-    default:
-        break;
-    }
-#undef XV
+    batch_triangles_xf(raster_xf_cb, NULL);
 }
 
 /* Count constant arrays once per batch, never from the per-vertex fetch path.
