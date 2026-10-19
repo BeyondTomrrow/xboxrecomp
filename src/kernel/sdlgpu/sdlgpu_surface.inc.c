@@ -82,6 +82,8 @@ static SgSurface *sg_surface_current(void) {
             sg_queue_flush(); /* its queued draws land first */
         if (s->owner == SG_OWNER_GPU)
             sg_download(s);
+        sg_surface_release(s);
+        }
         if (!sg_surface_create(s, w, h))
             return NULL;
         s->guest = va;
