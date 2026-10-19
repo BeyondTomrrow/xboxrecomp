@@ -174,7 +174,8 @@ static int sg_submit(const SgDraw *d)
         SDL_GPUColorTargetInfo target = {
             .texture = s->color, .load_op = SDL_GPU_LOADOP_LOAD, .store_op = SDL_GPU_STOREOP_STORE,
         };
-        SDL_GPURenderPass *pass = SDL_BeginGPURenderPass(cmd, &target, 1, NULL);
+        SDL_GPUDepthStencilTargetInfo depth = sg_depth_target(s, 0, 0);
+        SDL_GPURenderPass *pass = SDL_BeginGPURenderPass(cmd, &target, 1, &depth);
         SDL_GPUViewport view = { 0, 0, (float)s->w, (float)s->h, 0.0f, 1.0f };
         SDL_Rect clip = { (int)s_gpu.clip_x, (int)s_gpu.clip_y, (int)s_gpu.clip_w, (int)s_gpu.clip_h };
         SDL_GPUBufferBinding vb = { .buffer = s_sg.vertices, .offset = 0 };
@@ -192,6 +193,7 @@ static int sg_submit(const SgDraw *d)
         SDL_SetGPUViewport(pass, &view);
         SDL_SetGPUScissor(pass, &clip);
         SDL_SetGPUBlendConstants(pass, constant);
+        SDL_SetGPUStencilReference(pass, (Uint8)(s_vp.stencil_ref & 0xFF));
         SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
         SDL_BindGPUFragmentSamplers(pass, 0, tb, (Uint32)d->tex_count);
         SDL_PushGPUVertexUniformData(cmd, 0, d->vs_uniform, d->vs_uniform_size);

@@ -1,11 +1,13 @@
 /* ── SDL3 GPU renderer: render targets ──────────────────────────────────
  *
  * A render target lives in guest RAM and, once the renderer uses it, in a
- * GPU texture. SgSurface.owner says which copy is current
- * (docs/sdl-gpu-renderer.md, "Ownership of a surface").
+ * GPU texture. SgSurface.owner says which colour copy is current
+ * (docs/sdl-gpu-renderer.md, "Ownership of a surface"). Each surface also
+ * has a GPU-only depth-stencil texture of the same size (see SgSurface).
  *
- * Milestone 0 handles 32-bit colour targets only (A8R8G8B8 / X8R8G8B8,
- * which are B,G,R,A bytes in guest RAM: SDL's B8G8R8A8_UNORM).
+ * Colour targets: 32-bit only (A8R8G8B8 / X8R8G8B8, which are B,G,R,A
+ * bytes in guest RAM: SDL's B8G8R8A8_UNORM). 16-bit targets stay in
+ * software.
  */
 
 static void sg_download(SgSurface *s);
@@ -19,7 +21,34 @@ static void sg_surface_release(SgSurface *s)
 {
     if (s->color)
         SDL_ReleaseGPUTexture(s_sg.dev, s->color);
+    if (s->depth)
+        SDL_ReleaseGPUTexture(s_sg.dev, s->depth);
     memset(s, 0, sizeof *s);
+}
+
+/* Colour and depth-stencil textures for a new w x h surface. */
+static int sg_surface_create(SgSurface *s, uint32_t w, uint32_t h)
+{
+    SDL_GPUTextureCreateInfo color = {
+        .type = SDL_GPU_TEXTURETYPE_2D,
+        .format = SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM,
+        .usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER,
+        .width = w, .height = h, .layer_count_or_depth = 1, .num_levels = 1,
+    };
+    SDL_GPUTextureCreateInfo depth = {
+        .type = SDL_GPU_TEXTURETYPE_2D,
+        .format = s_sg.depth_format,
+        .usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET,
+        .width = w, .height = h, .layer_count_or_depth = 1, .num_levels = 1,
+    };
+    s->color = SDL_CreateGPUTexture(s_sg.dev, &color);
+    s->depth = s->color ? SDL_CreateGPUTexture(s_sg.dev, &depth) : NULL;
+    if (!s->color || !s->depth) {
+        fprintf(stderr, "  [SDLGPU] cannot create a %ux%u target: %s\n", w, h, SDL_GetError());
+        sg_surface_release(s);
+        return 0;
+    }
+    return 1;
 }
 
 /* The surface the executor is drawing into, created on first use.
@@ -34,7 +63,7 @@ static SgSurface *sg_surface_current(void)
     int i;
 
     if (surface_bpp() != 4 || !w || !h || s_gpu.pitch < w * 4)
-        return NULL;   /* 16-bit targets: later milestone */
+        return NULL;   /* 16-bit targets stay in software */
 
     s_sg.tick++;
     for (i = 0; i < SG_MAX_SURFACES; i++) {
@@ -56,26 +85,14 @@ static SgSurface *sg_surface_current(void)
             sg_download(s);
         sg_surface_release(s);
     }
-
-    {
-        SDL_GPUTextureCreateInfo info = {
-            .type = SDL_GPU_TEXTURETYPE_2D,
-            .format = SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM,
-            .usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER,
-            .width = w, .height = h,
-            .layer_count_or_depth = 1, .num_levels = 1,
-        };
-        s->color = SDL_CreateGPUTexture(s_sg.dev, &info);
-    }
-    if (!s->color) {
-        fprintf(stderr, "  [SDLGPU] cannot create a %ux%u target: %s\n", w, h, SDL_GetError());
+    if (!sg_surface_create(s, w, h))
         return NULL;
-    }
     s->guest = va;
     s->pitch = s_gpu.pitch;
     s->w = w;
     s->h = h;
     s->owner = SG_OWNER_GUEST;
+    s->depth_ready = 0;
     s->last_use = s_sg.tick;
     return s;
 }
@@ -143,34 +160,72 @@ static void sg_download_all(void)
             sg_download(&s_sg.surf[i]);
 }
 
-/* NV097_CLEAR_SURFACE on the GPU. Milestone 0 takes the common case: all
- * four colour channels over the whole surface, no depth or stencil. */
-static int sg_clear_color(uint32_t param)
+/* The depth-stencil target of a render pass. Unless this pass clears them,
+ * depth and stencil are kept -- or, on a surface's first use, started at 0
+ * (as the software buffers are). */
+static SDL_GPUDepthStencilTargetInfo sg_depth_target(SgSurface *s, int clear_depth, int clear_stencil)
+{
+    SDL_GPUDepthStencilTargetInfo t = {
+        .texture = s->depth,
+        .clear_depth = 0.0f,
+        .clear_stencil = 0,
+        .load_op = s->depth_ready ? SDL_GPU_LOADOP_LOAD : SDL_GPU_LOADOP_CLEAR,
+        .store_op = SDL_GPU_STOREOP_STORE,
+        .stencil_load_op = s->depth_ready ? SDL_GPU_LOADOP_LOAD : SDL_GPU_LOADOP_CLEAR,
+        .stencil_store_op = SDL_GPU_STOREOP_STORE,
+    };
+    if (clear_depth) {
+        t.load_op = SDL_GPU_LOADOP_CLEAR;
+        t.clear_depth = (float)(s_vp.zclear >> 8) / SG_DEPTH_MAX;   /* as zbuf_clear_bits */
+    }
+    if (clear_stencil) {
+        t.stencil_load_op = SDL_GPU_LOADOP_CLEAR;
+        t.clear_stencil = (Uint8)(s_vp.zclear & 0xFF);
+    }
+    s->depth_ready = 1;
+    return t;
+}
+
+/* NV097_CLEAR_SURFACE on the GPU: colour (all four channels or none), depth
+ * and stencil, over the whole surface. A channel subset or a partial
+ * rectangle needs a quad: software for now. */
+static int sg_clear_surface(uint32_t param)
 {
     uint32_t x0 = g_clear_rx & 0xFFF, x1 = ((g_clear_rx >> 16) & 0xFFF) + 1;
     uint32_t y0 = g_clear_ry & 0xFFF, y1 = ((g_clear_ry >> 16) & 0xFFF) + 1;
-    SDL_GPUColorTargetInfo target = { 0 };
+    uint32_t channels = param & 0xF0u;
+    int clear_depth = (param & 1u) != 0, clear_stencil = (param & 2u) != 0;
+    SDL_GPUColorTargetInfo color = { 0 };
+    SDL_GPUDepthStencilTargetInfo depth;
     SDL_GPUCommandBuffer *cmd;
     SgSurface *s;
     float c[4];
 
-    if ((param & 0xF0u) != 0xF0u || (param & 3u))
-        return 0;   /* channel subset or depth/stencil: software for now */
+    if (channels != 0xF0u && channels != 0)
+        return 0;                        /* a channel subset */
+    if (!channels && !clear_depth && !clear_stencil)
+        return 0;                        /* nothing to clear: let software see it */
     s = sg_surface_current();
     if (!s)
         return 0;
     if (x0 != 0 || y0 != 0 || x1 < s->w || y1 < s->h)
-        return 0;   /* partial rectangle: needs a quad, milestone 1 */
+        return 0;                        /* partial rectangle */
 
-    comb_unpack(s_gpu.clear_color, c);   /* clear colour as R,G,B,A floats */
-    target.texture = s->color;
-    target.clear_color = (SDL_FColor){ c[0], c[1], c[2], c[3] };
-    target.load_op = SDL_GPU_LOADOP_CLEAR;
-    target.store_op = SDL_GPU_STOREOP_STORE;
+    color.texture = s->color;
+    color.store_op = SDL_GPU_STOREOP_STORE;
+    if (channels) {
+        comb_unpack(s_gpu.clear_color, c);   /* clear colour as R,G,B,A floats */
+        color.clear_color = (SDL_FColor){ c[0], c[1], c[2], c[3] };
+        color.load_op = SDL_GPU_LOADOP_CLEAR;
+    } else {
+        color.load_op = SDL_GPU_LOADOP_LOAD; /* depth/stencil only: colour untouched */
+    }
+    depth = sg_depth_target(s, clear_depth, clear_stencil);
 
     cmd = SDL_AcquireGPUCommandBuffer(s_sg.dev);
-    SDL_EndGPURenderPass(SDL_BeginGPURenderPass(cmd, &target, 1, NULL));
+    SDL_EndGPURenderPass(SDL_BeginGPURenderPass(cmd, &color, 1, &depth));
     SDL_SubmitGPUCommandBuffer(cmd);
-    s->owner = SG_OWNER_GPU;
+    if (channels)
+        s->owner = SG_OWNER_GPU;         /* the GPU copy is now the newer one */
     return 1;
 }

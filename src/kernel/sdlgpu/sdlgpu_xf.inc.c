@@ -11,8 +11,7 @@
  * RECOMP_CULL=1, and off here.
  */
 
-/* XfVert z is in Z24 units: s_zbuf holds 0..2^24-1 (see zbuf_clear_bits). */
-#define SG_DEPTH_MAX 16777215.0f
+
 
 typedef struct {
     SgXfVertex *v;
@@ -122,8 +121,6 @@ static int sg_draw_xf(void)
 
     if (s_gpu.idx_count < 3)
         return 0;
-    if (s_vp.depth_test || s_vp.stencil_test)
-        return 0;                        /* depth and stencil: step 3 */
     if (!sg_draw_init())
         return 0;
     s = sg_surface_current();

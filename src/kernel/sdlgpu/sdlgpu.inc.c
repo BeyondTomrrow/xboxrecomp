@@ -30,11 +30,22 @@ typedef struct {
     uint32_t        pitch;      /* bytes per row in guest RAM */
     uint32_t        w, h;       /* pixels */
     SDL_GPUTexture *color;
-    SgOwner         owner;
+    SgOwner         owner;      /* applies to colour only, see below */
+    /* Depth and stencil live only on the GPU. In software they are host
+     * arrays (s_zbuf, s_sbuf), never guest RAM, so nothing ever downloads
+     * them. While this renderer is on, the GPU copy is authoritative: a
+     * depth-tested batch that falls back to software tests against its own
+     * (stale) buffer. Fallbacks are rare; see docs/sdl-gpu-renderer.md. */
+    SDL_GPUTexture *depth;
+    int             depth_ready; /* depth/stencil hold data (else clear before use) */
     uint32_t        last_use;   /* s_sg.tick when last bound, for eviction */
 } SgSurface;
 
-#define SG_MAX_PIPELINES 32
+#define SG_MAX_PIPELINES 64
+
+/* XfVert z and the depth clear value are in Z24 units: s_zbuf holds
+ * 0..2^24-1 (zbuf_clear_bits). The GPU stores z / SG_DEPTH_MAX. */
+#define SG_DEPTH_MAX 16777215.0f
 
 /* One vertex of a flat 2D triangle (shaders/flat2d.vert). */
 typedef struct {
@@ -51,14 +62,26 @@ typedef struct {
     float spec[4];       /* oD1, RGBA 0..1 */
     float uv[4][2];      /* oT0..oT3, in texels of their stage */
 } SgXfVertex;
+
+/* Everything a pipeline bakes in. Compared with memcmp, so it has no padding
+ * (only uint32_t members). Field layout: sdlgpu_pipeline.inc.c. */
 typedef struct {
-    uint32_t                 key;      /* sg_pipeline_key() of the state it encodes */
+    uint32_t color;      /* blend, write mask, kind */
+    uint32_t depth;      /* test, write, compare */
+    uint32_t stencil;    /* test, compare, fail/zfail/pass ops */
+    uint32_t masks;      /* stencil compare mask, write mask */
+} SgPipeKey;
+
+typedef struct {
+    SgPipeKey                key;
     SDL_GPUGraphicsPipeline *pipe;
 } SgPipeline;
+
 
 static struct {
     int                    tried;      /* device creation attempted */
     SDL_GPUDevice         *dev;
+    SDL_GPUTextureFormat depth_format;
     SgSurface              surf[SG_MAX_SURFACES];
     uint32_t               tick;
 
@@ -108,6 +131,13 @@ static int sg_ready(void)
         fprintf(stderr, "  [SDLGPU] no GPU device (%s); software rendering\n", SDL_GetError());
         return 0;
     }
+    /* 32-bit float depth keeps the software path's float comparisons
+     */
+    s_sg.depth_format = SDL_GPUTextureSupportsFormat(s_sg.dev, SDL_GPU_TEXTUREFORMAT_D32_FLOAT_S8_UINT,
+                                                 SDL_GPU_TEXTURETYPE_2D,
+                                                 SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET)
+                  ? SDL_GPU_TEXTUREFORMAT_D32_FLOAT_S8_UINT
+                  : SDL_GPU_TEXTUREFORMAT_D24_UNORM_S8_UINT;
     fprintf(stderr, "  [SDLGPU] hardware rendering via %s\n", SDL_GetGPUDeviceDriver(s_sg.dev));
     return 1;
 }
@@ -135,7 +165,7 @@ static int sg_draw_batch(int flat2d)
 
 static int sg_clear(uint32_t param)
 {
-    return sg_ready() && sg_clear_color(param);
+    return sg_ready() && sg_clear_surface(param);
 }
 
 static void sg_flip(void)
