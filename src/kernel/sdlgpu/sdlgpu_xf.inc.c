@@ -163,7 +163,7 @@ static int sg_draw_xf(void)
             .fs_uniform = &shade, .fs_uniform_size = sizeof shade,
         };
         sg_xf_shade_fill(&shade, sampled);
-        if (!sg_submit(&d))
+        if (!sg_queue_draw(&d))
             return sg_fallback(SG_FB_RESOURCES, 1);
         s_sg_stats.gpu3d++;
         return 1;

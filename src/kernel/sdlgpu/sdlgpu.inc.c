@@ -103,6 +103,51 @@ static struct {
     SDL_GPUTexture        *white;        /* bound when a batch has no texture */
 } s_sg;
 
+
+
+/* ──
+ * Batches are queued, not submitted one by one: a flush uploads all their
+ * vertices and new textures in one copy pass and draws them in one render
+ * pass. A queue targets one surface. Flushed before anything needs the
+ * GPU's results (CPU access, flip), before a clear, when the target
+ * changes, and when full. */
+#define SG_QUEUE_MAX_DRAWS 8192
+
+typedef struct {
+    SDL_GPUGraphicsPipeline *pipe;
+    uint32_t        vertex_offset;   /* bytes into the queue's vertex data */
+    uint32_t        vertex_count;
+    SDL_GPUTexture *tex[4];          /* fragment samplers 0..tex_count-1 */
+    int             tex_count;
+    SDL_Rect        scissor;
+    SDL_FColor      blend_constant;
+    Uint8           stencil_ref;
+    uint32_t        vs_size, fs_size;
+    uint8_t         vs[16];          /* uniform data, copied when queued */
+    uint8_t         fs[320];         /* fits SgXfShade (304 bytes) */
+} SgQueuedDraw;
+
+typedef struct {
+    SDL_GPUTexture *tex;
+    uint32_t        w, h;
+    uint32_t        offset;          /* into the queue's texture data */
+} SgQueuedUpload;
+
+typedef struct {
+    SgSurface      *surface;         /* every queued draw targets it; NULL = empty */
+    int             upload_surface;  /* upload its guest copy before drawing */
+    SgQueuedDraw   *draws;    uint32_t count, cap;
+    uint8_t        *vdata;    uint32_t vbytes, vcap;
+    uint8_t        *tdata;    uint32_t tbytes, tcap;
+    SgQueuedUpload *uploads;  uint32_t upload_count, upload_cap;
+    uint32_t        epoch;           /* bumped by every flush; cache slots used
+                                      * in the current epoch are in flight */
+} SgQueue;
+
+static SgQueue s_sg_queue = { .epoch = 1 };
+static int sg_queue_flush(void);
+
+
 /* ── Statistics: how many batches the GPU took, and why the rest fell back.
  * Printed every 5 s while the renderer is on; the first thing to read when
  * a scene is slow (each fallback costs a GPU->RAM download) or drawn wrong. */
@@ -204,8 +249,10 @@ static int sg_ready(void)
 
 static void sg_cpu_access(void)
 {
-    if (s_sg.dev)
+    if (s_sg.dev) {
+        sg_queue_flush();            /* queued draws first, then read back */
         sg_download_all();
+    }
 }
 
 static int sg_draw_batch(int flat2d)
@@ -232,7 +279,9 @@ static void sg_flip(void)
     /* The presenter shows guest RAM (snapshot at flip), so the frame must be
      * there before nv2a_pb_exec takes that snapshot. */
     if (s_sg.dev) {
+        sg_queue_flush();
         sg_download_all();
         sg_stats_tick();
+        s_sg_frame++;                /* texture hashes are per frame */
     }
 }

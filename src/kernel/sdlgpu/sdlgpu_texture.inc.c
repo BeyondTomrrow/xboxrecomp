@@ -18,6 +18,8 @@ typedef struct {
     uint32_t        w, h;
     SDL_GPUTexture *tex;
     uint32_t        last_use;
+    uint32_t        epoch_used; /* s_sg_queue.epoch when last used: in flight
+                                 * until that queue is flushed, never evicted */
 } SgCachedTexture;
 
 typedef struct {
@@ -30,6 +32,27 @@ typedef struct {
 
 static SgCachedTexture s_sg_textures[SG_MAX_TEXTURES];
 static uint32_t        s_sg_texture_tick;
+
+
+
+/* Hashing a texture's raw bytes is the per-batch cost of the cache, so each
+ * texture is hashed at most once per frame. Only textures read in place
+ * from guest RAM are remembered (a malloc'd snapshot copy can reuse an
+ * address). Limitation: a texture the title rewrites in place after using
+ * it in the same frame reaches the GPU one frame late. */
+#define SG_HASH_MEMO 64
+
+typedef struct {
+    const uint8_t *pixels;
+    size_t         bytes;
+    uint32_t       shape[4];
+    uint32_t       frame;
+    uint64_t       hash;
+} SgHashMemo;
+
+static SgHashMemo s_sg_hash_memo[SG_HASH_MEMO];
+static uint32_t   s_sg_frame = 1;            /* bumped at every flip */
+
 /* One decode buffer per stage: one batch can upload several stages. */
 static uint32_t       *s_sg_decode[4];
 static size_t          s_sg_decode_texels[4];
@@ -67,12 +90,27 @@ static uint64_t sg_texture_key(int st)
 {
     const TextureSnapshot *snap = &s_texture_snapshot[st];
     const Texture *tx = sg_stage_texture(st);
-    uint64_t h = 0x243F6A8885A308D3ull;
     uint32_t shape[4] = { tx->width, tx->height, tx->color, tx->pitch };
+    uint64_t h;
 
-    h = sg_hash((const uint8_t *)shape, sizeof shape, h);
-    h = sg_hash(snap->pixels, snap->bytes, h);
-    if (tx->color == 0x0B)
+    if (!snap->owned) {
+        SgHashMemo *m = &s_sg_hash_memo[(((uintptr_t)snap->pixels >> 6) ^ tx->width ^ (tx->height << 7))
+                                        % SG_HASH_MEMO];
+        if (m->frame != s_sg_frame || m->pixels != snap->pixels || m->bytes != snap->bytes ||
+            memcmp(m->shape, shape, sizeof shape) != 0) {
+            m->pixels = snap->pixels;
+            m->bytes = snap->bytes;
+            memcpy(m->shape, shape, sizeof shape);
+            m->frame = s_sg_frame;
+            m->hash = sg_hash(snap->pixels, snap->bytes,
+                              sg_hash((const uint8_t *)shape, sizeof shape, 0x243F6A8885A308D3ull));
+            }
+        h = m->hash;
+    } else {
+        h = sg_hash(snap->pixels, snap->bytes,
+                    sg_hash((const uint8_t *)shape, sizeof shape, 0x243F6A8885A308D3ull));
+    }
+    if (tx->color == 0x0B)                    /* 1 KB palette: cheap, hashed every time */
         h = sg_hash((const uint8_t *)snap->palette, sizeof snap->palette, h);
     return h ? h : 1;
 }
@@ -121,11 +159,28 @@ static int sg_texture_for_stage(int st, SgTextureUse *use)
         SgCachedTexture *c = &s_sg_textures[i];
         if (c->key == key && c->w == w && c->h == h) {
             c->last_use = s_sg_texture_tick;
+            c->epoch_used = s_sg_queue.epoch;
             *use = (SgTextureUse){ c->tex, NULL, w, h, NULL, 0 };
             return 1;
         }
-        if (c->last_use < slot->last_use)
-            slot = c;                                 /* least recently used */
+    }
+
+    /* Evict the least recently used slot that no queued draw still needs;
+     * if every slot is in flight, flush the queue first. */
+    slot = NULL;
+    for (i = 0; i < SG_MAX_TEXTURES; i++) {
+        SgCachedTexture *c = &s_sg_textures[i];
+        if (c->epoch_used == s_sg_queue.epoch)
+            continue;
+        if (!slot || c->last_use < slot->last_use)
+            slot = c;
+    }
+    if (!slot) {
+        sg_queue_flush();
+        slot = &s_sg_textures[0];
+        for (i = 1; i < SG_MAX_TEXTURES; i++)
+            if (s_sg_textures[i].last_use < slot->last_use)
+                slot = &s_sg_textures[i];
     }
 
     if (!sg_texture_decode(st, w, h))
@@ -151,6 +206,7 @@ static int sg_texture_for_stage(int st, SgTextureUse *use)
      * a key pointing at a texture that never received its texels. */
     slot->key = 0;
     slot->last_use = s_sg_texture_tick;
+    slot->epoch_used = s_sg_queue.epoch;      /* reserved by this batch */
     *use = (SgTextureUse){ slot->tex, s_sg_decode[st], w, h, slot, key };
     return 1;
 }
