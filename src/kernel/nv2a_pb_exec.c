@@ -46,44 +46,52 @@
  * own threads also contend for, which slowed the whole game down enough to
  * change menu timing. The environment does not change while running, so
  * every lookup is cached after its first read. */
-static const char *env_cached(const char *name)
-{
+static const char *env_cached(const char *name) {
     /* Hashed on the name's address (call sites pass literals), so a lookup
      * is one or two probes. The old linear scan over every debug switch ran
      * dozens of times per draw: ~3% of the game thread (2026-10-02). A miss
      * takes the lock, reads the environment once and publishes the value
      * before the name, so readers never see a name without its value. */
-    static struct { PVOID volatile name; const char *value; } tab[1024];
+    static struct {
+        PVOID volatile name;
+        const char *value;
+    } tab[1024];
     static SRWLOCK lock = SRWLOCK_INIT;
-    uintptr_t k = (uintptr_t)name;
-    unsigned h = (unsigned)(((k >> 3) * 2654435761u) >> 8) & 1023u, i;
+    uintptr_t k = (uintptr_t) name;
+    unsigned h = (unsigned) (((k >> 3) * 2654435761u) >> 8) & 1023u, i;
     for (i = 0; i < 1024; i++, h = (h + 1) & 1023u) {
-        const char *n = (const char *)InterlockedCompareExchangePointer(&tab[h].name, NULL, NULL);
+        const char *n = (const char *) InterlockedCompareExchangePointer(&tab[h].name, NULL, NULL);
         if (n == name) return tab[h].value;
         if (!n) break;
     }
     AcquireSRWLockExclusive(&lock);
-    for (i = 0, h = (unsigned)(((k >> 3) * 2654435761u) >> 8) & 1023u; i < 1024; i++, h = (h + 1) & 1023u) {
-        if (tab[h].name == (PVOID)name) break;
+    for (i = 0, h = (unsigned) (((k >> 3) * 2654435761u) >> 8) & 1023u; i < 1024; i++, h = (h + 1) & 1023u) {
+        if (tab[h].name == (PVOID) name) break;
         if (!tab[h].name) {
             tab[h].value = getenv(name);
             /* Publish the value through the same atomic pointer readers use. */
-            InterlockedCompareExchangePointer(&tab[h].name, (PVOID)name, NULL);
+            InterlockedCompareExchangePointer(&tab[h].name, (PVOID) name, NULL);
             break;
         }
     }
     ReleaseSRWLockExclusive(&lock);
     return i < 1024 ? tab[h].value : getenv(name);
 }
+
 #define getenv(name) env_cached(name)
 
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
+
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
+
 extern void xbox_FramebufferSnapshot(uint32_t fb_va, uint32_t pitch);
+
 extern void xbox_FramebufferWindowStart(void);
+
 extern void xbox_FramebufferWindowSize(uint32_t w, uint32_t h);
-extern uint32_t g_nv2a_pb_calls;   /* nv2a_pb_scan.c */
+
+extern uint32_t g_nv2a_pb_calls; /* nv2a_pb_scan.c */
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 
 /* Would writing this surface land on the title's own image?
@@ -103,8 +111,7 @@ extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
  * nothing is strictly better than writing over the guest, and a title that
  * cannot draw is easier to debug than one that has been overwritten.
  */
-static int surface_hits_image(uint32_t base, uint32_t bytes)
-{
+static int surface_hits_image(uint32_t base, uint32_t bytes) {
     if (!g_xbox_image_hi || !bytes)
         return 0;
     return base < g_xbox_image_hi && base + bytes > g_xbox_image_lo;
@@ -131,8 +138,7 @@ static int surface_hits_image(uint32_t base, uint32_t bytes)
  * in ordinary RAM (Wreckless renders to the tiled alias of physical
  * 0x01954000) keep the first path and are unaffected.
  */
-static uint32_t dma_resolve(uint32_t offset)
-{
+static uint32_t dma_resolve(uint32_t offset) {
     extern uint32_t xbox_ContiguousAllocatedBytes(void);
 
     /* Did this runtime hand the offset out as contiguous memory? Then the
@@ -149,19 +155,18 @@ static uint32_t dma_resolve(uint32_t offset)
      * black straight through the guest heap -- which faulted the title three
      * frames later on a pointer that had been overwritten, while the real
      * framebuffer at 0x80A6C000 stayed untouched and the screen stayed black. */
-    if (offset & XBOX_PHYS_LOW_TAG)     /* low memory, see MmGetPhysicalAddress */
+    if (offset & XBOX_PHYS_LOW_TAG) /* low memory, see MmGetPhysicalAddress */
         return offset & 0x03FFFFFFu;
     if (offset < xbox_ContiguousAllocatedBytes())
         return XBOX_CONTIG_BASE + offset;
     if (!surface_hits_image(offset, 1))
         return offset;
-    if ((uint64_t)offset < XBOX_CONTIG_SIZE)
+    if ((uint64_t) offset < XBOX_CONTIG_SIZE)
         return XBOX_CONTIG_BASE + offset;
-    return offset;                         /* nothing better to offer */
+    return offset; /* nothing better to offer */
 }
 
-static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what)
-{
+static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what) {
     static int said;
 
     if (!surface_hits_image(base, bytes))
@@ -254,21 +259,21 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 /* One vertex attribute stream, as the title describes it. Attribute 0 is
  * position; the rest are colours, texture coordinates and so on. */
 typedef struct {
-    uint32_t offset;      /* guest address of element 0 */
-    uint32_t type;        /* NV097 data type nibble */
-    uint32_t size;        /* components per element */
-    uint32_t stride;      /* bytes between elements */
+    uint32_t offset; /* guest address of element 0 */
+    uint32_t type; /* NV097 data type nibble */
+    uint32_t size; /* components per element */
+    uint32_t stride; /* bytes between elements */
 } VertexAttr;
 
 #define NV_VERTEX_ATTRS 16
 #define NV_MAX_INDICES  4096
 
 /* Indices that did not fit a batch (silently lost before 2026-10-02). */
-static void idx_overflow_note(const char *how, uint32_t dropped)
-{
+static void idx_overflow_note(const char *how, uint32_t dropped) {
     static unsigned long total, events;
     static DWORD last;
-    total += dropped; events++;
+    total += dropped;
+    events++;
     if (GetTickCount() - last > 2000) {
         fprintf(stderr, "  [IDXCAP] %lu batches overflowed, %lu indices dropped (last: %s)""\n", events, total, how);
         last = GetTickCount();
@@ -286,42 +291,42 @@ static void idx_overflow_note(const char *how, uint32_t dropped)
  * as unhandled methods and are counted as such, which is how the next title
  * that needs them will say so. */
 typedef struct {
-    uint32_t offset;                    /* guest address of texel (0,0)  */
-    uint32_t width, height;             /* from IMAGE_RECT               */
-    uint32_t pitch;                     /* bytes per row, from CONTROL1  */
-    uint32_t color;                     /* NV097 colour-format code      */
-    uint32_t addr_u, addr_v;            /* wrap mode per axis            */
-    uint32_t palette;                   /* guest address of A8R8G8B8 CLUT */
-    int      enabled;                   /* CONTROL0 bit 30                */
-    int      valid;
+    uint32_t offset; /* guest address of texel (0,0)  */
+    uint32_t width, height; /* from IMAGE_RECT               */
+    uint32_t pitch; /* bytes per row, from CONTROL1  */
+    uint32_t color; /* NV097 colour-format code      */
+    uint32_t addr_u, addr_v; /* wrap mode per axis            */
+    uint32_t palette; /* guest address of A8R8G8B8 CLUT */
+    int enabled; /* CONTROL0 bit 30                */
+    int valid;
 } Texture;
 
 static struct {
     VertexAttr attr[NV_VERTEX_ATTRS];
-    uint32_t   prim;                    /* SET_BEGIN_END parameter, 0 = ended */
-    uint16_t   idx[NV_MAX_INDICES];
-    uint32_t   idx_count;
+    uint32_t prim; /* SET_BEGIN_END parameter, 0 = ended */
+    uint16_t idx[NV_MAX_INDICES];
+    uint32_t idx_count;
     /* DRAW_ARRAYS method words are individual draw calls unless adjacent
      * ranges can be joined.  Keep that provenance so a non-contiguous range
      * can be flushed instead of turning two strips into one (which creates a
      * long bridge triangle across the field). */
-    int        draw_arrays_active;
+    int draw_arrays_active;
     /* INLINE_ARRAY payload: vertices written straight into the pushbuffer
      * instead of into a buffer the title points at. Same vertex format, a
      * different place to read them from. */
-    uint32_t   inline_buf[NV_MAX_INLINE];
-    uint32_t   inline_count;
+    uint32_t inline_buf[NV_MAX_INLINE];
+    uint32_t inline_count;
     /* Current values of the immediate-mode attributes, and how many complete
      * vertices they have produced in this batch. */
-    float      imm_pos[4];
-    uint32_t   imm_diffuse;
-    float      imm_tex[2];
-    uint32_t   imm_count;
-    int        inline_active;
-    uint32_t   draws, verts, nonzero_draws;
-    float      min_x, max_x, min_y, max_y;
+    float imm_pos[4];
+    uint32_t imm_diffuse;
+    float imm_tex[2];
+    uint32_t imm_count;
+    int inline_active;
+    uint32_t draws, verts, nonzero_draws;
+    float min_x, max_x, min_y, max_y;
     uint32_t color_offset, color_base, pitch, format;
-    uint32_t zeta_offset, zeta_pitch;    /* independent NV097 depth/stencil surface */
+    uint32_t zeta_offset, zeta_pitch; /* independent NV097 depth/stencil surface */
     /* The surface the last batch actually drew into. A double-buffered title
      * has already pointed color_offset at the next buffer and cleared it by
      * the time the flip arrives, so dumping the current one dumps the frame
@@ -329,7 +334,7 @@ static struct {
      * sequence came out as 12 black BMPs. */
     uint32_t drawn_offset;
     uint64_t pixels;
-    uint32_t pixel_max;   /* brightest value any pixel write carried */
+    uint32_t pixel_max; /* brightest value any pixel write carried */
     uint32_t clip_x, clip_w, clip_y, clip_h;
     uint32_t window_clip_type;
     uint32_t window_clip_x[8], window_clip_y[8];
@@ -345,7 +350,7 @@ static struct {
      * identical on screen and want opposite fixes: the batch carried no
      * texture coordinates, or it did and the stage was not usable. */
     uint32_t batches_textured, batches_no_uv, batches_no_tex;
-    Texture  tex;
+    Texture tex;
 } s_gpu;
 
 /* What each vertex attribute reads when the batch does not supply it as an
@@ -356,15 +361,19 @@ static struct {
  * 3D characters -- Create Player, the pregame studio -- alpha 0, so they drew
  * fully transparent (2026-09-24). */
 static float s_attr_inline[NV_VERTEX_ATTRS][4] = {
-    {0,0,0,1},{0,0,0,1},{0,0,0,1},{0,0,0,1},{0,0,0,1},{0,0,0,1},{0,0,0,1},{0,0,0,1},
-    {0,0,0,1},{0,0,0,1},{0,0,0,1},{0,0,0,1},{0,0,0,1},{0,0,0,1},{0,0,0,1},{0,0,0,1},
+    {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1},
+    {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1},
 };
 
 /* Unhandled methods, ranked. The interesting output is not that something was
  * skipped but which things dominate, because that is the order to implement
  * them in. */
 #define PB_EXEC_MAX_UNHANDLED 2048
-typedef struct { uint32_t method, count, last_param; } PbUnhandled;
+
+typedef struct {
+    uint32_t method, count, last_param;
+} PbUnhandled;
+
 static PbUnhandled s_unhandled[PB_EXEC_MAX_UNHANDLED];
 static int s_unhandled_count;
 
@@ -374,19 +383,17 @@ static int s_unhandled_count;
 #define NV_TEX_FIRST 0x1B00
 #define NV_TEX_LAST  0x1BFC
 static uint32_t s_tex_reg[(NV_TEX_LAST - NV_TEX_FIRST) / 4 + 1];
-static uint8_t  s_tex_set[(NV_TEX_LAST - NV_TEX_FIRST) / 4 + 1];
+static uint8_t s_tex_set[(NV_TEX_LAST - NV_TEX_FIRST) / 4 + 1];
 
 /* Formats whose dimensions come from the format word and whose coordinates
  * arrive normalised, rather than from a pitch and SET_TEXTURE_IMAGE_RECT with
  * coordinates in texels. Swizzled and block-compressed are both in this group,
  * and every place that used to test only for swizzled needs the pair. */
-static int tex_size_from_format(uint32_t fmt)
-{
+static int tex_size_from_format(uint32_t fmt) {
     return d3d8_format_is_swizzled(fmt) || d3d8_format_dxt_block_bytes(fmt);
 }
 
-static void record_tex_reg(uint32_t method, uint32_t param)
-{
+static void record_tex_reg(uint32_t method, uint32_t param) {
     s_tex_reg[(method - NV_TEX_FIRST) / 4] = param;
     s_tex_set[(method - NV_TEX_FIRST) / 4] = 1;
     /* A pitch is a linear texture's property. A swizzled one has no rows and
@@ -396,19 +403,20 @@ static void record_tex_reg(uint32_t method, uint32_t param)
      * flat vertex colour. */
     int was_valid = s_gpu.tex.valid;
     s_gpu.tex.valid = s_gpu.tex.offset && s_gpu.tex.width && s_gpu.tex.height
-                   && (tex_size_from_format(s_gpu.tex.color)
-                       || s_gpu.tex.pitch);
+                      && (tex_size_from_format(s_gpu.tex.color)
+                          || s_gpu.tex.pitch);
     /* Opt-in: identify whether any bound texture matches the known
      * legal-screen asset (512x512 P8/indexed, archive record 0) without
      * changing behavior. See docs/GEMINI-HANDOFF.md for the verified
      * decode of that asset from the native rebuild track. */
     if (!was_valid && s_gpu.tex.valid && getenv("RECOMP_TEX_IDENTIFY")) {
         fprintf(stderr,
-            "[TEX] bound: offset=0x%08X width=%u height=%u format=0x%02X pitch=%u%s\n",
-            s_gpu.tex.offset, s_gpu.tex.width, s_gpu.tex.height,
-            s_gpu.tex.color, s_gpu.tex.pitch,
-            (s_gpu.tex.width == 512 && s_gpu.tex.height == 512) ?
-                "  <-- matches legal-screen texture dimensions" : "");
+                "[TEX] bound: offset=0x%08X width=%u height=%u format=0x%02X pitch=%u%s\n",
+                s_gpu.tex.offset, s_gpu.tex.width, s_gpu.tex.height,
+                s_gpu.tex.color, s_gpu.tex.pitch,
+                (s_gpu.tex.width == 512 && s_gpu.tex.height == 512)
+                    ? "  <-- matches legal-screen texture dimensions"
+                    : "");
     }
 }
 
@@ -419,41 +427,41 @@ static void record_tex_reg(uint32_t method, uint32_t param)
  * "is a font page ever bound". This is the same shape as the unhandled-method
  * table below it: a small set, ranked, printed with the rest of the report. */
 #define PB_EXEC_MAX_TEXTURES 64
+
 typedef struct {
     uint32_t offset, color, width, height, batches;
 } PbTexUse;
+
 static PbTexUse s_tex_use[PB_EXEC_MAX_TEXTURES];
 static int s_tex_use_count;
 
 /* Defined below, next to the sampler it goes through. */
 static void dump_texture_bmp(uint32_t seq);
 
-static void note_texture_use(void)
-{
+static void note_texture_use(void) {
     int i;
 
     if (!s_gpu.tex.valid)
         return;
     for (i = 0; i < s_tex_use_count; i++) {
         if (s_tex_use[i].offset == s_gpu.tex.offset
-         && s_tex_use[i].color  == s_gpu.tex.color) {
+            && s_tex_use[i].color == s_gpu.tex.color) {
             s_tex_use[i].batches++;
             return;
         }
     }
     if (s_tex_use_count < PB_EXEC_MAX_TEXTURES) {
-        s_tex_use[s_tex_use_count].offset  = s_gpu.tex.offset;
-        s_tex_use[s_tex_use_count].color   = s_gpu.tex.color;
-        s_tex_use[s_tex_use_count].width   = s_gpu.tex.width;
-        s_tex_use[s_tex_use_count].height  = s_gpu.tex.height;
+        s_tex_use[s_tex_use_count].offset = s_gpu.tex.offset;
+        s_tex_use[s_tex_use_count].color = s_gpu.tex.color;
+        s_tex_use[s_tex_use_count].width = s_gpu.tex.width;
+        s_tex_use[s_tex_use_count].height = s_gpu.tex.height;
         s_tex_use[s_tex_use_count].batches = 1;
         s_tex_use_count++;
-        dump_texture_bmp((uint32_t)s_tex_use_count - 1);
+        dump_texture_bmp((uint32_t) s_tex_use_count - 1);
     }
 }
 
-static void note_unhandled(uint32_t method, uint32_t param)
-{
+static void note_unhandled(uint32_t method, uint32_t param) {
     int i;
 
     s_gpu.unhandled_total++;
@@ -480,14 +488,16 @@ static void note_unhandled(uint32_t method, uint32_t param)
 /* Read attribute `a` of vertex `index` as floats. Only the float and the
  * normalised-byte types appear in practice; anything else returns 0 so a
  * caller sees a degenerate vertex rather than reading past the array. */
-static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
-{
-    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4]) {
+    const uint8_t *mem = (const uint8_t *) xbox_GetMemoryOffset();
     const uint8_t *p;
     uint32_t i;
     size_t bytes;
 #if defined(__linux__)
-    union { float floats[4]; uint8_t bytes[16]; } sampled;
+    union {
+        float floats[4];
+        uint8_t bytes[16];
+    } sampled;
 #endif
 
     out[0] = out[1] = out[2] = 0.0f;
@@ -499,93 +509,99 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
         return 0;
     }
     switch (a->type) {
-    case 0: case 6: bytes = 4; break;
-    case 2: bytes = (a->size < 4 ? a->size : 4) * 4; break;
-    case 1: case 5: bytes = (a->size < 4 ? a->size : 4) * 2; break;
-    case 4: bytes = a->size < 4 ? a->size : 4; break;
-    default: return 0;
+        case 0:
+        case 6: bytes = 4;
+            break;
+        case 2: bytes = (a->size < 4 ? a->size : 4) * 4;
+            break;
+        case 1:
+        case 5: bytes = (a->size < 4 ? a->size : 4) * 2;
+            break;
+        case 4: bytes = a->size < 4 ? a->size : 4;
+            break;
+        default: return 0;
     }
     if (s_gpu.inline_active) {
         /* The batch arrived as INLINE_ARRAY, so `offset` is a byte offset into
          * the buffered payload rather than a guest address -- and 0 is a legal
          * one there, which is why the offset test is on the other side of this
          * branch. */
-        uint64_t at = (uint64_t)a->offset + (uint64_t)index * a->stride;
-        uint64_t available = (uint64_t)s_gpu.inline_count * 4;
+        uint64_t at = (uint64_t) a->offset + (uint64_t) index * a->stride;
+        uint64_t available = (uint64_t) s_gpu.inline_count * 4;
         if (at > available || bytes > available - at)
             return 0;
-        p = (const uint8_t *)s_gpu.inline_buf + at;
+        p = (const uint8_t *) s_gpu.inline_buf + at;
     } else {
         if (!a->offset)
             return 0;
 #if defined(__linux__)
-        uint64_t address = (uint64_t)a->offset + (uint64_t)index * a->stride;
-        if (!xbox_guest_memory_read((uintptr_t)mem,address,sampled.bytes,bytes))
+        uint64_t address = (uint64_t) a->offset + (uint64_t) index * a->stride;
+        if (!xbox_guest_memory_read((uintptr_t) mem, address, sampled.bytes, bytes))
             return 0;
         p = sampled.bytes;
 #else
-        p = mem + a->offset + (size_t)index * a->stride;
+        p = mem + a->offset + (size_t) index * a->stride;
 #endif
     }
 
     switch (a->type) {
-    case 0:                                  /* D3DCOLOR */
-        /* A DWORD 0xAARRGGBB, so little-endian bytes are B,G,R,A -- not the
-         * component order of every other format here. Returned as R,G,B,A so
-         * callers need not know which format the title chose. */
-        /* A zero-stride array supplies a constant inline value, decoded in
-         * byte order just like SET_VERTEX_DATA4UB (xemu vertex.c and
-         * gl/vertex.c). BGRA conversion applies only to array fetches. */
-        out[0] = (float)p[a->stride ? 2 : 0] / 255.0f;
-        out[1] = (float)p[1] / 255.0f;
-        out[2] = (float)p[a->stride ? 0 : 2] / 255.0f;
-        out[3] = (float)p[3] / 255.0f;
-        return 1;
-    case 2:                                  /* float */
-        for (i = 0; i < a->size && i < 4; i++)
-            out[i] = ((const float *)p)[i];
-        return 1;
-    case 4:                                  /* unsigned byte, normalised */
-        for (i = 0; i < a->size && i < 4; i++)
-            out[i] = (float)p[i] / 255.0f;
-        return 1;
-    /* Signed shorts. NFL 2K5's shaders take their matrix-palette index from
-     * attribute 1 as raw shorts (type 5) through ARL; read as 0, every vertex
-     * of a batch transformed by an unset matrix and collapsed to one point. */
-    case 1:                                  /* short, normalised (S1) */
-        for (i = 0; i < a->size && i < 4; i++) {
-            float v = (float)((const int16_t *)p)[i] / 32767.0f;
-            out[i] = v < -1.0f ? -1.0f : v;
+        case 0: /* D3DCOLOR */
+            /* A DWORD 0xAARRGGBB, so little-endian bytes are B,G,R,A -- not the
+             * component order of every other format here. Returned as R,G,B,A so
+             * callers need not know which format the title chose. */
+            /* A zero-stride array supplies a constant inline value, decoded in
+             * byte order just like SET_VERTEX_DATA4UB (xemu vertex.c and
+             * gl/vertex.c). BGRA conversion applies only to array fetches. */
+            out[0] = (float) p[a->stride ? 2 : 0] / 255.0f;
+            out[1] = (float) p[1] / 255.0f;
+            out[2] = (float) p[a->stride ? 0 : 2] / 255.0f;
+            out[3] = (float) p[3] / 255.0f;
+            return 1;
+        case 2: /* float */
+            for (i = 0; i < a->size && i < 4; i++)
+                out[i] = ((const float *) p)[i];
+            return 1;
+        case 4: /* unsigned byte, normalised */
+            for (i = 0; i < a->size && i < 4; i++)
+                out[i] = (float) p[i] / 255.0f;
+            return 1;
+        /* Signed shorts. NFL 2K5's shaders take their matrix-palette index from
+         * attribute 1 as raw shorts (type 5) through ARL; read as 0, every vertex
+         * of a batch transformed by an unset matrix and collapsed to one point. */
+        case 1: /* short, normalised (S1) */
+            for (i = 0; i < a->size && i < 4; i++) {
+                float v = (float) ((const int16_t *) p)[i] / 32767.0f;
+                out[i] = v < -1.0f ? -1.0f : v;
+            }
+            return 1;
+        case 5: /* short, as is (S32K) */
+            for (i = 0; i < a->size && i < 4; i++)
+                out[i] = (float) ((const int16_t *) p)[i];
+            return 1;
+        case 6: {
+            /* packed 11:11:10 signed normal (CMP) */
+            uint32_t w = *(const uint32_t *) p;
+            int32_t x = (int32_t) (w << 21) >> 21;
+            int32_t y = (int32_t) ((w >> 11) << 21) >> 21;
+            int32_t z = (int32_t) (w >> 22) << 22 >> 22;
+            out[0] = (float) x / 1023.0f;
+            out[1] = (float) y / 1023.0f;
+            out[2] = (float) z / 511.0f;
+            if (!a->stride) {
+                /* Constant arrays pass through pgraph_update_inline_value,
+                 * which clamps the negative endpoint of signed normal formats. */
+                if (out[0] < -1.0f) out[0] = -1.0f;
+                if (out[1] < -1.0f) out[1] = -1.0f;
+                if (out[2] < -1.0f) out[2] = -1.0f;
+            }
+            return 1;
         }
-        return 1;
-    case 5:                                  /* short, as is (S32K) */
-        for (i = 0; i < a->size && i < 4; i++)
-            out[i] = (float)((const int16_t *)p)[i];
-        return 1;
-    case 6: {                                /* packed 11:11:10 signed normal (CMP) */
-        uint32_t w = *(const uint32_t *)p;
-        int32_t x = (int32_t)(w << 21) >> 21;
-        int32_t y = (int32_t)((w >> 11) << 21) >> 21;
-        int32_t z = (int32_t)(w >> 22) << 22 >> 22;
-        out[0] = (float)x / 1023.0f;
-        out[1] = (float)y / 1023.0f;
-        out[2] = (float)z / 511.0f;
-        if (!a->stride) {
-            /* Constant arrays pass through pgraph_update_inline_value,
-             * which clamps the negative endpoint of signed normal formats. */
-            if (out[0] < -1.0f) out[0] = -1.0f;
-            if (out[1] < -1.0f) out[1] = -1.0f;
-            if (out[2] < -1.0f) out[2] = -1.0f;
-        }
-        return 1;
-    }
-    default:
-        return 0;
+        default:
+            return 0;
     }
 }
 
-static uint32_t surface_bpp(void)
-{
+static uint32_t surface_bpp(void) {
     /* The pitch and the clip width together give the pixel size, which is more
      * reliable than decoding the format field: the format's colour code is
      * only meaningful alongside a type the title also sets, while the pitch is
@@ -605,20 +621,18 @@ static uint32_t surface_bpp(void)
  * ponytail: bottom-up 24bpp BMP, no palette, no compression. That is the one
  * format every viewer reads and it is 30 lines; PNG would need a dependency.
  */
-static int pb_diagnostic_read(uint64_t address, void *output, size_t bytes)
-{
+static int pb_diagnostic_read(uint64_t address, void *output, size_t bytes) {
 #if defined(__linux__)
-    return xbox_guest_memory_read((uintptr_t)xbox_GetMemoryOffset(), address, output, bytes);
+    return xbox_guest_memory_read((uintptr_t) xbox_GetMemoryOffset(), address, output, bytes);
 #else
-    memcpy(output, (const uint8_t *)xbox_GetMemoryOffset() + address, bytes);
+    memcpy(output, (const uint8_t *) xbox_GetMemoryOffset() + address, bytes);
     return 1;
 #endif
 }
 
-static void dump_surface_bmp(void)
-{
+static void dump_surface_bmp(void) {
     const char *prefix = getenv("RECOMP_FB_DUMP");
-    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    const uint8_t *mem = (const uint8_t *) xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
     static int seq;
     char path[512];
@@ -628,8 +642,8 @@ static void dump_surface_bmp(void)
     FILE *f;
 #if defined(__linux__)
     uint8_t *staged_row;
-    if ((uint64_t)w * 3 > UINT32_MAX - 3 ||
-        (uint64_t)54 + (((uint64_t)w * 3 + 3) & ~UINT64_C(3)) * h > UINT32_MAX)
+    if ((uint64_t) w * 3 > UINT32_MAX - 3 ||
+        (uint64_t) 54 + (((uint64_t) w * 3 + 3) & ~UINT64_C(3)) * h > UINT32_MAX)
         return;
 #endif
 
@@ -645,12 +659,17 @@ static void dump_surface_bmp(void)
     if (!f)
         return;
 #if defined(__linux__)
-    staged_row = (uint8_t *)malloc((size_t)w * bpp);
-    if (!staged_row) { fclose(f); remove(path); return; }
+    staged_row = (uint8_t *) malloc((size_t) w * bpp);
+    if (!staged_row) {
+        fclose(f);
+        remove(path);
+        return;
+    }
 #endif
 
     memset(hdr, 0, sizeof hdr);
-    hdr[0] = 'B'; hdr[1] = 'M';
+    hdr[0] = 'B';
+    hdr[1] = 'M';
     memcpy(hdr + 2, &filesz, 4);
     hdr[10] = 54;
     hdr[14] = 40;
@@ -661,49 +680,51 @@ static void dump_surface_bmp(void)
     fwrite(hdr, 1, sizeof hdr, f);
 
     /* BMP rows run bottom-up. */
-    for (y = h; y-- > 0; ) {
+    for (y = h; y-- > 0;) {
 #if defined(__linux__)
-        uint64_t row_index=(uint64_t)s_gpu.clip_y+y;
-        uint64_t row_offset=(row_index<=UINT32_MAX ? row_index : 0)*s_gpu.pitch;
+        uint64_t row_index = (uint64_t) s_gpu.clip_y + y;
+        uint64_t row_offset = (row_index <= UINT32_MAX ? row_index : 0) * s_gpu.pitch;
         uint64_t address = dma_resolve(s_gpu.drawn_offset ? s_gpu.drawn_offset : s_gpu.color_offset)
-            + (row_offset<=UINT32_MAX ? row_offset : 0) + (uint64_t)s_gpu.clip_x * bpp;
-        if (row_index>UINT32_MAX || row_offset>UINT32_MAX ||
-                !pb_diagnostic_read(address, staged_row, (size_t)w * bpp)) {
-            free(staged_row); fclose(f); remove(path);
-            fprintf(stderr,"  [GPU] framebuffer dump unavailable: unreadable row %u\n",y);
+                           + (row_offset <= UINT32_MAX ? row_offset : 0) + (uint64_t) s_gpu.clip_x * bpp;
+        if (row_index > UINT32_MAX || row_offset > UINT32_MAX ||
+            !pb_diagnostic_read(address, staged_row, (size_t) w * bpp)) {
+            free(staged_row);
+            fclose(f);
+            remove(path);
+            fprintf(stderr, "  [GPU] framebuffer dump unavailable: unreadable row %u\n", y);
             return;
         }
         const uint8_t *row = staged_row;
 #else
         const uint8_t *row = mem + dma_resolve(s_gpu.drawn_offset
-                                                ? s_gpu.drawn_offset
-                                                : s_gpu.color_offset)
-                           + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch;
+                                                   ? s_gpu.drawn_offset
+                                                   : s_gpu.color_offset)
+                             + (size_t) (s_gpu.clip_y + y) * s_gpu.pitch;
 #endif
         for (x = 0; x < w; x++) {
             uint8_t bgr[3];
             if (bpp == 4) {
-                uint32_t v = ((const uint32_t *)row)[
+                uint32_t v = ((const uint32_t *) row)[
 #if defined(__linux__)
                     x
 #else
                     s_gpu.clip_x + x
 #endif
                 ];
-                bgr[0] = (uint8_t)(v);
-                bgr[1] = (uint8_t)(v >> 8);
-                bgr[2] = (uint8_t)(v >> 16);
+                bgr[0] = (uint8_t) (v);
+                bgr[1] = (uint8_t) (v >> 8);
+                bgr[2] = (uint8_t) (v >> 16);
             } else {
-                uint16_t v = ((const uint16_t *)row)[
+                uint16_t v = ((const uint16_t *) row)[
 #if defined(__linux__)
                     x
 #else
                     s_gpu.clip_x + x
 #endif
                 ];
-                bgr[0] = (uint8_t)(( v        & 0x1F) << 3);
-                bgr[1] = (uint8_t)(((v >>  5) & 0x3F) << 2);
-                bgr[2] = (uint8_t)(((v >> 11) & 0x1F) << 3);
+                bgr[0] = (uint8_t) ((v & 0x1F) << 3);
+                bgr[1] = (uint8_t) (((v >> 5) & 0x3F) << 2);
+                bgr[2] = (uint8_t) (((v >> 11) & 0x1F) << 3);
             }
             fwrite(bgr, 1, 3, f);
         }
@@ -732,19 +753,22 @@ static void raster_triangle(const float a[2], const float b[2],
 static uint32_t g_clear_rx = 0x0FFF0000u, g_clear_ry = 0x0FFF0000u;
 static uint32_t g_color_mask = 0x01010101u;
 static uint8_t *s_surface;
+
 static int surface_stage_begin(const uint8_t *mem);
+
 static int surface_stage_flush(const uint8_t *mem);
+
 static void surface_stage_reset(void);
+
 static void surface_stage_dirty(uint32_t y, uint32_t first, uint32_t end);
 
-static void clear_surface(uint32_t param)
-{
-    uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+static void clear_surface(uint32_t param) {
+    uint8_t *mem = (uint8_t *) xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
     uint32_t y, x;
 
     if (!(param & NV097_CLEAR_COLOR_MASK))
-        return;                            /* depth/stencil only */
+        return; /* depth/stencil only */
     if (!s_gpu.color_offset || !s_gpu.pitch || !s_gpu.clip_h || bpp == 0)
         return;
     {
@@ -774,34 +798,37 @@ static void clear_surface(uint32_t param)
         if (ry1 > s_gpu.clip_y + s_gpu.clip_h) ry1 = s_gpu.clip_y + s_gpu.clip_h;
         if (bpp == 4) {
             for (y = ry0; y < ry1; y++) {
-                uint32_t *p = (uint32_t *)(s_surface + (size_t)y * s_gpu.pitch);
+                uint32_t *p = (uint32_t *) (s_surface + (size_t) y * s_gpu.pitch);
                 for (x = rx0; x < rx1; x++)
                     p[x] = (p[x] & keep) | (s_gpu.clear_color & ~keep);
-                surface_stage_dirty(y,rx0,rx1);
+                surface_stage_dirty(y, rx0, rx1);
             }
             goto cleared;
         }
     }
     for (y = 0; y < s_gpu.clip_h; y++) {
-        uint8_t *row = s_surface + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch;
+        uint8_t *row = s_surface + (size_t) (s_gpu.clip_y + y) * s_gpu.pitch;
         if (bpp == 4) {
-            uint32_t *p = (uint32_t *)row + s_gpu.clip_x;
+            uint32_t *p = (uint32_t *) row + s_gpu.clip_x;
             for (x = 0; x < s_gpu.clip_w; x++)
                 p[x] = s_gpu.clear_color;
         } else if (bpp == 2) {
             /* The clear value is always given as A8R8G8B8; a 16-bit surface
              * takes the same colour reduced to 5:6:5. */
-            uint16_t v = (uint16_t)(((s_gpu.clear_color >> 8) & 0xF800)
-                                  | ((s_gpu.clear_color >> 5) & 0x07E0)
-                                  | ((s_gpu.clear_color >> 3) & 0x001F));
-            uint16_t *p = (uint16_t *)row + s_gpu.clip_x;
+            uint16_t v = (uint16_t) (((s_gpu.clear_color >> 8) & 0xF800)
+                                     | ((s_gpu.clear_color >> 5) & 0x07E0)
+                                     | ((s_gpu.clear_color >> 3) & 0x001F));
+            uint16_t *p = (uint16_t *) row + s_gpu.clip_x;
             for (x = 0; x < s_gpu.clip_w; x++)
                 p[x] = v;
         }
-        surface_stage_dirty(s_gpu.clip_y+y,s_gpu.clip_x,s_gpu.clip_x+s_gpu.clip_w);
+        surface_stage_dirty(s_gpu.clip_y + y, s_gpu.clip_x, s_gpu.clip_x + s_gpu.clip_w);
     }
 cleared:
-    if (!surface_stage_flush(mem)) { surface_stage_reset(); return; }
+    if (!surface_stage_flush(mem)) {
+        surface_stage_reset();
+        return;
+    }
     surface_stage_reset();
     s_gpu.clears++;
     /* Progress markers, interleaved with everything else in the log. The
@@ -821,7 +848,7 @@ cleared:
         if (i == n && n < 8) {
             seen[n++] = s_gpu.clear_color;
             fprintf(stderr, "  [GPU] clear colour 0x%08X -> surface 0x%08X"
-                            " (%ubpp)\n",
+                    " (%ubpp)\n",
                     s_gpu.clear_color, s_gpu.color_offset, surface_bpp());
         }
     }
@@ -845,17 +872,20 @@ cleared:
          * so a triangle drawn a single time is erased before anyone sees it. */
         if (s_gpu.clip_w && s_gpu.clip_h) {
             float a[2], b[2], c[2];
-            a[0] = s_gpu.clip_w * 0.5f; a[1] = s_gpu.clip_h * 0.15f;
-            b[0] = s_gpu.clip_w * 0.85f; b[1] = s_gpu.clip_h * 0.85f;
-            c[0] = s_gpu.clip_w * 0.15f; c[1] = s_gpu.clip_h * 0.85f;
-            raster_triangle(a, b, c, 0xFFFF00FFu, NULL);  /* magenta: never a clear colour */
+            a[0] = s_gpu.clip_w * 0.5f;
+            a[1] = s_gpu.clip_h * 0.15f;
+            b[0] = s_gpu.clip_w * 0.85f;
+            b[1] = s_gpu.clip_h * 0.85f;
+            c[0] = s_gpu.clip_w * 0.15f;
+            c[1] = s_gpu.clip_h * 0.85f;
+            raster_triangle(a, b, c, 0xFFFF00FFu, NULL); /* magenta: never a clear colour */
             surface_stage_flush(mem);
             surface_stage_reset();
             if (announced++ == 0)
-            fprintf(stderr, "  [GPU] raster self-test: triangle (%.0f,%.0f)"
-                            " (%.0f,%.0f) (%.0f,%.0f) into 0x%08X %ubpp\n",
-                    a[0], a[1], b[0], b[1], c[0], c[1],
-                    s_gpu.color_offset, surface_bpp());
+                fprintf(stderr, "  [GPU] raster self-test: triangle (%.0f,%.0f)"
+                        " (%.0f,%.0f) (%.0f,%.0f) into 0x%08X %ubpp\n",
+                        a[0], a[1], b[0], b[1], c[0], c[1],
+                        s_gpu.color_offset, surface_bpp());
         }
     }
 
@@ -931,17 +961,15 @@ cleared:
  * resolve does exactly that -- its last column and last row, 1119 pixels of
  * white on a black frame, from a rounding step at the boundary.
  */
-static uint32_t wrap_coord(uint32_t c, uint32_t size, uint32_t mode)
-{
+static uint32_t wrap_coord(uint32_t c, uint32_t size, uint32_t mode) {
     if (!size)
         return 0;
-    if (mode == 1)                         /* wrap */
+    if (mode == 1) /* wrap */
         return c % size;
-    return c >= size ? size - 1 : c;       /* clamp, and everything else */
+    return c >= size ? size - 1 : c; /* clamp, and everything else */
 }
 
-static uint32_t expand(uint32_t v, uint32_t bits)
-{
+static uint32_t expand(uint32_t v, uint32_t bits) {
     return d3d8_expand_channel(v, bits);
 }
 
@@ -952,18 +980,17 @@ static uint32_t expand(uint32_t v, uint32_t bits)
  * difference is the address calculation, and one of those lets every format
  * below serve both. Pairs read off the table in d3d8_xbox.h rather than
  * recalled -- the comment above this one is about getting exactly that wrong. */
-static uint32_t linear_twin(uint32_t fmt)
-{
+static uint32_t linear_twin(uint32_t fmt) {
     switch (fmt) {
-    case 0x00: return 0x13;                /* L8        -> LIN_L8        */
-    case 0x02: return 0x10;                /* A1R5G5B5  -> LIN_A1R5G5B5  */
-    case 0x03: return 0x1C;                /* X1R5G5B5  -> LIN_X1R5G5B5  */
-    case 0x04: return 0x1D;                /* A4R4G4B4  -> LIN_A4R4G4B4  */
-    case 0x05: return 0x11;                /* R5G6B5    -> LIN_R5G6B5    */
-    case 0x06: return 0x12;                /* A8R8G8B8  -> LIN_A8R8G8B8  */
-    case 0x07: return 0x1E;                /* X8R8G8B8  -> LIN_X8R8G8B8  */
-    case 0x19: return 0x1F;                /* A8        -> LIN_A8        */
-    default:   return fmt;                 /* already linear, or unhandled */
+        case 0x00: return 0x13; /* L8        -> LIN_L8        */
+        case 0x02: return 0x10; /* A1R5G5B5  -> LIN_A1R5G5B5  */
+        case 0x03: return 0x1C; /* X1R5G5B5  -> LIN_X1R5G5B5  */
+        case 0x04: return 0x1D; /* A4R4G4B4  -> LIN_A4R4G4B4  */
+        case 0x05: return 0x11; /* R5G6B5    -> LIN_R5G6B5    */
+        case 0x06: return 0x12; /* A8R8G8B8  -> LIN_A8R8G8B8  */
+        case 0x07: return 0x1E; /* X8R8G8B8  -> LIN_X8R8G8B8  */
+        case 0x19: return 0x1F; /* A8        -> LIN_A8        */
+        default: return fmt; /* already linear, or unhandled */
     }
 }
 
@@ -971,73 +998,97 @@ static Texture s_stage[4];
 #if defined(__linux__)
 typedef struct {
     uint8_t *pixels;
-    size_t bytes;            /* of pixels: the texture's footprint in guest RAM */
-    int owned;               /* pixels is a copy to free, not guest RAM itself */
+    size_t bytes; /* of pixels: the texture's footprint in guest RAM */
+    int owned; /* pixels is a copy to free, not guest RAM itself */
     uint32_t palette[256];
     int ready;
 } TextureSnapshot;
+
 static TextureSnapshot s_texture_snapshot[4];
 static int s_sampler_stage;
 
-static void snapshot_texture(int stage, const Texture *texture)
-{
+static void snapshot_texture(int stage, const Texture *texture) {
     TextureSnapshot *snapshot = &s_texture_snapshot[stage];
     uint64_t bytes, bpp, blocks;
     uint32_t format = linear_twin(texture->color);
     if (snapshot->owned) free(snapshot->pixels);
-    snapshot->pixels = NULL; snapshot->owned = 0; snapshot->bytes = 0; snapshot->ready = 0;
+    snapshot->pixels = NULL;
+    snapshot->owned = 0;
+    snapshot->bytes = 0;
+    snapshot->ready = 0;
     if (!texture->valid || !texture->width || !texture->height ||
-        texture->width > 65535 || texture->height > 65535) return;
+        texture->width > 65535 || texture->height > 65535)
+        return;
     blocks = d3d8_format_dxt_block_bytes(texture->color);
     if (blocks) {
-        bytes = ((uint64_t)texture->width + 3) / 4 *
-                (((uint64_t)texture->height + 3) / 4) * blocks;
+        bytes = ((uint64_t) texture->width + 3) / 4 *
+                (((uint64_t) texture->height + 3) / 4) * blocks;
     } else if (texture->color == 0x0B) {
-        bytes = (uint64_t)swizzle_offset(texture->width - 1, texture->height - 1,
-                                       texture->width, texture->height) + 1;
+        bytes = (uint64_t) swizzle_offset(texture->width - 1, texture->height - 1,
+                                          texture->width, texture->height) + 1;
     } else {
         switch (format) {
-        case 0x12: case 0x1E: case 0x3F: case 0x40: case 0x41: bpp = 4; break;
-        case 0x10: case 0x1C: case 0x11: case 0x1D: bpp = 2; break;
-        case 0x13: case 0x1F: bpp = 1; break;
-        default: return;
+            case 0x12:
+            case 0x1E:
+            case 0x3F:
+            case 0x40:
+            case 0x41: bpp = 4;
+                break;
+            case 0x10:
+            case 0x1C:
+            case 0x11:
+            case 0x1D: bpp = 2;
+                break;
+            case 0x13:
+            case 0x1F: bpp = 1;
+                break;
+            default: return;
         }
         if (d3d8_format_is_swizzled(texture->color)) {
-            bytes = ((uint64_t)swizzle_offset(texture->width - 1, texture->height - 1,
-                                            texture->width, texture->height) + 1) * bpp;
+            bytes = ((uint64_t) swizzle_offset(texture->width - 1, texture->height - 1,
+                                               texture->width, texture->height) + 1) * bpp;
         } else {
-            if ((uint64_t)texture->pitch < (uint64_t)texture->width * bpp) return;
-            bytes = ((uint64_t)texture->height - 1) * texture->pitch + texture->width * bpp;
+            if ((uint64_t) texture->pitch < (uint64_t) texture->width * bpp) return;
+            bytes = ((uint64_t) texture->height - 1) * texture->pitch + texture->width * bpp;
         }
     }
     if (!bytes || bytes > SIZE_MAX || bytes > UINT64_C(0x100000000) - texture->offset) return;
-    uintptr_t base = (uintptr_t)xbox_GetMemoryOffset();
+    uintptr_t base = (uintptr_t) xbox_GetMemoryOffset();
     if (texture->color == 0x0B &&
         (!texture->palette ||
-         !xbox_guest_memory_read(base,texture->palette,snapshot->palette,sizeof snapshot->palette)))
+         !xbox_guest_memory_read(base, texture->palette, snapshot->palette, sizeof snapshot->palette)))
         return;
-    snapshot->bytes = (size_t)bytes;
+    snapshot->bytes = (size_t) bytes;
     /* Mapped guest RAM is read in place, as on Windows; a copy per stage per
      * batch was most of a menu frame's cost on Linux. */
-    if (xbox_guest_memory_direct(base, texture->offset, (size_t)bytes, false)) {
-        snapshot->pixels = (uint8_t *)base + texture->offset;
+    if (xbox_guest_memory_direct(base, texture->offset, (size_t) bytes, false)) {
+        snapshot->pixels = (uint8_t *) base + texture->offset;
         snapshot->ready = 1;
         return;
     }
-    snapshot->pixels = malloc((size_t)bytes);
+    snapshot->pixels = malloc((size_t) bytes);
     if (!snapshot->pixels) return;
     snapshot->owned = 1;
-    if (!xbox_guest_memory_read(base,texture->offset,snapshot->pixels,(size_t)bytes)) {
-        free(snapshot->pixels); snapshot->pixels = NULL; snapshot->owned = 0; return;
+    if (!xbox_guest_memory_read(base, texture->offset, snapshot->pixels, (size_t) bytes)) {
+        free(snapshot->pixels);
+        snapshot->pixels = NULL;
+        snapshot->owned = 0;
+        return;
     }
     snapshot->ready = 1;
 }
 
-static int snapshot_textures(void)
+/* Re-read one stage's snapshot after its guest RAM changed under it (the
+ * GPU renderer downloads a render target the title samples as a texture). */
+static void xbox_texture_snapshot_refresh(int stage)
 {
+    snapshot_texture(stage, stage == 0 ? &s_gpu.tex : &s_stage[stage]);
+}
+
+static int snapshot_textures(void) {
     int valid = 1;
-    snapshot_texture(0,&s_gpu.tex);
-    for (int stage = 1; stage < 4; ++stage) snapshot_texture(stage,&s_stage[stage]);
+    snapshot_texture(0, &s_gpu.tex);
+    for (int stage = 1; stage < 4; ++stage) snapshot_texture(stage, &s_stage[stage]);
     if (s_gpu.tex.enabled && s_gpu.tex.valid && !s_texture_snapshot[0].ready) valid = 0;
     for (int stage = 1; stage < 4; ++stage)
         if (s_stage[stage].enabled && s_stage[stage].valid && !s_texture_snapshot[stage].ready) valid = 0;
@@ -1046,10 +1097,9 @@ static int snapshot_textures(void)
 }
 #endif
 
-static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
-{
+static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb) {
 #if !defined(__linux__)
-    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    const uint8_t *mem = (const uint8_t *) xbox_GetMemoryOffset();
 #endif
     const uint8_t *p;
     uint32_t fmt;
@@ -1062,7 +1112,7 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
 #else
     const uint8_t *image = mem + s_gpu.tex.offset;
 #endif
-    u = wrap_coord(u, s_gpu.tex.width,  s_gpu.tex.addr_u);
+    u = wrap_coord(u, s_gpu.tex.width, s_gpu.tex.addr_u);
     v = wrap_coord(v, s_gpu.tex.height, s_gpu.tex.addr_v);
 
     fmt = s_gpu.tex.color;
@@ -1080,7 +1130,7 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
 #if defined(__linux__)
         *argb = s_texture_snapshot[s_sampler_stage].palette[idx];
 #else
-        *argb = *(const uint32_t *)(mem + s_gpu.tex.palette + (size_t)idx * 4u);
+        *argb = *(const uint32_t *) (mem + s_gpu.tex.palette + (size_t) idx * 4u);
 #endif
         return 1;
     }
@@ -1093,86 +1143,93 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
         p = image;
         u = swizzle_offset(u, v, s_gpu.tex.width, s_gpu.tex.height);
     } else {
-        p = image + (size_t)v * s_gpu.tex.pitch;
+        p = image + (size_t) v * s_gpu.tex.pitch;
     }
 
     switch (fmt) {
+        /* 32-bit, alpha-red-green-blue in the dword. */
+        case 0x12: /* LIN_A8R8G8B8 */
+            *argb = ((const uint32_t *) p)[u];
+            return 1;
+        case 0x1E: /* LIN_X8R8G8B8 */
+            *argb = ((const uint32_t *) p)[u] | 0xFF000000u;
+            return 1;
 
-    /* 32-bit, alpha-red-green-blue in the dword. */
-    case 0x12:                                      /* LIN_A8R8G8B8 */
-        *argb = ((const uint32_t *)p)[u];
-        return 1;
-    case 0x1E:                                      /* LIN_X8R8G8B8 */
-        *argb = ((const uint32_t *)p)[u] | 0xFF000000u;
-        return 1;
+        /* 32-bit, other channel orders. The name gives the byte order from the
+         * top of the dword down, so each is a permutation of the same four. */
+        case 0x3F: {
+            /* LIN_A8B8G8R8 */
+            uint32_t t = ((const uint32_t *) p)[u];
+            *argb = (t & 0xFF00FF00u) | ((t & 0xFF) << 16) | ((t >> 16) & 0xFF);
+            return 1;
+        }
+        case 0x40: {
+            /* LIN_B8G8R8A8 */
+            uint32_t t = ((const uint32_t *) p)[u];
+            *argb = ((t & 0xFFu) << 24) /* A, from the bottom */
+                    | (((t >> 8) & 0xFFu) << 16) /* R */
+                    | (((t >> 16) & 0xFFu) << 8) /* G */
+                    | ((t >> 24) & 0xFFu); /* B, from the top */
+            return 1;
+        }
+        case 0x41: {
+            /* LIN_R8G8B8A8 */
+            uint32_t t = ((const uint32_t *) p)[u];
+            *argb = ((t & 0xFFu) << 24) | (t >> 8);
+            return 1;
+        }
 
-    /* 32-bit, other channel orders. The name gives the byte order from the
-     * top of the dword down, so each is a permutation of the same four. */
-    case 0x3F: {                                    /* LIN_A8B8G8R8 */
-        uint32_t t = ((const uint32_t *)p)[u];
-        *argb = (t & 0xFF00FF00u) | ((t & 0xFF) << 16) | ((t >> 16) & 0xFF);
-        return 1;
-    }
-    case 0x40: {                                    /* LIN_B8G8R8A8 */
-        uint32_t t = ((const uint32_t *)p)[u];
-        *argb = ((t & 0xFFu) << 24)                 /* A, from the bottom */
-              | (((t >>  8) & 0xFFu) << 16)         /* R */
-              | (((t >> 16) & 0xFFu) <<  8)         /* G */
-              |  ((t >> 24) & 0xFFu);               /* B, from the top */
-        return 1;
-    }
-    case 0x41: {                                    /* LIN_R8G8B8A8 */
-        uint32_t t = ((const uint32_t *)p)[u];
-        *argb = ((t & 0xFFu) << 24) | (t >> 8);
-        return 1;
-    }
+        /* 16-bit. */
+        case 0x10: {
+            /* LIN_A1R5G5B5 */
+            uint32_t t = ((const uint16_t *) p)[u];
+            *argb = ((t & 0x8000u) ? 0xFF000000u : 0u)
+                    | (expand((t >> 10) & 0x1F, 5) << 16)
+                    | (expand((t >> 5) & 0x1F, 5) << 8)
+                    | expand(t & 0x1F, 5);
+            return 1;
+        }
+        case 0x1C: {
+            /* LIN_X1R5G5B5 */
+            uint32_t t = ((const uint16_t *) p)[u];
+            *argb = 0xFF000000u
+                    | (expand((t >> 10) & 0x1F, 5) << 16)
+                    | (expand((t >> 5) & 0x1F, 5) << 8)
+                    | expand(t & 0x1F, 5);
+            return 1;
+        }
+        case 0x11: {
+            /* LIN_R5G6B5 */
+            uint32_t t = ((const uint16_t *) p)[u];
+            *argb = 0xFF000000u
+                    | (expand((t >> 11) & 0x1F, 5) << 16)
+                    | (expand((t >> 5) & 0x3F, 6) << 8)
+                    | expand(t & 0x1F, 5);
+            return 1;
+        }
+        case 0x1D: {
+            /* LIN_A4R4G4B4 */
+            uint32_t t = ((const uint16_t *) p)[u];
+            *argb = (expand((t >> 12) & 0x0F, 4) << 24)
+                    | (expand((t >> 8) & 0x0F, 4) << 16)
+                    | (expand((t >> 4) & 0x0F, 4) << 8)
+                    | expand(t & 0x0F, 4);
+            return 1;
+        }
 
-    /* 16-bit. */
-    case 0x10: {                                    /* LIN_A1R5G5B5 */
-        uint32_t t = ((const uint16_t *)p)[u];
-        *argb = ((t & 0x8000u) ? 0xFF000000u : 0u)
-              | (expand((t >> 10) & 0x1F, 5) << 16)
-              | (expand((t >>  5) & 0x1F, 5) <<  8)
-              |  expand( t        & 0x1F, 5);
-        return 1;
-    }
-    case 0x1C: {                                    /* LIN_X1R5G5B5 */
-        uint32_t t = ((const uint16_t *)p)[u];
-        *argb = 0xFF000000u
-              | (expand((t >> 10) & 0x1F, 5) << 16)
-              | (expand((t >>  5) & 0x1F, 5) <<  8)
-              |  expand( t        & 0x1F, 5);
-        return 1;
-    }
-    case 0x11: {                                    /* LIN_R5G6B5 */
-        uint32_t t = ((const uint16_t *)p)[u];
-        *argb = 0xFF000000u
-              | (expand((t >> 11) & 0x1F, 5) << 16)
-              | (expand((t >>  5) & 0x3F, 6) <<  8)
-              |  expand( t        & 0x1F, 5);
-        return 1;
-    }
-    case 0x1D: {                                    /* LIN_A4R4G4B4 */
-        uint32_t t = ((const uint16_t *)p)[u];
-        *argb = (expand((t >> 12) & 0x0F, 4) << 24)
-              | (expand((t >>  8) & 0x0F, 4) << 16)
-              | (expand((t >>  4) & 0x0F, 4) <<  8)
-              |  expand( t        & 0x0F, 4);
-        return 1;
-    }
+        /* 8-bit. */
+        case 0x13: {
+            /* LIN_L8 */
+            uint32_t t = p[u];
+            *argb = 0xFF000000u | (t << 16) | (t << 8) | t;
+            return 1;
+        }
+        case 0x1F: /* LIN_A8 */
+            *argb = ((uint32_t) p[u] << 24) | 0x00FFFFFFu;
+            return 1;
 
-    /* 8-bit. */
-    case 0x13: {                                    /* LIN_L8 */
-        uint32_t t = p[u];
-        *argb = 0xFF000000u | (t << 16) | (t << 8) | t;
-        return 1;
-    }
-    case 0x1F:                                      /* LIN_A8 */
-        *argb = ((uint32_t)p[u] << 24) | 0x00FFFFFFu;
-        return 1;
-
-    default:
-        return 0;
+        default:
+            return 0;
     }
 }
 
@@ -1189,8 +1246,7 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
  * black, so alpha is composited onto mid-grey to stay legible; that is a
  * viewing choice, not a decode. One file per distinct texture, first use only.
  */
-static void dump_texture_bmp(uint32_t seq)
-{
+static void dump_texture_bmp(uint32_t seq) {
     const char *prefix = getenv("RECOMP_TEX_DUMP");
     uint32_t w = s_gpu.tex.width, h = s_gpu.tex.height, x, y;
     uint32_t row_bytes, pad, filesz;
@@ -1201,7 +1257,7 @@ static void dump_texture_bmp(uint32_t seq)
     if (!prefix || !w || !h || w > 4096 || h > 4096)
         return;
 #if defined(__linux__)
-    snapshot_texture(0,&s_gpu.tex);
+    snapshot_texture(0, &s_gpu.tex);
     s_sampler_stage = 0;
     if (!s_texture_snapshot[0].ready) return;
 #endif
@@ -1216,12 +1272,15 @@ static void dump_texture_bmp(uint32_t seq)
     if (!f)
         return;
     memset(hdr, 0, sizeof hdr);
-    hdr[0] = 'B'; hdr[1] = 'M';
+    hdr[0] = 'B';
+    hdr[1] = 'M';
     memcpy(hdr + 2, &filesz, 4);
-    hdr[10] = 54; hdr[14] = 40;
+    hdr[10] = 54;
+    hdr[14] = 40;
     memcpy(hdr + 18, &w, 4);
     memcpy(hdr + 22, &h, 4);
-    hdr[26] = 1; hdr[28] = 24;
+    hdr[26] = 1;
+    hdr[28] = 24;
     fwrite(hdr, 1, sizeof hdr, f);
 
     for (y = 0; y < h; y++) {
@@ -1232,9 +1291,9 @@ static void dump_texture_bmp(uint32_t seq)
                 argb = 0;
             a = (argb >> 24) & 0xFFu;
             /* over mid-grey, so an alpha-only page is visible either way */
-            px[0] = (uint8_t)(((argb & 0xFFu) * a + 128u * (255u - a)) / 255u);
-            px[1] = (uint8_t)((((argb >> 8) & 0xFFu) * a + 128u * (255u - a)) / 255u);
-            px[2] = (uint8_t)((((argb >> 16) & 0xFFu) * a + 128u * (255u - a)) / 255u);
+            px[0] = (uint8_t) (((argb & 0xFFu) * a + 128u * (255u - a)) / 255u);
+            px[1] = (uint8_t) ((((argb >> 8) & 0xFFu) * a + 128u * (255u - a)) / 255u);
+            px[2] = (uint8_t) ((((argb >> 16) & 0xFFu) * a + 128u * (255u - a)) / 255u);
             fwrite(px, 1, 3, f);
         }
         if (pad) {
@@ -1268,148 +1327,156 @@ static uint32_t s_surface_base, s_surface_rows, s_surface_pitch, s_surface_bpp;
 static int s_surface_direct;
 #endif
 
-static void surface_stage_reset(void)
-{
+static void surface_stage_reset(void) {
 #if defined(__linux__)
     if (!s_surface_direct)
         free(s_surface);
     s_surface_direct = 0;
-    free(s_surface_first); free(s_surface_end);
-    s_surface_first=s_surface_end=NULL;
-    s_surface_rows=0;
+    free(s_surface_first);
+    free(s_surface_end);
+    s_surface_first = s_surface_end = NULL;
+    s_surface_rows = 0;
 #endif
-    s_surface=NULL;
+    s_surface = NULL;
 }
 
-static int surface_stage_begin(const uint8_t *mem)
-{
-    uint32_t base=dma_resolve(s_gpu.color_offset);
+static int surface_stage_begin(const uint8_t *mem) {
+    uint32_t base = dma_resolve(s_gpu.color_offset);
 #if defined(__linux__)
-    uint64_t right=(uint64_t)s_gpu.clip_x+s_gpu.clip_w;
-    uint64_t bottom=(uint64_t)s_gpu.clip_y+s_gpu.clip_h;
-    uint32_t bpp=surface_bpp();
-    uint64_t bytes=bottom*s_gpu.pitch;
+    uint64_t right = (uint64_t) s_gpu.clip_x + s_gpu.clip_w;
+    uint64_t bottom = (uint64_t) s_gpu.clip_y + s_gpu.clip_h;
+    uint32_t bpp = surface_bpp();
+    uint64_t bytes = bottom * s_gpu.pitch;
     uint32_t y;
     /* A bounded host allocation policy, not a guest hardware capacity claim. */
-    if (!s_gpu.clip_w || !s_gpu.clip_h || (bpp!=2 && bpp!=4) ||
-        right>65535 || bottom>65535 || right*bpp>s_gpu.pitch ||
-        bytes>64u*1024u*1024u || (uint64_t)base+bytes>UINT64_C(0x100000000) ||
-        surface_hits_image(base,(uint32_t)bytes)) return 0;
-    if (s_surface) return base==s_surface_base && bottom==s_surface_rows &&
-        s_gpu.pitch==s_surface_pitch && bpp==s_surface_bpp;
+    if (!s_gpu.clip_w || !s_gpu.clip_h || (bpp != 2 && bpp != 4) ||
+        right > 65535 || bottom > 65535 || right * bpp > s_gpu.pitch ||
+        bytes > 64u * 1024u * 1024u || (uint64_t) base + bytes > UINT64_C(0x100000000) ||
+        surface_hits_image(base, (uint32_t) bytes))
+        return 0;
+    if (s_surface)
+        return base == s_surface_base && bottom == s_surface_rows &&
+               s_gpu.pitch == s_surface_pitch && bpp == s_surface_bpp;
     /* The common case: the target is ordinary mapped guest RAM. Draw into it
      * in place, as on Windows. Staging below copies the whole target in and
      * the dirty rows back through one syscall per row, on every batch -- the
      * main cost of a menu frame on Linux before this. */
-    if (xbox_guest_memory_direct((uintptr_t)mem, base, (size_t)bytes, true)) {
-        s_surface=(uint8_t *)mem+base;
-        s_surface_direct=1;
-        s_surface_base=base; s_surface_rows=(uint32_t)bottom;
-        s_surface_pitch=s_gpu.pitch; s_surface_bpp=bpp;
+    if (xbox_guest_memory_direct((uintptr_t) mem, base, (size_t) bytes, true)) {
+        s_surface = (uint8_t *) mem + base;
+        s_surface_direct = 1;
+        s_surface_base = base;
+        s_surface_rows = (uint32_t) bottom;
+        s_surface_pitch = s_gpu.pitch;
+        s_surface_bpp = bpp;
         return 1;
     }
-    s_surface=(uint8_t *)calloc(1,(size_t)bytes);
-    s_surface_first=(uint32_t *)malloc((size_t)bottom*sizeof(uint32_t));
-    s_surface_end=(uint32_t *)calloc((size_t)bottom,sizeof(uint32_t));
-    if (!s_surface || !s_surface_first || !s_surface_end) { surface_stage_reset(); return 0; }
-    s_surface_base=base; s_surface_rows=(uint32_t)bottom;
-    s_surface_pitch=s_gpu.pitch; s_surface_bpp=bpp;
-    for (y=0;y<s_surface_rows;y++) s_surface_first[y]=UINT32_MAX;
-    for (y=s_gpu.clip_y;y<s_surface_rows;y++) {
-        size_t at=(size_t)y*s_gpu.pitch+(size_t)s_gpu.clip_x*bpp;
-        if (!xbox_guest_memory_read((uintptr_t)mem,(uint64_t)base+at,s_surface+at,
-                                   (size_t)s_gpu.clip_w*bpp)) {
-            surface_stage_reset(); return 0;
+    s_surface = (uint8_t *) calloc(1, (size_t) bytes);
+    s_surface_first = (uint32_t *) malloc((size_t) bottom * sizeof(uint32_t));
+    s_surface_end = (uint32_t *) calloc((size_t) bottom, sizeof(uint32_t));
+    if (!s_surface || !s_surface_first || !s_surface_end) {
+        surface_stage_reset();
+        return 0;
+    }
+    s_surface_base = base;
+    s_surface_rows = (uint32_t) bottom;
+    s_surface_pitch = s_gpu.pitch;
+    s_surface_bpp = bpp;
+    for (y = 0; y < s_surface_rows; y++) s_surface_first[y] = UINT32_MAX;
+    for (y = s_gpu.clip_y; y < s_surface_rows; y++) {
+        size_t at = (size_t) y * s_gpu.pitch + (size_t) s_gpu.clip_x * bpp;
+        if (!xbox_guest_memory_read((uintptr_t) mem, (uint64_t) base + at, s_surface + at,
+                                    (size_t) s_gpu.clip_w * bpp)) {
+            surface_stage_reset();
+            return 0;
         }
     }
 #else
-    if (surface_hits_image(base,(s_gpu.clip_y+s_gpu.clip_h)*s_gpu.pitch)) return 0;
-    s_surface=(uint8_t *)mem+base;
+    if (surface_hits_image(base, (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch)) return 0;
+    s_surface = (uint8_t *) mem + base;
 #endif
     return 1;
 }
 
-static void surface_stage_dirty(uint32_t y, uint32_t first, uint32_t end)
-{
+static void surface_stage_dirty(uint32_t y, uint32_t first, uint32_t end) {
 #if defined(__linux__)
-    if (!s_surface || s_surface_direct || y>=s_surface_rows || first>=end) return;
-    if (first<s_surface_first[y]) s_surface_first[y]=first;
-    if (end>s_surface_end[y]) s_surface_end[y]=end;
+    if (!s_surface || s_surface_direct || y >= s_surface_rows || first >= end) return;
+    if (first < s_surface_first[y]) s_surface_first[y] = first;
+    if (end > s_surface_end[y]) s_surface_end[y] = end;
 #else
-    (void)y; (void)first; (void)end;
+    (void) y; (void) first; (void) end;
 #endif
 }
 
-static int surface_stage_flush(const uint8_t *mem)
-{
+static int surface_stage_flush(const uint8_t *mem) {
 #if defined(__linux__)
     uint32_t y;
-    if (!s_surface || s_surface_direct) return 1;   /* drawn in place */
-    for (y=0;y<s_surface_rows;y++) if (s_surface_first[y]!=UINT32_MAX) {
-        size_t at=(size_t)y*s_surface_pitch+(size_t)s_surface_first[y]*s_surface_bpp;
-        size_t bytes=(size_t)(s_surface_end[y]-s_surface_first[y])*s_surface_bpp;
-        /* Failed writes may have transferred a prefix; never claim atomicity. */
-        if (!xbox_guest_memory_write((uintptr_t)mem,(uint64_t)s_surface_base+at,
-                                    s_surface+at,bytes)) return 0;
-    }
+    if (!s_surface || s_surface_direct) return 1; /* drawn in place */
+    for (y = 0; y < s_surface_rows; y++)
+        if (s_surface_first[y] != UINT32_MAX) {
+            size_t at = (size_t) y * s_surface_pitch + (size_t) s_surface_first[y] * s_surface_bpp;
+            size_t bytes = (size_t) (s_surface_end[y] - s_surface_first[y]) * s_surface_bpp;
+            /* Failed writes may have transferred a prefix; never claim atomicity. */
+            if (!xbox_guest_memory_write((uintptr_t) mem, (uint64_t) s_surface_base + at,
+                                         s_surface + at, bytes))
+                return 0;
+        }
 #else
-    (void)mem;
+    (void) mem;
 #endif
     return 1;
 }
 
-static int surface_begin_batch(const uint8_t *mem)
-{
+static int surface_begin_batch(const uint8_t *mem) {
     return surface_stage_begin(mem);
 }
 
-static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
-{
+static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb) {
     uint8_t *row;
 
-    (void)mem;
-    if (x < (int)s_gpu.clip_x || x >= (int)(s_gpu.clip_x + s_gpu.clip_w))
+    (void) mem;
+    if (x < (int) s_gpu.clip_x || x >= (int) (s_gpu.clip_x + s_gpu.clip_w))
         return;
-    if (y < (int)s_gpu.clip_y || y >= (int)(s_gpu.clip_y + s_gpu.clip_h))
+    if (y < (int) s_gpu.clip_y || y >= (int) (s_gpu.clip_y + s_gpu.clip_h))
         return;
     s_gpu.pixels++;
     if ((argb & 0x00FFFFFFu) > (s_gpu.pixel_max & 0x00FFFFFFu))
         s_gpu.pixel_max = argb;
-    row = s_surface + (size_t)y * s_gpu.pitch;
+    row = s_surface + (size_t) y * s_gpu.pitch;
     if (bpp == 4) {
-        ((uint32_t *)row)[x] = argb;
+        ((uint32_t *) row)[x] = argb;
     } else if (bpp == 2) {
-        ((uint16_t *)row)[x] = (uint16_t)(((argb >> 8) & 0xF800)
-                                        | ((argb >> 5) & 0x07E0)
-                                        | ((argb >> 3) & 0x001F));
+        ((uint16_t *) row)[x] = (uint16_t) (((argb >> 8) & 0xF800)
+                                            | ((argb >> 5) & 0x07E0)
+                                            | ((argb >> 3) & 0x001F));
     }
-    surface_stage_dirty((uint32_t)y,(uint32_t)x,(uint32_t)x+1);
+    surface_stage_dirty((uint32_t) y, (uint32_t) x, (uint32_t) x + 1);
 }
 
 /* One blend factor, per channel, for source s and destination d (0..255,
  * index 3 is alpha). GL enum values, which is what the NV2A takes. */
-static uint32_t blend_factor(uint32_t f, const uint32_t s[4], const uint32_t d[4], int ch)
-{
+static uint32_t blend_factor(uint32_t f, const uint32_t s[4], const uint32_t d[4], int ch) {
     uint32_t k[4];
-    k[0] = (s_gpu.blend_color >> 16) & 0xFF; k[1] = (s_gpu.blend_color >> 8) & 0xFF;
-    k[2] = s_gpu.blend_color & 0xFF;         k[3] = s_gpu.blend_color >> 24;
+    k[0] = (s_gpu.blend_color >> 16) & 0xFF;
+    k[1] = (s_gpu.blend_color >> 8) & 0xFF;
+    k[2] = s_gpu.blend_color & 0xFF;
+    k[3] = s_gpu.blend_color >> 24;
     switch (f) {
-    case 0x0000: return 0;
-    case 0x0001: return 255;
-    case 0x0300: return s[ch];
-    case 0x0301: return 255 - s[ch];
-    case 0x0302: return s[3];
-    case 0x0303: return 255 - s[3];
-    case 0x0304: return d[3];
-    case 0x0305: return 255 - d[3];
-    case 0x0306: return d[ch];
-    case 0x0307: return 255 - d[ch];
-    case 0x0308: return ch == 3 ? 255 : (s[3] < 255 - d[3] ? s[3] : 255 - d[3]);
-    case 0x8001: return k[ch];
-    case 0x8002: return 255 - k[ch];
-    case 0x8003: return k[3];
-    case 0x8004: return 255 - k[3];
-    default:     return 255;
+        case 0x0000: return 0;
+        case 0x0001: return 255;
+        case 0x0300: return s[ch];
+        case 0x0301: return 255 - s[ch];
+        case 0x0302: return s[3];
+        case 0x0303: return 255 - s[3];
+        case 0x0304: return d[3];
+        case 0x0305: return 255 - d[3];
+        case 0x0306: return d[ch];
+        case 0x0307: return 255 - d[ch];
+        case 0x0308: return ch == 3 ? 255 : (s[3] < 255 - d[3] ? s[3] : 255 - d[3]);
+        case 0x8001: return k[ch];
+        case 0x8002: return 255 - k[ch];
+        case 0x8003: return k[3];
+        case 0x8004: return 255 - k[3];
+        default: return 255;
     }
 }
 
@@ -1420,62 +1487,80 @@ static uint32_t blend_factor(uint32_t f, const uint32_t s[4], const uint32_t d[4
  * (a fade, alpha from the vertex colour) and the movie vanished under flat
  * grey. The colour is texture MODULATE diffuse -- D3D's default stage 0 op,
  * and the identity for the white-vertex quads that were already right. */
-static void shade_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t src)
-{
+static void shade_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t src) {
     uint32_t a = src >> 24;
 
     if (s_gpu.alpha_test) {
         uint32_t r = s_gpu.alpha_ref;
         int pass;
         switch (s_gpu.alpha_func) {
-        case 0x0200: pass = 0; break;              /* NEVER    */
-        case 0x0201: pass = a <  r; break;          /* LESS     */
-        case 0x0202: pass = a == r; break;          /* EQUAL    */
-        case 0x0203: pass = a <= r; break;          /* LEQUAL   */
-        case 0x0204: pass = a >  r; break;          /* GREATER  */
-        case 0x0205: pass = a != r; break;          /* NOTEQUAL */
-        case 0x0206: pass = a >= r; break;          /* GEQUAL   */
-        default:     pass = 1; break;               /* ALWAYS   */
+            case 0x0200: pass = 0;
+                break; /* NEVER    */
+            case 0x0201: pass = a < r;
+                break; /* LESS     */
+            case 0x0202: pass = a == r;
+                break; /* EQUAL    */
+            case 0x0203: pass = a <= r;
+                break; /* LEQUAL   */
+            case 0x0204: pass = a > r;
+                break; /* GREATER  */
+            case 0x0205: pass = a != r;
+                break; /* NOTEQUAL */
+            case 0x0206: pass = a >= r;
+                break; /* GEQUAL   */
+            default: pass = 1;
+                break; /* ALWAYS   */
         }
         if (!pass)
             return;
     }
     if (s_gpu.blend && bpp == 4
-            && x >= (int)s_gpu.clip_x && x < (int)(s_gpu.clip_x + s_gpu.clip_w)
-            && y >= (int)s_gpu.clip_y && y < (int)(s_gpu.clip_y + s_gpu.clip_h)) {
-        uint32_t dst = ((uint32_t *)(s_surface + (size_t)y * s_gpu.pitch))[x];
+        && x >= (int) s_gpu.clip_x && x < (int) (s_gpu.clip_x + s_gpu.clip_w)
+        && y >= (int) s_gpu.clip_y && y < (int) (s_gpu.clip_y + s_gpu.clip_h)) {
+        uint32_t dst = ((uint32_t *) (s_surface + (size_t) y * s_gpu.pitch))[x];
         uint32_t sv[4], dv[4], out = 0;
         int ch;
-        sv[0] = (src >> 16) & 0xFF; sv[1] = (src >> 8) & 0xFF; sv[2] = src & 0xFF; sv[3] = a;
-        dv[0] = (dst >> 16) & 0xFF; dv[1] = (dst >> 8) & 0xFF; dv[2] = dst & 0xFF; dv[3] = dst >> 24;
+        sv[0] = (src >> 16) & 0xFF;
+        sv[1] = (src >> 8) & 0xFF;
+        sv[2] = src & 0xFF;
+        sv[3] = a;
+        dv[0] = (dst >> 16) & 0xFF;
+        dv[1] = (dst >> 8) & 0xFF;
+        dv[2] = dst & 0xFF;
+        dv[3] = dst >> 24;
         for (ch = 0; ch < 4; ch++) {
-            int32_t sp = (int32_t)(sv[ch] * blend_factor(s_gpu.blend_sf, sv, dv, ch) / 255);
-            int32_t dp = (int32_t)(dv[ch] * blend_factor(s_gpu.blend_df, sv, dv, ch) / 255);
+            int32_t sp = (int32_t) (sv[ch] * blend_factor(s_gpu.blend_sf, sv, dv, ch) / 255);
+            int32_t dp = (int32_t) (dv[ch] * blend_factor(s_gpu.blend_df, sv, dv, ch) / 255);
             int32_t v;
             switch (s_gpu.blend_eq) {
-            case 0x800A: v = sp - dp; break;                     /* SUBTRACT     */
-            case 0x800B: v = dp - sp; break;                     /* REV_SUBTRACT */
-            case 0x8007: v = sv[ch] < dv[ch] ? sv[ch] : dv[ch]; break; /* MIN */
-            case 0x8008: v = sv[ch] > dv[ch] ? sv[ch] : dv[ch]; break; /* MAX */
-            default:     v = sp + dp; break;                     /* ADD          */
+                case 0x800A: v = sp - dp;
+                    break; /* SUBTRACT     */
+                case 0x800B: v = dp - sp;
+                    break; /* REV_SUBTRACT */
+                case 0x8007: v = sv[ch] < dv[ch] ? sv[ch] : dv[ch];
+                    break; /* MIN */
+                case 0x8008: v = sv[ch] > dv[ch] ? sv[ch] : dv[ch];
+                    break; /* MAX */
+                default: v = sp + dp;
+                    break; /* ADD          */
             }
             if (v < 0) v = 0;
             if (v > 255) v = 255;
-            out |= (uint32_t)v << (ch == 3 ? 24 : 16 - 8 * ch);
+            out |= (uint32_t) v << (ch == 3 ? 24 : 16 - 8 * ch);
         }
         src = out;
     }
     /* SET_COLOR_MASK: channels with their write-enable cleared keep what the
      * surface already holds. */
     if (g_color_mask != 0x01010101u && bpp == 4
-            && x >= (int)s_gpu.clip_x && x < (int)(s_gpu.clip_x + s_gpu.clip_w)
-            && y >= (int)s_gpu.clip_y && y < (int)(s_gpu.clip_y + s_gpu.clip_h)) {
-        uint32_t dst = ((uint32_t *)(s_surface + (size_t)y * s_gpu.pitch))[x];
+        && x >= (int) s_gpu.clip_x && x < (int) (s_gpu.clip_x + s_gpu.clip_w)
+        && y >= (int) s_gpu.clip_y && y < (int) (s_gpu.clip_y + s_gpu.clip_h)) {
+        uint32_t dst = ((uint32_t *) (s_surface + (size_t) y * s_gpu.pitch))[x];
         uint32_t keep = 0;
-        if (!(g_color_mask & 0x00000001u)) keep |= 0x000000FFu;   /* blue  */
-        if (!(g_color_mask & 0x00000100u)) keep |= 0x0000FF00u;   /* green */
-        if (!(g_color_mask & 0x00010000u)) keep |= 0x00FF0000u;   /* red   */
-        if (!(g_color_mask & 0x01000000u)) keep |= 0xFF000000u;   /* alpha */
+        if (!(g_color_mask & 0x00000001u)) keep |= 0x000000FFu; /* blue  */
+        if (!(g_color_mask & 0x00000100u)) keep |= 0x0000FF00u; /* green */
+        if (!(g_color_mask & 0x00010000u)) keep |= 0x00FF0000u; /* red   */
+        if (!(g_color_mask & 0x01000000u)) keep |= 0xFF000000u; /* alpha */
         if (keep == 0xFFFFFFFFu)
             return;
         src = (dst & keep) | (src & ~keep);
@@ -1483,8 +1568,7 @@ static void shade_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t src)
     put_pixel(mem, bpp, x, y, src);
 }
 
-static uint32_t modulate(uint32_t t, uint32_t c)
-{
+static uint32_t modulate(uint32_t t, uint32_t c) {
     uint32_t out = 0;
     int sh;
     for (sh = 0; sh < 32; sh += 8)
@@ -1497,9 +1581,8 @@ static uint32_t modulate(uint32_t t, uint32_t c)
  * triangles does not silently render nothing. */
 static void raster_triangle(const float a[2], const float b[2],
                             const float c[2], uint32_t argb,
-                            const float uv[3][2])
-{
-    uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+                            const float uv[3][2]) {
+    uint8_t *mem = (uint8_t *) xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
     float area;
     int minx, maxx, miny, maxy, x, y;
@@ -1510,7 +1593,7 @@ static void raster_triangle(const float a[2], const float b[2],
 
     area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
     if (area == 0.0f)
-        return;                            /* degenerate */
+        return; /* degenerate */
 
     /* Where this batch writes. The same check the per-pixel path made, made
      * once: a surface address landing on the title's own image is no safer
@@ -1518,15 +1601,15 @@ static void raster_triangle(const float a[2], const float b[2],
     if (!surface_begin_batch(mem))
         return;
 
-    minx = (int)floorf(fminf(a[0], fminf(b[0], c[0])));
-    maxx = (int)ceilf (fmaxf(a[0], fmaxf(b[0], c[0])));
-    miny = (int)floorf(fminf(a[1], fminf(b[1], c[1])));
-    maxy = (int)ceilf (fmaxf(a[1], fmaxf(b[1], c[1])));
+    minx = (int) floorf(fminf(a[0], fminf(b[0], c[0])));
+    maxx = (int) ceilf(fmaxf(a[0], fmaxf(b[0], c[0])));
+    miny = (int) floorf(fminf(a[1], fminf(b[1], c[1])));
+    maxy = (int) ceilf(fmaxf(a[1], fmaxf(b[1], c[1])));
 
-    if (minx < (int)s_gpu.clip_x) minx = (int)s_gpu.clip_x;
-    if (miny < (int)s_gpu.clip_y) miny = (int)s_gpu.clip_y;
-    if (maxx > (int)(s_gpu.clip_x + s_gpu.clip_w)) maxx = (int)(s_gpu.clip_x + s_gpu.clip_w);
-    if (maxy > (int)(s_gpu.clip_y + s_gpu.clip_h)) maxy = (int)(s_gpu.clip_y + s_gpu.clip_h);
+    if (minx < (int) s_gpu.clip_x) minx = (int) s_gpu.clip_x;
+    if (miny < (int) s_gpu.clip_y) miny = (int) s_gpu.clip_y;
+    if (maxx > (int) (s_gpu.clip_x + s_gpu.clip_w)) maxx = (int) (s_gpu.clip_x + s_gpu.clip_w);
+    if (maxy > (int) (s_gpu.clip_y + s_gpu.clip_h)) maxy = (int) (s_gpu.clip_y + s_gpu.clip_h);
     if (minx >= maxx || miny >= maxy) {
         s_gpu.tris_skipped_offscreen++;
         return;
@@ -1534,12 +1617,12 @@ static void raster_triangle(const float a[2], const float b[2],
 
     for (y = miny; y < maxy; y++) {
         for (x = minx; x < maxx; x++) {
-            float px = (float)x + 0.5f, py = (float)y + 0.5f;
+            float px = (float) x + 0.5f, py = (float) y + 0.5f;
             float w0 = (b[0] - a[0]) * (py - a[1]) - (b[1] - a[1]) * (px - a[0]);
             float w1 = (c[0] - b[0]) * (py - b[1]) - (c[1] - b[1]) * (px - b[0]);
             float w2 = (a[0] - c[0]) * (py - c[1]) - (a[1] - c[1]) * (px - c[0]);
             if (!((w0 >= 0 && w1 >= 0 && w2 >= 0)
-               || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
+                  || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
                 continue;
             if (textured) {
                 /* Barycentric, straight from the edge functions already
@@ -1554,7 +1637,7 @@ static void raster_triangle(const float a[2], const float b[2],
                 float sv = (w1 * uv[0][1] + w2 * uv[1][1] + w0 * uv[2][1]) / area;
                 if (su < 0.0f) su = 0.0f;
                 if (sv < 0.0f) sv = 0.0f;
-                if (sample_texture((uint32_t)su, (uint32_t)sv, &texel)) {
+                if (sample_texture((uint32_t) su, (uint32_t) sv, &texel)) {
                     shade_pixel(mem, bpp, x, y, modulate(texel, argb));
                     continue;
                 }
@@ -1576,15 +1659,14 @@ static void raster_triangle(const float a[2], const float b[2],
  * at stride 24, and the colour arrives in slot 5. So fall back to the format
  * rather than the slot number -- D3DCOLOR is the one attribute type that is
  * only ever a colour, which makes it a stronger signal than the convention. */
-static const VertexAttr *color_attr(void)
-{
+static const VertexAttr *color_attr(void) {
     uint32_t a;
 
     if (s_gpu.attr[3].offset && s_gpu.attr[3].stride)
         return &s_gpu.attr[3];
     for (a = 0; a < NV_VERTEX_ATTRS; a++)
         if (s_gpu.attr[a].type == 0 && s_gpu.attr[a].size == 4
-                && s_gpu.attr[a].offset && s_gpu.attr[a].stride)
+            && s_gpu.attr[a].offset && s_gpu.attr[a].stride)
             return &s_gpu.attr[a];
     return &s_gpu.attr[3];
 }
@@ -1607,15 +1689,14 @@ static const VertexAttr *color_attr(void)
  * ponytail: takes the first float2 it finds, so a title with two texcoord sets
  * gets stage 0's -- which is what this single-texture rasteriser samples
  * anyway. Multi-texture wants the D3D11 translator, not another heuristic. */
-static const VertexAttr *texcoord_attr(void)
-{
+static const VertexAttr *texcoord_attr(void) {
     uint32_t a;
 
     if (s_gpu.attr[9].offset && s_gpu.attr[9].stride)
         return &s_gpu.attr[9];
     for (a = 0; a < NV_VERTEX_ATTRS; a++)
         if (s_gpu.attr[a].type == 2 && s_gpu.attr[a].size == 2
-                && s_gpu.attr[a].offset && s_gpu.attr[a].stride)
+            && s_gpu.attr[a].offset && s_gpu.attr[a].stride)
             return &s_gpu.attr[a];
     return &s_gpu.attr[9];
 }
@@ -1632,8 +1713,7 @@ static const VertexAttr *texcoord_attr(void)
  * below 1.0, so a whole quad sampled a single texel and came out flat: the
  * background painted one near-black colour, which looks like a texture that
  * decoded wrong rather than one that was never indexed. */
-static int fetch_texcoord(uint32_t index, float out[2])
-{
+static int fetch_texcoord(uint32_t index, float out[2]) {
     float t[4];
 
     if (!fetch_attr(texcoord_attr(), index, t))
@@ -1641,22 +1721,21 @@ static int fetch_texcoord(uint32_t index, float out[2])
     out[0] = t[0];
     out[1] = t[1];
     if (tex_size_from_format(s_gpu.tex.color)) {
-        out[0] *= (float)s_gpu.tex.width;
-        out[1] *= (float)s_gpu.tex.height;
+        out[0] *= (float) s_gpu.tex.width;
+        out[1] *= (float) s_gpu.tex.height;
     }
     return 1;
 }
 
-static uint32_t vertex_color(uint32_t index)
-{
+static uint32_t vertex_color(uint32_t index) {
     float c[4];
 
     if (!fetch_attr(color_attr(), index, c))
         return 0xFFFFFFFFu;
-    return ((uint32_t)(c[3] * 255.0f) << 24)
-         | ((uint32_t)(c[0] * 255.0f) << 16)
-         | ((uint32_t)(c[1] * 255.0f) <<  8)
-         |  (uint32_t)(c[2] * 255.0f);
+    return ((uint32_t) (c[3] * 255.0f) << 24)
+           | ((uint32_t) (c[0] * 255.0f) << 16)
+           | ((uint32_t) (c[1] * 255.0f) << 8)
+           | (uint32_t) (c[2] * 255.0f);
 }
 
 /* An untransformed batch drawn as if it were screen space smears a few pixels
@@ -1680,8 +1759,7 @@ static uint32_t vertex_color(uint32_t index)
  */
 #define OBJECT_SPACE_SPAN 8.0f
 
-static int batch_is_screen_space(void)
-{
+static int batch_is_screen_space(void) {
     float p[4], lo_x, hi_x, lo_y, hi_y;
     uint32_t i;
 
@@ -1701,10 +1779,10 @@ static int batch_is_screen_space(void)
     }
 
     /* Entirely off the surface: nothing to draw under either reading. */
-    if (hi_x < (float)s_gpu.clip_x
-     || lo_x > (float)(s_gpu.clip_x + s_gpu.clip_w)
-     || hi_y < (float)s_gpu.clip_y
-     || lo_y > (float)(s_gpu.clip_y + s_gpu.clip_h))
+    if (hi_x < (float) s_gpu.clip_x
+        || lo_x > (float) (s_gpu.clip_x + s_gpu.clip_w)
+        || hi_y < (float) s_gpu.clip_y
+        || lo_y > (float) (s_gpu.clip_y + s_gpu.clip_h))
         return 0;
 
     /* Small enough to be model units rather than pixels. */
@@ -1740,22 +1818,21 @@ static void dump_surface_bmp(void);
  * a batch whose texcoords cannot be read is drawn untextured rather than not
  * at all, so a missing coordinate stream costs the colour and not the shape.
  */
-static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
-{
+static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb) {
     float p[3][4], uv[3][2];
     int textured;
 
     if (!fetch_attr(&s_gpu.attr[0], i0, p[0])
-     || !fetch_attr(&s_gpu.attr[0], i1, p[1])
-     || !fetch_attr(&s_gpu.attr[0], i2, p[2]))
+        || !fetch_attr(&s_gpu.attr[0], i1, p[1])
+        || !fetch_attr(&s_gpu.attr[0], i2, p[2]))
         return;
 
     textured = fetch_texcoord(i0, uv[0])
-            && fetch_texcoord(i1, uv[1])
-            && fetch_texcoord(i2, uv[2]);
+               && fetch_texcoord(i1, uv[1])
+               && fetch_texcoord(i2, uv[2]);
 
     raster_triangle(p[0], p[1], p[2], argb,
-                    textured ? (const float (*)[2])uv : NULL);
+                    textured ? (const float (*)[2]) uv : NULL);
 }
 
 /* The triangles of the current batch, in draw order, each with the colour
@@ -1764,58 +1841,55 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
  * triangles. Points and lines produce none. */
 typedef void (*BatchTriFn)(void *ctx, uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb);
 
-static void batch_triangles(BatchTriFn emit, void *ctx)
-{
+static void batch_triangles(BatchTriFn emit, void *ctx) {
     uint32_t i;
     switch (s_gpu.prim) {
-    case NV_PRIM_TRIANGLES:
-        for (i = 0; i + 2 < s_gpu.idx_count; i += 3)
-            emit(ctx, s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2],
-                           vertex_color(s_gpu.idx[i]));
-        break;
-    case NV_PRIM_TRIANGLE_STRIP:
-        for (i = 0; i + 2 < s_gpu.idx_count; i++)
-            emit(ctx, s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2],
-                           vertex_color(s_gpu.idx[i]));
-        break;
-    case NV_PRIM_TRIANGLE_FAN:
-    case NV_PRIM_POLYGON:
-        for (i = 1; i + 1 < s_gpu.idx_count; i++)
-            emit(ctx, s_gpu.idx[0], s_gpu.idx[i], s_gpu.idx[i+1],
-                           vertex_color(s_gpu.idx[0]));
-        break;
-    case NV_PRIM_QUADS:
-        /* Each group of four is its own quad: two triangles around its first
-         * vertex. */
-        for (i = 0; i + 3 < s_gpu.idx_count; i += 4) {
-            emit(ctx, s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2],
-                           vertex_color(s_gpu.idx[i]));
-            emit(ctx, s_gpu.idx[i], s_gpu.idx[i+2], s_gpu.idx[i+3],
-                           vertex_color(s_gpu.idx[i]));
-        }
-        break;
-    case NV_PRIM_QUAD_STRIP:
-        /* Vertices pair up; each new pair closes a quad with the previous. */
-        for (i = 0; i + 3 < s_gpu.idx_count; i += 2) {
-            emit(ctx, s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+3],
-                           vertex_color(s_gpu.idx[i]));
-            emit(ctx, s_gpu.idx[i], s_gpu.idx[i+3], s_gpu.idx[i+2],
-                           vertex_color(s_gpu.idx[i]));
-        }
-        break;
-    default:
-        break;                             /* points and lines: not yet */
+        case NV_PRIM_TRIANGLES:
+            for (i = 0; i + 2 < s_gpu.idx_count; i += 3)
+                emit(ctx, s_gpu.idx[i], s_gpu.idx[i + 1], s_gpu.idx[i + 2],
+                     vertex_color(s_gpu.idx[i]));
+            break;
+        case NV_PRIM_TRIANGLE_STRIP:
+            for (i = 0; i + 2 < s_gpu.idx_count; i++)
+                emit(ctx, s_gpu.idx[i], s_gpu.idx[i + 1], s_gpu.idx[i + 2],
+                     vertex_color(s_gpu.idx[i]));
+            break;
+        case NV_PRIM_TRIANGLE_FAN:
+        case NV_PRIM_POLYGON:
+            for (i = 1; i + 1 < s_gpu.idx_count; i++)
+                emit(ctx, s_gpu.idx[0], s_gpu.idx[i], s_gpu.idx[i + 1],
+                     vertex_color(s_gpu.idx[0]));
+            break;
+        case NV_PRIM_QUADS:
+            /* Each group of four is its own quad: two triangles around its first
+             * vertex. */
+            for (i = 0; i + 3 < s_gpu.idx_count; i += 4) {
+                emit(ctx, s_gpu.idx[i], s_gpu.idx[i + 1], s_gpu.idx[i + 2],
+                     vertex_color(s_gpu.idx[i]));
+                emit(ctx, s_gpu.idx[i], s_gpu.idx[i + 2], s_gpu.idx[i + 3],
+                     vertex_color(s_gpu.idx[i]));
+            }
+            break;
+        case NV_PRIM_QUAD_STRIP:
+            /* Vertices pair up; each new pair closes a quad with the previous. */
+            for (i = 0; i + 3 < s_gpu.idx_count; i += 2) {
+                emit(ctx, s_gpu.idx[i], s_gpu.idx[i + 1], s_gpu.idx[i + 3],
+                     vertex_color(s_gpu.idx[i]));
+                emit(ctx, s_gpu.idx[i], s_gpu.idx[i + 3], s_gpu.idx[i + 2],
+                     vertex_color(s_gpu.idx[i]));
+            }
+            break;
+        default:
+            break; /* points and lines: not yet */
     }
 }
 
-static void raster_indexed_cb(void *ctx, uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
-{
-    (void)ctx;
+static void raster_indexed_cb(void *ctx, uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb) {
+    (void) ctx;
     raster_indexed(i0, i1, i2, argb);
 }
 
-static void raster_batch(void)
-{
+static void raster_batch(void) {
     uint32_t before = s_gpu.tris_drawn;
 
     if (s_gpu.idx_count < 3)
@@ -1866,8 +1940,7 @@ static void raster_batch(void)
  * (lightmaps, detail and environment maps on 3D scenes). Same registers
  * as stage 0, 0x40 apart. */
 
-static void stage_method(uint32_t method, uint32_t param)
-{
+static void stage_method(uint32_t method, uint32_t param) {
     uint32_t st = (method - NV097_SET_TEXTURE_OFFSET) >> 6;
     uint32_t reg = (method - NV097_SET_TEXTURE_OFFSET) & 0x3F;
     Texture *t;
@@ -1876,29 +1949,36 @@ static void stage_method(uint32_t method, uint32_t param)
         return;
     t = &s_stage[st];
     switch (reg) {
-    case 0x00: t->offset = dma_resolve(param); break;
-    case 0x04:
-        t->color = (param >> 8) & 0xFF;
-        if (tex_size_from_format(t->color)) {
-            t->width  = 1u << ((param >> 20) & 0xF);
-            t->height = 1u << ((param >> 24) & 0xF);
-        }
-        break;
-    case 0x08: t->addr_u = param & 0xF; t->addr_v = (param >> 8) & 0xF; break;
-    case 0x0C: t->enabled = (param >> 30) & 1; break;
-    case 0x10: t->pitch = param >> 16; break;
-    case 0x1C: t->width = param >> 16; t->height = param & 0xFFFF; break;
-    case 0x20: t->palette = dma_resolve(param & ~0x3Fu); break;
-    default: break;
+        case 0x00: t->offset = dma_resolve(param);
+            break;
+        case 0x04:
+            t->color = (param >> 8) & 0xFF;
+            if (tex_size_from_format(t->color)) {
+                t->width = 1u << ((param >> 20) & 0xF);
+                t->height = 1u << ((param >> 24) & 0xF);
+            }
+            break;
+        case 0x08: t->addr_u = param & 0xF;
+            t->addr_v = (param >> 8) & 0xF;
+            break;
+        case 0x0C: t->enabled = (param >> 30) & 1;
+            break;
+        case 0x10: t->pitch = param >> 16;
+            break;
+        case 0x1C: t->width = param >> 16;
+            t->height = param & 0xFFFF;
+            break;
+        case 0x20: t->palette = dma_resolve(param & ~0x3Fu);
+            break;
+        default: break;
     }
     t->valid = t->offset && t->width && t->height
-            && (tex_size_from_format(t->color) || t->pitch);
+               && (tex_size_from_format(t->color) || t->pitch);
 }
 
 /* Sample another stage through the stage-0 sampler. The sampler reads
  * s_gpu.tex throughout, so swap it in for the call. */
-static int sample_stage(int st, uint32_t u, uint32_t v, uint32_t *argb)
-{
+static int sample_stage(int st, uint32_t u, uint32_t v, uint32_t *argb) {
     Texture saved;
     int r;
     if (st == 0)
@@ -1952,25 +2032,30 @@ static struct {
     uint32_t color_icw[8], color_ocw[8], alpha_icw[8], alpha_ocw[8];
     uint32_t factor0[8], factor1[8], specfog[2];
     uint32_t final0, final1, control, stage_prog, shaderctl;
-    int      set;
+    int set;
 } s_comb;
 
-static int comb_method(uint32_t method, uint32_t param)
-{
+static int comb_method(uint32_t method, uint32_t param) {
     uint32_t *arr = NULL, base = 0;
 
     if (method >= NV097_SET_COMBINER_ALPHA_ICW && method < NV097_SET_COMBINER_ALPHA_ICW + 32) {
-        arr = s_comb.alpha_icw; base = NV097_SET_COMBINER_ALPHA_ICW;
+        arr = s_comb.alpha_icw;
+        base = NV097_SET_COMBINER_ALPHA_ICW;
     } else if (method >= NV097_SET_COMBINER_FACTOR0 && method < NV097_SET_COMBINER_FACTOR0 + 32) {
-        arr = s_comb.factor0; base = NV097_SET_COMBINER_FACTOR0;
+        arr = s_comb.factor0;
+        base = NV097_SET_COMBINER_FACTOR0;
     } else if (method >= NV097_SET_COMBINER_FACTOR1 && method < NV097_SET_COMBINER_FACTOR1 + 32) {
-        arr = s_comb.factor1; base = NV097_SET_COMBINER_FACTOR1;
+        arr = s_comb.factor1;
+        base = NV097_SET_COMBINER_FACTOR1;
     } else if (method >= NV097_SET_COMBINER_ALPHA_OCW && method < NV097_SET_COMBINER_ALPHA_OCW + 32) {
-        arr = s_comb.alpha_ocw; base = NV097_SET_COMBINER_ALPHA_OCW;
+        arr = s_comb.alpha_ocw;
+        base = NV097_SET_COMBINER_ALPHA_OCW;
     } else if (method >= NV097_SET_COMBINER_COLOR_ICW && method < NV097_SET_COMBINER_COLOR_ICW + 32) {
-        arr = s_comb.color_icw; base = NV097_SET_COMBINER_COLOR_ICW;
+        arr = s_comb.color_icw;
+        base = NV097_SET_COMBINER_COLOR_ICW;
     } else if (method >= NV097_SET_COMBINER_COLOR_OCW && method < NV097_SET_COMBINER_COLOR_OCW + 32) {
-        arr = s_comb.color_ocw; base = NV097_SET_COMBINER_COLOR_OCW;
+        arr = s_comb.color_ocw;
+        base = NV097_SET_COMBINER_COLOR_OCW;
     }
     if (arr) {
         arr[(method - base) / 4] = param;
@@ -1978,37 +2063,43 @@ static int comb_method(uint32_t method, uint32_t param)
         return 1;
     }
     switch (method) {
-    case NV097_SET_COMBINER_SPECULAR_FOG_CW0: s_comb.final0 = param; return 1;
-    case NV097_SET_COMBINER_SPECULAR_FOG_CW1: s_comb.final1 = param; return 1;
-    case NV097_SET_SPECULAR_FOG_FACTOR:       s_comb.specfog[0] = param; return 1;
-    case NV097_SET_SPECULAR_FOG_FACTOR + 4:   s_comb.specfog[1] = param; return 1;
-    case NV097_SET_COMBINER_CONTROL:          s_comb.control = param; s_comb.set = 1; return 1;
-    case NV097_SET_SHADER_STAGE_PROGRAM:      s_comb.stage_prog = param; return 1;
-    /* NV_PGRAPH_SHADERCTL: dot mappings (bits 0-11) and each stage's input
-     * stage (bits 16-27), for the dot-product texture modes (xemu). */
-    case 0x1E74: s_comb.shaderctl = (s_comb.shaderctl & ~0xFFFu) | (param & 0xFFFu); return 1;
-    case 0x1E78: s_comb.shaderctl = (s_comb.shaderctl & ~0xFFFF000u) | (param & 0xFFFF000u); return 1;
-    default: return 0;
+        case NV097_SET_COMBINER_SPECULAR_FOG_CW0: s_comb.final0 = param;
+            return 1;
+        case NV097_SET_COMBINER_SPECULAR_FOG_CW1: s_comb.final1 = param;
+            return 1;
+        case NV097_SET_SPECULAR_FOG_FACTOR: s_comb.specfog[0] = param;
+            return 1;
+        case NV097_SET_SPECULAR_FOG_FACTOR + 4: s_comb.specfog[1] = param;
+            return 1;
+        case NV097_SET_COMBINER_CONTROL: s_comb.control = param;
+            s_comb.set = 1;
+            return 1;
+        case NV097_SET_SHADER_STAGE_PROGRAM: s_comb.stage_prog = param;
+            return 1;
+        /* NV_PGRAPH_SHADERCTL: dot mappings (bits 0-11) and each stage's input
+         * stage (bits 16-27), for the dot-product texture modes (xemu). */
+        case 0x1E74: s_comb.shaderctl = (s_comb.shaderctl & ~0xFFFu) | (param & 0xFFFu);
+            return 1;
+        case 0x1E78: s_comb.shaderctl = (s_comb.shaderctl & ~0xFFFF000u) | (param & 0xFFFF000u);
+            return 1;
+        default: return 0;
     }
 }
 
-static int comb_active(void)
-{
+static int comb_active(void) {
     return s_comb.set && (s_comb.control & 0xFF);
 }
 
-static void comb_unpack(uint32_t c, float v[4])
-{
-    v[0] = (float)((c >> 16) & 0xFF) / 255.0f;
-    v[1] = (float)((c >> 8) & 0xFF) / 255.0f;
-    v[2] = (float)(c & 0xFF) / 255.0f;
-    v[3] = (float)(c >> 24) / 255.0f;
+static void comb_unpack(uint32_t c, float v[4]) {
+    v[0] = (float) ((c >> 16) & 0xFF) / 255.0f;
+    v[1] = (float) ((c >> 8) & 0xFF) / 255.0f;
+    v[2] = (float) (c & 0xFF) / 255.0f;
+    v[3] = (float) (c >> 24) / 255.0f;
 }
 
 /* One mapped input. `in` is the 8-bit input byte (reg | chan | mapping).
  * For RGB (is_alpha 0) fills 3 components; for alpha fills out[0]. */
-static void comb_input(float regs[16][4], uint32_t in, int is_alpha, float out[3])
-{
+static void comb_input(float regs[16][4], uint32_t in, int is_alpha, float out[3]) {
     const float *r = regs[in & 0xF];
     int chan_alpha = (in & 0x10) != 0;
     uint32_t mod = in & 0xE0;
@@ -2018,36 +2109,46 @@ static void comb_input(float regs[16][4], uint32_t in, int is_alpha, float out[3
         float x = is_alpha ? (chan_alpha ? r[3] : r[2]) : (chan_alpha ? r[3] : r[i]);
         float p = x > 0.0f ? x : 0.0f;
         switch (mod) {
-        case 0x00: x = p; break;                                        /* unsigned identity */
-        case 0x20: x = 1.0f - (p > 1.0f ? 1.0f : p); break;             /* unsigned invert   */
-        case 0x40: x = 2.0f * p - 1.0f; break;                          /* expand normal     */
-        case 0x60: x = -2.0f * p + 1.0f; break;                         /* expand negate     */
-        case 0x80: x = p - 0.5f; break;                                 /* half-bias normal  */
-        case 0xA0: x = -p + 0.5f; break;                                /* half-bias negate  */
-        case 0xC0: break;                                               /* signed identity   */
-        default:   x = -x; break;                                       /* signed negate     */
+            case 0x00: x = p;
+                break; /* unsigned identity */
+            case 0x20: x = 1.0f - (p > 1.0f ? 1.0f : p);
+                break; /* unsigned invert   */
+            case 0x40: x = 2.0f * p - 1.0f;
+                break; /* expand normal     */
+            case 0x60: x = -2.0f * p + 1.0f;
+                break; /* expand negate     */
+            case 0x80: x = p - 0.5f;
+                break; /* half-bias normal  */
+            case 0xA0: x = -p + 0.5f;
+                break; /* half-bias negate  */
+            case 0xC0: break; /* signed identity   */
+            default: x = -x;
+                break; /* signed negate     */
         }
         out[i] = x;
     }
 }
 
-static float comb_map(float x, uint32_t mapping)
-{
+static float comb_map(float x, uint32_t mapping) {
     switch (mapping) {
-    case 0x08: x -= 0.5f; break;
-    case 0x10: x *= 2.0f; break;
-    case 0x18: x = (x - 0.5f) * 2.0f; break;
-    case 0x20: x *= 4.0f; break;
-    case 0x30: x *= 0.5f; break;
-    default: break;
+        case 0x08: x -= 0.5f;
+            break;
+        case 0x10: x *= 2.0f;
+            break;
+        case 0x18: x = (x - 0.5f) * 2.0f;
+            break;
+        case 0x20: x *= 4.0f;
+            break;
+        case 0x30: x *= 0.5f;
+            break;
+        default: break;
     }
     return x < -1.0f ? -1.0f : (x > 1.0f ? 1.0f : x);
 }
 
 /* One general-combiner stage for RGB or alpha. Reads `src`, writes `dst`. */
 static void comb_stage(float src[16][4], float dst[16][4], uint32_t icw, uint32_t ocw,
-                       int is_alpha)
-{
+                       int is_alpha) {
     float A[3], B[3], C[3], D[3], ab[3], cd[3], ms[3];
     uint32_t flags = ocw >> 12, mapping = flags & 0x38;
     uint32_t ab_dst = (ocw >> 4) & 0xF, cd_dst = ocw & 0xF, ms_dst = (ocw >> 8) & 0xF;
@@ -2070,10 +2171,10 @@ static void comb_stage(float src[16][4], float dst[16][4], uint32_t icw, uint32_
     } else {
         for (i = 0; i < n; i++) cd[i] = C[i] * D[i];
     }
-    if (s_comb.control & 0x100)           /* PS_COMBINERCOUNT_MUX_MSB */
+    if (s_comb.control & 0x100) /* PS_COMBINERCOUNT_MUX_MSB */
         mux_cd = src[12][3] >= 0.5f;
     else
-        mux_cd = ((uint32_t)(src[12][3] * 255.0f + 0.5f) & 1u) != 0;
+        mux_cd = ((uint32_t) (src[12][3] * 255.0f + 0.5f) & 1u) != 0;
     for (i = 0; i < n; i++)
         ms[i] = (flags & 4) ? (mux_cd ? cd[i] : ab[i]) : ab[i] + cd[i];
 
@@ -2087,10 +2188,14 @@ static void comb_stage(float src[16][4], float dst[16][4], uint32_t icw, uint32_
         if (cd_dst) dst[cd_dst][3] = cd[0];
         if (ms_dst) dst[ms_dst][3] = ms[0];
     } else {
-        if (ab_dst) { for (i = 0; i < 3; i++) dst[ab_dst][i] = ab[i];
-                      if (flags & 0x80) dst[ab_dst][3] = ab[2]; }
-        if (cd_dst) { for (i = 0; i < 3; i++) dst[cd_dst][i] = cd[i];
-                      if (flags & 0x40) dst[cd_dst][3] = cd[2]; }
+        if (ab_dst) {
+            for (i = 0; i < 3; i++) dst[ab_dst][i] = ab[i];
+            if (flags & 0x80) dst[ab_dst][3] = ab[2];
+        }
+        if (cd_dst) {
+            for (i = 0; i < 3; i++) dst[cd_dst][i] = cd[i];
+            if (flags & 0x40) dst[cd_dst][3] = cd[2];
+        }
         if (ms_dst) for (i = 0; i < 3; i++) dst[ms_dst][i] = ms[i];
     }
 }
@@ -2098,10 +2203,9 @@ static void comb_stage(float src[16][4], float dst[16][4], uint32_t icw, uint32_
 /* Final colour for one fragment. t0: sampled stage-0 texel (RGBA 0..1),
  * v0: interpolated diffuse. Returns ARGB8888. */
 static uint32_t comb_eval(const float t0[4], const float v0[4], const float v1[4],
-                          const float tn[3][4])
-{
+                          const float tn[3][4]) {
     float regs[16][4], next[16][4], out[4];
-    int stages = (int)(s_comb.control & 0xFF), s, i;
+    int stages = (int) (s_comb.control & 0xFF), s, i;
 
     if (stages > 8) stages = 8;
     memset(regs, 0, sizeof regs);
@@ -2114,11 +2218,11 @@ static uint32_t comb_eval(const float t0[4], const float v0[4], const float v1[4
         if ((s_comb.stage_prog >> (s * 5)) & 0x1F)
             for (i = 0; i < 4; i++)
                 regs[8 + s][i] = tn ? tn[s - 1][i] : 1.0f;
-    regs[12][3] = (s_comb.stage_prog & 0x1F) ? t0[3] : 1.0f;   /* r0.a = t0.a */
+    regs[12][3] = (s_comb.stage_prog & 0x1F) ? t0[3] : 1.0f; /* r0.a = t0.a */
 
     for (s = 0; s < stages; s++) {
-        int c0 = (s_comb.control & 0x1000) ? s : 0;   /* UNIQUE_C0 */
-        int c1 = (s_comb.control & 0x10000) ? s : 0;  /* UNIQUE_C1 */
+        int c0 = (s_comb.control & 0x1000) ? s : 0; /* UNIQUE_C0 */
+        int c1 = (s_comb.control & 0x10000) ? s : 0; /* UNIQUE_C1 */
         comb_unpack(s_comb.factor0[c0], regs[1]);
         comb_unpack(s_comb.factor1[c1], regs[2]);
         memcpy(next, regs, sizeof next);
@@ -2157,10 +2261,10 @@ static uint32_t comb_eval(const float t0[4], const float v0[4], const float v1[4
     }
     for (i = 0; i < 4; i++)
         out[i] = out[i] < 0 ? 0 : (out[i] > 1 ? 1 : out[i]);
-    return ((uint32_t)(out[3] * 255.0f + 0.5f) << 24)
-         | ((uint32_t)(out[0] * 255.0f + 0.5f) << 16)
-         | ((uint32_t)(out[1] * 255.0f + 0.5f) << 8)
-         |  (uint32_t)(out[2] * 255.0f + 0.5f);
+    return ((uint32_t) (out[3] * 255.0f + 0.5f) << 24)
+           | ((uint32_t) (out[0] * 255.0f + 0.5f) << 16)
+           | ((uint32_t) (out[1] * 255.0f + 0.5f) << 8)
+           | (uint32_t) (out[2] * 255.0f + 0.5f);
 }
 
 /* ── Vertex programs ─────────────────────────────────────────────────────
@@ -2212,28 +2316,28 @@ static struct {
     float p[3];
 } s_fog;
 
-static float fog_factor(float dist)
-{
+static float fog_factor(float dist) {
     float f, exceptional = 0.0f;
     if (!s_fog.enable)
         return 1.0f;
     switch (s_fog.mode) {
-    case 0x0804:                      /* LINEAR_ABS */
-    case 0x2601:                      /* LINEAR */
-        exceptional = 1.0f;
-        f = s_fog.p[0] + dist * s_fog.p[1] - 1.0f;
-        break;
-    case 0x0800:                      /* EXP */
-        exceptional = 1.0f;
+        case 0x0804: /* LINEAR_ABS */
+        case 0x2601: /* LINEAR */
+            exceptional = 1.0f;
+            f = s_fog.p[0] + dist * s_fog.p[1] - 1.0f;
+            break;
+        case 0x0800: /* EXP */
+            exceptional = 1.0f;
         /* fall through */
-    case 0x0802:                      /* EXP_ABS */
-        f = s_fog.p[0] + exp2f(dist * s_fog.p[1] * 16.0f) - 1.5f;
-        break;
-    case 0x0803:                      /* EXP2_ABS */
-    case 0x0801:                      /* EXP2 */
-        f = s_fog.p[0] + exp2f(-dist * dist * s_fog.p[1] * s_fog.p[1] * 32.0f) - 1.5f;
-        break;
-    default:     f = 1.0f; break;
+        case 0x0802: /* EXP_ABS */
+            f = s_fog.p[0] + exp2f(dist * s_fog.p[1] * 16.0f) - 1.5f;
+            break;
+        case 0x0803: /* EXP2_ABS */
+        case 0x0801: /* EXP2 */
+            f = s_fog.p[0] + exp2f(-dist * dist * s_fog.p[1] * s_fog.p[1] * 32.0f) - 1.5f;
+            break;
+        default: f = 1.0f;
+            break;
     }
     /* xemu vsh.c: ABS modes apply to the factor, not the distance. Keep
      * out-of-range factors for interpolation; the combiner clamps per pixel. */
@@ -2252,22 +2356,24 @@ static uint8_t s_const_written[VP_CONSTS];
 /* Bumped whenever s_vp.c changes: the GPU path re-sends the 3 KB of
  * constants only then (gpu_vp_bind compared all of it every draw). */
 static uint32_t s_vp_cgen;
+
 static void const_unwritten_note(int c, int a0);
+
 #define VP_VPSCL      0x3A     /* constant slots SET_VIEWPORT_* write */
 #define VP_VPOFF      0x3B
 
 static struct {
     uint32_t prog[VP_PROG_LEN][4];
-    float    c[VP_CONSTS][4];
+    float c[VP_CONSTS][4];
     uint32_t prog_load, const_load, start;
-    uint32_t mode;                        /* 0 fixed, 2 program */
-    int      loaded;                      /* any program uploaded yet */
+    uint32_t mode; /* 0 fixed, 2 program */
+    int loaded; /* any program uploaded yet */
     /* output merge state the 3D path needs */
     uint32_t depth_test, depth_func, depth_mask;
     uint32_t cull, cull_face, front_face;
     uint32_t specular_enable, light_control;
     uint32_t poly_offset_point, poly_offset_line, poly_offset_fill;
-    float    poly_offset_scale, poly_offset_bias;
+    float poly_offset_scale, poly_offset_bias;
     uint32_t zclear;
     /* Stencil and colour write mask. NFL 2K5's menus mask their skewed
      * panels with the stencil: a colour-masked pass writes the panel shape,
@@ -2276,25 +2382,26 @@ static struct {
      * geometry. GL enums, as the NV2A takes them. */
     uint32_t stencil_test, stencil_wmask, stencil_func, stencil_ref, stencil_fmask;
     uint32_t op_fail, op_zfail, op_zpass;
-    uint32_t color_mask;                  /* NV097_SET_COLOR_MASK */
-    uint32_t clear_rx, clear_ry;          /* SET_CLEAR_RECT_HORIZONTAL/VERTICAL */
-    float    clip_min, clip_max;          /* SET_CLIP_MIN/MAX: depth range oPos.z is in */
-    uint32_t control0;                    /* SET_CONTROL0: bit 16 Z perspective (w-buffer), bit 12 float Z */
-    uint32_t zminmax;                     /* SET_ZMIN_MAX_CONTROL: bits 4-7 ZCLAMP_EN (0 cull, 1 clamp) */
-    uint32_t batches, verts;              /* counters for the report */
+    uint32_t color_mask; /* NV097_SET_COLOR_MASK */
+    uint32_t clear_rx, clear_ry; /* SET_CLEAR_RECT_HORIZONTAL/VERTICAL */
+    float clip_min, clip_max; /* SET_CLIP_MIN/MAX: depth range oPos.z is in */
+    uint32_t control0; /* SET_CONTROL0: bit 16 Z perspective (w-buffer), bit 12 float Z */
+    uint32_t zminmax; /* SET_ZMIN_MAX_CONTROL: bits 4-7 ZCLAMP_EN (0 cull, 1 clamp) */
+    uint32_t batches, verts; /* counters for the report */
     uint32_t rej_bad, rej_area, rej_cull, rej_clip, drawn;
-} s_vp = { .depth_func = 0x0201, .depth_mask = 1, .cull_face = 0x0405,
-           .front_face = 0x0901,
-           .stencil_wmask = 0xFF, .stencil_func = 0x0207, .stencil_fmask = 0xFF,
-           .op_fail = 0x1E00, .op_zfail = 0x1E00, .op_zpass = 0x1E00,
-           .color_mask = 0x01010101u,
-           .clear_rx = 0x0FFF0000u, .clear_ry = 0x0FFF0000u };
+} s_vp = {
+    .depth_func = 0x0201, .depth_mask = 1, .cull_face = 0x0405,
+    .front_face = 0x0901,
+    .stencil_wmask = 0xFF, .stencil_func = 0x0207, .stencil_fmask = 0xFF,
+    .op_fail = 0x1E00, .op_zfail = 0x1E00, .op_zpass = 0x1E00,
+    .color_mask = 0x01010101u,
+    .clear_rx = 0x0FFF0000u, .clear_ry = 0x0FFF0000u
+};
 
-static void const_unwritten_note(int c, int a0)
-{
+static void const_unwritten_note(int c, int a0) {
     static int on = -1, n;
     static uint32_t seen[64];
-    uint32_t key = ((uint32_t)s_vp.start << 16) | (uint32_t)c;
+    uint32_t key = ((uint32_t) s_vp.start << 16) | (uint32_t) c;
     int k;
     if (on < 0) on = getenv("RECOMP_VP_CONST_LOG") != NULL;
     if (!on || n >= 64) return;
@@ -2305,8 +2412,7 @@ static void const_unwritten_note(int c, int a0)
 }
 
 /* Returns 1 when the method was a transform-engine method. */
-static int vp_method(uint32_t method, uint32_t param)
-{
+static int vp_method(uint32_t method, uint32_t param) {
     float f;
     memcpy(&f, &param, 4);
     if (method >= NV097_SET_TRANSFORM_PROGRAM && method < NV097_SET_TRANSFORM_PROGRAM + 0x80) {
@@ -2340,56 +2446,94 @@ static int vp_method(uint32_t method, uint32_t param)
         return 1;
     }
     switch (method) {
-    case NV097_SET_TRANSFORM_EXECUTION_MODE: s_vp.mode = param & 3; return 1;
-    case NV097_SET_TRANSFORM_PROGRAM_LOAD:   s_vp.prog_load = param; return 1;
-    case NV097_SET_TRANSFORM_PROGRAM_START:  s_vp.start = param; return 1;
-    case NV097_SET_TRANSFORM_CONSTANT_LOAD:  s_vp.const_load = param; return 1;
-    case NV097_SET_DEPTH_TEST_ENABLE:        s_vp.depth_test = param; return 1;
-    case NV097_SET_DEPTH_FUNC:               s_vp.depth_func = param; return 1;
-    case NV097_SET_DEPTH_MASK:               s_vp.depth_mask = param; return 1;
-    case NV097_SET_CULL_FACE_ENABLE:         s_vp.cull = param; return 1;
-    case NV097_SET_CULL_FACE:                s_vp.cull_face = param; return 1;
-    case NV097_SET_FRONT_FACE:               s_vp.front_face = param; return 1;
-    case 0x0330: s_vp.poly_offset_point = param; return 1; /* SET_POLY_OFFSET_POINT_ENABLE */
-    case 0x0334: s_vp.poly_offset_line  = param; return 1; /* SET_POLY_OFFSET_LINE_ENABLE */
-    case 0x0338: s_vp.poly_offset_fill  = param; return 1; /* SET_POLY_OFFSET_FILL_ENABLE */
-    case 0x0384: s_vp.poly_offset_scale = f; return 1;     /* SET_POLYGON_OFFSET_SCALE_FACTOR */
-    case 0x0388: s_vp.poly_offset_bias  = f; return 1;     /* SET_POLYGON_OFFSET_BIAS */
-    case NV097_SET_ZSTENCIL_CLEAR_VALUE:     s_vp.zclear = param; return 1;
-    case 0x032C: s_vp.stencil_test  = param; return 1;   /* SET_STENCIL_TEST_ENABLE */
-    case 0x0358: s_vp.color_mask = g_color_mask = param; return 1;   /* SET_COLOR_MASK */
-    case 0x0360: s_vp.stencil_wmask = param & 0xFF; return 1;
-    case 0x0364: s_vp.stencil_func  = param; return 1;
-    case 0x0368: s_vp.stencil_ref   = param & 0xFF; return 1;
-    case 0x036C: s_vp.stencil_fmask = param & 0xFF; return 1;
-    case 0x0370: s_vp.op_fail       = param; return 1;
-    case 0x0374: s_vp.op_zfail      = param; return 1;
-    case 0x0378: s_vp.op_zpass      = param; return 1;
-    case 0x0290: s_vp.control0 = param; return 1;  /* SET_CONTROL0 */
-    case 0x0294: s_vp.light_control = param; return 1; /* SET_LIGHT_CONTROL */
-    case 0x03B8: s_vp.specular_enable = param; return 1; /* SET_SPECULAR_ENABLE */
-    case 0x0394: s_vp.clip_min = f; return 1;   /* SET_CLIP_MIN */
-    case 0x0398: s_vp.clip_max = f; return 1;   /* SET_CLIP_MAX */
-    case 0x1D78: s_vp.zminmax = param; return 1; /* SET_ZMIN_MAX_CONTROL */
-    case 0x029C: s_fog.mode = param; return 1;     /* SET_FOG_MODE */
-    case 0x02A0: s_fog.gen = param; return 1;      /* SET_FOG_GEN_MODE */
-    case 0x02A4: s_fog.enable = param; return 1;   /* SET_FOG_ENABLE */
-    case 0x02A8: s_fog.color = param; return 1;    /* SET_FOG_COLOR: A B G R from the top */
-    case 0x09C0: case 0x09C4: case 0x09C8:         /* SET_FOG_PARAMS */
-        s_fog.p[(method - 0x09C0) / 4] = f; return 1;
-    case 0x1D98: s_vp.clear_rx = g_clear_rx = param; return 1;   /* SET_CLEAR_RECT_HORIZONTAL */
-    case 0x1D9C: s_vp.clear_ry = g_clear_ry = param; return 1;   /* SET_CLEAR_RECT_VERTICAL */
-    default: return 0;
+        case NV097_SET_TRANSFORM_EXECUTION_MODE: s_vp.mode = param & 3;
+            return 1;
+        case NV097_SET_TRANSFORM_PROGRAM_LOAD: s_vp.prog_load = param;
+            return 1;
+        case NV097_SET_TRANSFORM_PROGRAM_START: s_vp.start = param;
+            return 1;
+        case NV097_SET_TRANSFORM_CONSTANT_LOAD: s_vp.const_load = param;
+            return 1;
+        case NV097_SET_DEPTH_TEST_ENABLE: s_vp.depth_test = param;
+            return 1;
+        case NV097_SET_DEPTH_FUNC: s_vp.depth_func = param;
+            return 1;
+        case NV097_SET_DEPTH_MASK: s_vp.depth_mask = param;
+            return 1;
+        case NV097_SET_CULL_FACE_ENABLE: s_vp.cull = param;
+            return 1;
+        case NV097_SET_CULL_FACE: s_vp.cull_face = param;
+            return 1;
+        case NV097_SET_FRONT_FACE: s_vp.front_face = param;
+            return 1;
+        case 0x0330: s_vp.poly_offset_point = param;
+            return 1; /* SET_POLY_OFFSET_POINT_ENABLE */
+        case 0x0334: s_vp.poly_offset_line = param;
+            return 1; /* SET_POLY_OFFSET_LINE_ENABLE */
+        case 0x0338: s_vp.poly_offset_fill = param;
+            return 1; /* SET_POLY_OFFSET_FILL_ENABLE */
+        case 0x0384: s_vp.poly_offset_scale = f;
+            return 1; /* SET_POLYGON_OFFSET_SCALE_FACTOR */
+        case 0x0388: s_vp.poly_offset_bias = f;
+            return 1; /* SET_POLYGON_OFFSET_BIAS */
+        case NV097_SET_ZSTENCIL_CLEAR_VALUE: s_vp.zclear = param;
+            return 1;
+        case 0x032C: s_vp.stencil_test = param;
+            return 1; /* SET_STENCIL_TEST_ENABLE */
+        case 0x0358: s_vp.color_mask = g_color_mask = param;
+            return 1; /* SET_COLOR_MASK */
+        case 0x0360: s_vp.stencil_wmask = param & 0xFF;
+            return 1;
+        case 0x0364: s_vp.stencil_func = param;
+            return 1;
+        case 0x0368: s_vp.stencil_ref = param & 0xFF;
+            return 1;
+        case 0x036C: s_vp.stencil_fmask = param & 0xFF;
+            return 1;
+        case 0x0370: s_vp.op_fail = param;
+            return 1;
+        case 0x0374: s_vp.op_zfail = param;
+            return 1;
+        case 0x0378: s_vp.op_zpass = param;
+            return 1;
+        case 0x0290: s_vp.control0 = param;
+            return 1; /* SET_CONTROL0 */
+        case 0x0294: s_vp.light_control = param;
+            return 1; /* SET_LIGHT_CONTROL */
+        case 0x03B8: s_vp.specular_enable = param;
+            return 1; /* SET_SPECULAR_ENABLE */
+        case 0x0394: s_vp.clip_min = f;
+            return 1; /* SET_CLIP_MIN */
+        case 0x0398: s_vp.clip_max = f;
+            return 1; /* SET_CLIP_MAX */
+        case 0x1D78: s_vp.zminmax = param;
+            return 1; /* SET_ZMIN_MAX_CONTROL */
+        case 0x029C: s_fog.mode = param;
+            return 1; /* SET_FOG_MODE */
+        case 0x02A0: s_fog.gen = param;
+            return 1; /* SET_FOG_GEN_MODE */
+        case 0x02A4: s_fog.enable = param;
+            return 1; /* SET_FOG_ENABLE */
+        case 0x02A8: s_fog.color = param;
+            return 1; /* SET_FOG_COLOR: A B G R from the top */
+        case 0x09C0:
+        case 0x09C4:
+        case 0x09C8: /* SET_FOG_PARAMS */
+            s_fog.p[(method - 0x09C0) / 4] = f;
+            return 1;
+        case 0x1D98: s_vp.clear_rx = g_clear_rx = param;
+            return 1; /* SET_CLEAR_RECT_HORIZONTAL */
+        case 0x1D9C: s_vp.clear_ry = g_clear_ry = param;
+            return 1; /* SET_CLEAR_RECT_VERTICAL */
+        default: return 0;
     }
 }
 
-static int vp_active(void)
-{
+static int vp_active(void) {
     return s_vp.mode == 2 && s_vp.loaded;
 }
 
-static uint32_t vp_field(const uint32_t *t, int word, int bit, int len)
-{
+static uint32_t vp_field(const uint32_t *t, int word, int bit, int len) {
     return (t[word] >> bit) & ((1u << len) - 1u);
 }
 
@@ -2398,27 +2542,29 @@ static uint32_t vp_field(const uint32_t *t, int word, int bit, int len)
  * reads its (C) operand for the scalar ops. */
 static void vp_src(const uint32_t *t, int mux, int reg, int neg, const int swz[4],
                    float R[13][4], float O[16][4], const float V[16][4], int a0,
-                   int scalar, float out[4])
-{
+                   int scalar, float out[4]) {
     const float *s;
     int i;
     float tmp[4];
 
     switch (mux) {
-    case 1:  s = reg == 12 ? O[0] : R[reg < 13 ? reg : 0]; break;
-    case 2:  s = V[vp_field(t, 1, 9, 4)]; break;
-    case 3: {
-        int c = (int)vp_field(t, 1, 13, 8);
-        if (vp_field(t, 3, 1, 1)) {
-            c += a0;
-            if (c >= 0 && c < VP_CONSTS && !s_const_written[c]) const_unwritten_note(c, a0);
+        case 1: s = reg == 12 ? O[0] : R[reg < 13 ? reg : 0];
+            break;
+        case 2: s = V[vp_field(t, 1, 9, 4)];
+            break;
+        case 3: {
+            int c = (int) vp_field(t, 1, 13, 8);
+            if (vp_field(t, 3, 1, 1)) {
+                c += a0;
+                if (c >= 0 && c < VP_CONSTS && !s_const_written[c]) const_unwritten_note(c, a0);
+            }
+            if (c < 0) c = 0;
+            if (c >= VP_CONSTS) c = VP_CONSTS - 1;
+            s = s_vp.c[c];
+            break;
         }
-        if (c < 0) c = 0;
-        if (c >= VP_CONSTS) c = VP_CONSTS - 1;
-        s = s_vp.c[c];
-        break;
-    }
-    default: s = R[0]; break;
+        default: s = R[0];
+            break;
     }
     for (i = 0; i < 4; i++)
         tmp[i] = s[scalar ? swz[0] : swz[i]];
@@ -2426,8 +2572,7 @@ static void vp_src(const uint32_t *t, int mux, int reg, int neg, const int swz[4
         out[i] = neg ? -tmp[i] : tmp[i];
 }
 
-static void vp_write(float *dst, const float v[4], uint32_t mask)
-{
+static void vp_write(float *dst, const float v[4], uint32_t mask) {
     /* mask bit 3 = x ... bit 0 = w */
     if (mask & 8) dst[0] = v[0];
     if (mask & 4) dst[1] = v[1];
@@ -2435,8 +2580,7 @@ static void vp_write(float *dst, const float v[4], uint32_t mask)
     if (mask & 1) dst[3] = v[3];
 }
 
-static uint32_t vp_fog_write_mask(uint32_t mask)
-{
+static uint32_t vp_fog_write_mask(uint32_t mask) {
     /* xemu fog_mask_str: every n-component oFog write maps to the first n
      * components, making x the scalar fog output even for an oFog.w write. */
     static const uint8_t masks[16] = {
@@ -2447,15 +2591,13 @@ static uint32_t vp_fog_write_mask(uint32_t mask)
 
 /* NV2A raster setup parity with xemu vsh.c: screen coordinates have four
  * fractional bits and truncate toward zero, including negative positions. */
-static float vp_screen_coord(float value)
-{
+static float vp_screen_coord(float value) {
     return truncf(value * 16.0f) / 16.0f;
 }
 
 /* xemu clampAwayZeroInf: preserve signed zero while clamping W to the exact
  * signed [2^-64, 2^64] interval. Exceptional NaN values remain NaN. */
-static float vp_clamp_w(float value)
-{
+static float vp_clamp_w(float value) {
     const float minimum = 5.421010862427522e-20f;
     const float maximum = 1.8446744073709552e19f;
     uint32_t bits;
@@ -2475,10 +2617,10 @@ static float vp_clamp_w(float value)
 /* Set to trace every instruction of the next vp_run (RECOMP_GPU_TRACE). */
 static int s_vp_trace_next;
 
-static float s_vp_dbg_r[13][4];             /* last vp_run's temporaries (RECOMP_IDX_DUMP) */
+static float s_vp_dbg_r[13][4]; /* last vp_run's temporaries (RECOMP_IDX_DUMP) */
 static int s_vp_dbg_a0;
-static void vp_run(const float V[16][4], float O[16][4])
-{
+
+static void vp_run(const float V[16][4], float O[16][4]) {
     float R[13][4];
     int a0 = 0, slot, i;
 
@@ -2488,98 +2630,158 @@ static void vp_run(const float V[16][4], float O[16][4])
         O[i][3] = 1.0f;
     }
 
-    for (slot = (int)s_vp.start; slot < VP_PROG_LEN; slot++) {
+    for (slot = (int) s_vp.start; slot < VP_PROG_LEN; slot++) {
         const uint32_t *t = s_vp.prog[slot];
         uint32_t ilu = vp_field(t, 1, 25, 3), mac = vp_field(t, 1, 21, 4);
         float A[4], B[4], C[4], mres[4] = {0, 0, 0, 0}, ires[4] = {0, 0, 0, 0};
         int sa[4], sb[4], sc[4];
-        int mux_a = (int)vp_field(t, 2, 26, 2), mux_b = (int)vp_field(t, 2, 11, 2);
-        int mux_c = (int)vp_field(t, 3, 28, 2);
-        int reg_a = (int)vp_field(t, 2, 28, 4), reg_b = (int)vp_field(t, 2, 13, 4);
-        int reg_c = (int)((vp_field(t, 2, 0, 2) << 2) | vp_field(t, 3, 30, 2));
+        int mux_a = (int) vp_field(t, 2, 26, 2), mux_b = (int) vp_field(t, 2, 11, 2);
+        int mux_c = (int) vp_field(t, 3, 28, 2);
+        int reg_a = (int) vp_field(t, 2, 28, 4), reg_b = (int) vp_field(t, 2, 13, 4);
+        int reg_c = (int) ((vp_field(t, 2, 0, 2) << 2) | vp_field(t, 3, 30, 2));
         uint32_t mac_mask = vp_field(t, 3, 24, 4), ilu_mask = vp_field(t, 3, 16, 4);
         uint32_t o_mask = vp_field(t, 3, 12, 4), out_r = vp_field(t, 3, 20, 4);
         uint32_t orb = vp_field(t, 3, 11, 1), out_addr = vp_field(t, 3, 3, 8);
         uint32_t out_mux = vp_field(t, 3, 2, 1);
         int new_a0 = a0, a0_written = 0;
 
-        sa[0] = (int)vp_field(t, 1, 6, 2); sa[1] = (int)vp_field(t, 1, 4, 2);
-        sa[2] = (int)vp_field(t, 1, 2, 2); sa[3] = (int)vp_field(t, 1, 0, 2);
-        sb[0] = (int)vp_field(t, 2, 23, 2); sb[1] = (int)vp_field(t, 2, 21, 2);
-        sb[2] = (int)vp_field(t, 2, 19, 2); sb[3] = (int)vp_field(t, 2, 17, 2);
-        sc[0] = (int)vp_field(t, 2, 8, 2); sc[1] = (int)vp_field(t, 2, 6, 2);
-        sc[2] = (int)vp_field(t, 2, 4, 2); sc[3] = (int)vp_field(t, 2, 2, 2);
+        sa[0] = (int) vp_field(t, 1, 6, 2);
+        sa[1] = (int) vp_field(t, 1, 4, 2);
+        sa[2] = (int) vp_field(t, 1, 2, 2);
+        sa[3] = (int) vp_field(t, 1, 0, 2);
+        sb[0] = (int) vp_field(t, 2, 23, 2);
+        sb[1] = (int) vp_field(t, 2, 21, 2);
+        sb[2] = (int) vp_field(t, 2, 19, 2);
+        sb[3] = (int) vp_field(t, 2, 17, 2);
+        sc[0] = (int) vp_field(t, 2, 8, 2);
+        sc[1] = (int) vp_field(t, 2, 6, 2);
+        sc[2] = (int) vp_field(t, 2, 4, 2);
+        sc[3] = (int) vp_field(t, 2, 2, 2);
 
-        vp_src(t, mux_a, reg_a, (int)vp_field(t, 1, 8, 1), sa, R, O, V, a0, 0, A);
-        vp_src(t, mux_b, reg_b, (int)vp_field(t, 2, 25, 1), sb, R, O, V, a0, 0, B);
-        vp_src(t, mux_c, reg_c, (int)vp_field(t, 2, 10, 1), sc, R, O, V, a0,
+        vp_src(t, mux_a, reg_a, (int) vp_field(t, 1, 8, 1), sa, R, O, V, a0, 0, A);
+        vp_src(t, mux_b, reg_b, (int) vp_field(t, 2, 25, 1), sb, R, O, V, a0, 0, B);
+        vp_src(t, mux_c, reg_c, (int) vp_field(t, 2, 10, 1), sc, R, O, V, a0,
                ilu >= 2 && ilu <= 6, C);
 
         switch (mac) {
-        case 1: memcpy(mres, A, sizeof mres); break;                                  /* MOV */
-        case 2: for (i = 0; i < 4; i++) mres[i] = A[i] * B[i]; break;                /* MUL */
-        case 3: for (i = 0; i < 4; i++) mres[i] = A[i] + C[i]; break;                /* ADD */
-        case 4: for (i = 0; i < 4; i++) mres[i] = A[i] * B[i] + C[i]; break;         /* MAD */
-        case 5: mres[0] = mres[1] = mres[2] = mres[3] =                                /* DP3 */
-                    A[0] * B[0] + A[1] * B[1] + A[2] * B[2]; break;
-        case 6: mres[0] = mres[1] = mres[2] = mres[3] =                                /* DPH */
-                    A[0] * B[0] + A[1] * B[1] + A[2] * B[2] + B[3]; break;
-        case 7: mres[0] = mres[1] = mres[2] = mres[3] =                                /* DP4 */
-                    A[0] * B[0] + A[1] * B[1] + A[2] * B[2] + A[3] * B[3]; break;
-        case 8: mres[0] = 1.0f; mres[1] = A[1] * B[1]; mres[2] = A[2]; mres[3] = B[3]; break; /* DST */
-        case 9: for (i = 0; i < 4; i++) mres[i] = A[i] < B[i] ? A[i] : B[i]; break;  /* MIN */
-        case 10: for (i = 0; i < 4; i++) mres[i] = A[i] > B[i] ? A[i] : B[i]; break; /* MAX */
-        case 11: for (i = 0; i < 4; i++) mres[i] = A[i] < B[i] ? 1.0f : 0.0f; break; /* SLT */
-        case 12: for (i = 0; i < 4; i++) mres[i] = A[i] >= B[i] ? 1.0f : 0.0f; break;/* SGE */
-        case 13: new_a0 = (int)floorf(A[0] + 0.001f); a0_written = 1;                  /* ARL */
-            {   /* RECOMP_VP_A0_LOG: the address range each program start uses */
-                static int on = -1;
-                static int lo[256], hi[256], seen[256];
-                static DWORD last;
-                if (on < 0) on = getenv("RECOMP_VP_A0_LOG") != NULL;
-                if (on && s_vp.start < 256) {
-                    int st = (int)s_vp.start;
-                    if (!seen[st] || new_a0 < lo[st]) lo[st] = new_a0;
-                    if (!seen[st] || new_a0 > hi[st]) hi[st] = new_a0;
-                    seen[st] = 1;
-                    if (GetTickCount() - last > 3000) {
-                        int q;
-                        last = GetTickCount();
-                        for (q = 0; q < 256; q++)
-                            if (seen[q]) fprintf(stderr, "  [VPA0] start %d a0 %d..%d (input %g)\n", q, lo[q], hi[q], A[0]);
+            case 1: memcpy(mres, A, sizeof mres);
+                break; /* MOV */
+            case 2: for (i = 0; i < 4; i++) mres[i] = A[i] * B[i];
+                break; /* MUL */
+            case 3: for (i = 0; i < 4; i++) mres[i] = A[i] + C[i];
+                break; /* ADD */
+            case 4: for (i = 0; i < 4; i++) mres[i] = A[i] * B[i] + C[i];
+                break; /* MAD */
+            case 5: mres[0] = mres[1] = mres[2] = mres[3] = /* DP3 */
+                                                  A[0] * B[0] + A[1] * B[1] + A[2] * B[2];
+                break;
+            case 6: mres[0] = mres[1] = mres[2] = mres[3] = /* DPH */
+                                                  A[0] * B[0] + A[1] * B[1] + A[2] * B[2] + B[3];
+                break;
+            case 7: mres[0] = mres[1] = mres[2] = mres[3] = /* DP4 */
+                                                  A[0] * B[0] + A[1] * B[1] + A[2] * B[2] + A[3] * B[3];
+                break;
+            case 8: mres[0] = 1.0f;
+                mres[1] = A[1] * B[1];
+                mres[2] = A[2];
+                mres[3] = B[3];
+                break; /* DST */
+            case 9: for (i = 0; i < 4; i++) mres[i] = A[i] < B[i] ? A[i] : B[i];
+                break; /* MIN */
+            case 10: for (i = 0; i < 4; i++) mres[i] = A[i] > B[i] ? A[i] : B[i];
+                break; /* MAX */
+            case 11: for (i = 0; i < 4; i++) mres[i] = A[i] < B[i] ? 1.0f : 0.0f;
+                break; /* SLT */
+            case 12: for (i = 0; i < 4; i++) mres[i] = A[i] >= B[i] ? 1.0f : 0.0f;
+                break; /* SGE */
+            case 13: new_a0 = (int) floorf(A[0] + 0.001f);
+                a0_written = 1; /* ARL */
+                {
+                    /* RECOMP_VP_A0_LOG: the address range each program start uses */
+                    static int on = -1;
+                    static int lo[256], hi[256], seen[256];
+                    static DWORD last;
+                    if (on < 0) on = getenv("RECOMP_VP_A0_LOG") != NULL;
+                    if (on && s_vp.start < 256) {
+                        int st = (int) s_vp.start;
+                        if (!seen[st] || new_a0 < lo[st]) lo[st] = new_a0;
+                        if (!seen[st] || new_a0 > hi[st]) hi[st] = new_a0;
+                        seen[st] = 1;
+                        if (GetTickCount() - last > 3000) {
+                            int q;
+                            last = GetTickCount();
+                            for (q = 0; q < 256; q++)
+                                if (seen[q]) fprintf(stderr, "  [VPA0] start %d a0 %d..%d (input %g)\n", q, lo[q],
+                                                     hi[q], A[0]);
+                        }
                     }
                 }
-            }
-            break;
-        default: break;
+                break;
+            default: break;
         }
 
         switch (ilu) {
-        case 1: memcpy(ires, C, sizeof ires); break;                                  /* MOV */
-        case 2: { float x = C[0];                                                     /* RCP */
-                  float r = x == 1.0f ? 1.0f : (x == 0.0f ? INFINITY : 1.0f / x);
-                  ires[0] = ires[1] = ires[2] = ires[3] = r; break; }
-        case 3: { float x = C[0], r;                                                  /* RCC */
-                  r = x == 0.0f ? 1.8446743e19f : 1.0f / x;
-                  if (r > 0) { if (r < 5.42101e-20f) r = 5.42101e-20f; if (r > 1.8446743e19f) r = 1.8446743e19f; }
-                  else { if (r > -5.42101e-20f) r = -5.42101e-20f; if (r < -1.8446743e19f) r = -1.8446743e19f; }
-                  ires[0] = ires[1] = ires[2] = ires[3] = r; break; }
-        case 4: { float x = fabsf(C[0]);                                              /* RSQ */
-                  float r = x == 1.0f ? 1.0f : (x == 0.0f ? INFINITY : 1.0f / sqrtf(x));
-                  ires[0] = ires[1] = ires[2] = ires[3] = r; break; }
-        case 5: { float x = C[0], fl = floorf(x);                                     /* EXP */
-                  ires[0] = exp2f(fl); ires[1] = x - fl; ires[2] = exp2f(x); ires[3] = 1.0f; break; }
-        case 6: { float x = fabsf(C[0]);                                              /* LOG */
-                  if (x == 0.0f) { ires[0] = ires[2] = -INFINITY; ires[1] = 1.0f; }
-                  else { float e = floorf(log2f(x)); ires[0] = e; ires[1] = x / exp2f(e); ires[2] = log2f(x); }
-                  ires[3] = 1.0f; break; }
-        case 7: { float sx = C[0] > 0 ? C[0] : 0, sy = C[1] > 0 ? C[1] : 0;          /* LIT */
-                  float sw = C[3];
-                  if (sw < -127.996f) sw = -127.996f;
-                  if (sw > 127.996f) sw = 127.996f;
-                  ires[0] = 1.0f; ires[1] = sx;
-                  ires[2] = sx > 0 ? exp2f(sw * log2f(sy)) : 0.0f; ires[3] = 1.0f; break; }
-        default: break;
+            case 1: memcpy(ires, C, sizeof ires);
+                break; /* MOV */
+            case 2: {
+                float x = C[0]; /* RCP */
+                float r = x == 1.0f ? 1.0f : (x == 0.0f ? INFINITY : 1.0f / x);
+                ires[0] = ires[1] = ires[2] = ires[3] = r;
+                break;
+            }
+            case 3: {
+                float x = C[0], r; /* RCC */
+                r = x == 0.0f ? 1.8446743e19f : 1.0f / x;
+                if (r > 0) {
+                    if (r < 5.42101e-20f) r = 5.42101e-20f;
+                    if (r > 1.8446743e19f) r = 1.8446743e19f;
+                } else {
+                    if (r > -5.42101e-20f) r = -5.42101e-20f;
+                    if (r < -1.8446743e19f) r = -1.8446743e19f;
+                }
+                ires[0] = ires[1] = ires[2] = ires[3] = r;
+                break;
+            }
+            case 4: {
+                float x = fabsf(C[0]); /* RSQ */
+                float r = x == 1.0f ? 1.0f : (x == 0.0f ? INFINITY : 1.0f / sqrtf(x));
+                ires[0] = ires[1] = ires[2] = ires[3] = r;
+                break;
+            }
+            case 5: {
+                float x = C[0], fl = floorf(x); /* EXP */
+                ires[0] = exp2f(fl);
+                ires[1] = x - fl;
+                ires[2] = exp2f(x);
+                ires[3] = 1.0f;
+                break;
+            }
+            case 6: {
+                float x = fabsf(C[0]); /* LOG */
+                if (x == 0.0f) {
+                    ires[0] = ires[2] = -INFINITY;
+                    ires[1] = 1.0f;
+                } else {
+                    float e = floorf(log2f(x));
+                    ires[0] = e;
+                    ires[1] = x / exp2f(e);
+                    ires[2] = log2f(x);
+                }
+                ires[3] = 1.0f;
+                break;
+            }
+            case 7: {
+                float sx = C[0] > 0 ? C[0] : 0, sy = C[1] > 0 ? C[1] : 0; /* LIT */
+                float sw = C[3];
+                if (sw < -127.996f) sw = -127.996f;
+                if (sw > 127.996f) sw = 127.996f;
+                ires[0] = 1.0f;
+                ires[1] = sx;
+                ires[2] = sx > 0 ? exp2f(sw * log2f(sy)) : 0.0f;
+                ires[3] = 1.0f;
+                break;
+            }
+            default: break;
         }
 
         /* Register writes. A MAC paired with an ILU op writes its own
@@ -2627,31 +2829,29 @@ static void vp_run(const float V[16][4], float O[16][4])
 
 /* One transformed vertex, as the rasteriser wants it. */
 typedef struct {
-    float x, y, z, w;       /* screen x, y; depth; w for perspective */
-    float col[4];           /* oD0, 0..1 RGBA */
-    float spec[4];          /* oD1, 0..1 RGBA -- where 3D lighting lands */
-    float uv[2];            /* oT0 in texels (scaled like fetch_texcoord) */
-    float uvn[3][2];        /* oT1..oT3, scaled for stages 1..3 */
-    float tc[4][4];         /* oT0..oT3 as the program wrote them (GPU renderer) */
-    float fog;              /* fog factor from oFog (fog_factor) */
-    int   ok;
+    float x, y, z, w; /* screen x, y; depth; w for perspective */
+    float col[4]; /* oD0, 0..1 RGBA */
+    float spec[4]; /* oD1, 0..1 RGBA -- where 3D lighting lands */
+    float uv[2]; /* oT0 in texels (scaled like fetch_texcoord) */
+    float uvn[3][2]; /* oT1..oT3, scaled for stages 1..3 */
+    float tc[4][4]; /* oT0..oT3 as the program wrote them (GPU renderer) */
+    float fog; /* fog factor from oFog (fog_factor) */
+    int ok;
 } XfVert;
 
 #define VP_CACHE 65536
-static XfVert   s_xf[VP_CACHE];
+static XfVert s_xf[VP_CACHE];
 static uint32_t s_xf_stamp[VP_CACHE];
 static uint32_t s_xf_gen = 1;
 
-static void vp_begin_batch(void)
-{
+static void vp_begin_batch(void) {
     if (++s_xf_gen == 0) {
         memset(s_xf_stamp, 0, sizeof s_xf_stamp);
         s_xf_gen = 1;
     }
 }
 
-static const XfVert *vp_vertex(uint32_t index)
-{
+static const XfVert *vp_vertex(uint32_t index) {
     XfVert *x = &s_xf[index & (VP_CACHE - 1)];
     float V[16][4], O[16][4];
     uint32_t a;
@@ -2670,7 +2870,7 @@ static const XfVert *vp_vertex(uint32_t index)
             if (shown == 0) {
                 int sl;
                 fprintf(stderr, "  [VP] program from slot %u:\n", s_vp.start);
-                for (sl = (int)s_vp.start; sl < VP_PROG_LEN; sl++) {
+                for (sl = (int) s_vp.start; sl < VP_PROG_LEN; sl++) {
                     fprintf(stderr, "  [VP]   %3d: %08X %08X %08X %08X\n", sl,
                             s_vp.prog[sl][0], s_vp.prog[sl][1], s_vp.prog[sl][2], s_vp.prog[sl][3]);
                     if (s_vp.prog[sl][3] & 1) break;
@@ -2680,17 +2880,22 @@ static const XfVert *vp_vertex(uint32_t index)
                         s_vp.c[VP_VPOFF][0], s_vp.c[VP_VPOFF][1], s_vp.c[VP_VPOFF][2], s_vp.c[VP_VPOFF][3]);
             }
             shown++;
-            fprintf(stderr, "  [VP] v0 %g %g %g %g  v3 %g %g %g %g  v9 %g %g -> oPos %g %g %g %g  oD0 %g %g %g %g  oT0 %g %g\n",
-                    V[0][0], V[0][1], V[0][2], V[0][3], V[3][0], V[3][1], V[3][2], V[3][3],
-                    V[9][0], V[9][1], O[0][0], O[0][1], O[0][2], O[0][3],
-                    O[3][0], O[3][1], O[3][2], O[3][3], O[9][0], O[9][1]);
+            fprintf(
+                stderr,
+                "  [VP] v0 %g %g %g %g  v3 %g %g %g %g  v9 %g %g -> oPos %g %g %g %g  oD0 %g %g %g %g  oT0 %g %g\n",
+                V[0][0], V[0][1], V[0][2], V[0][3], V[3][0], V[3][1], V[3][2], V[3][3],
+                V[9][0], V[9][1], O[0][0], O[0][1], O[0][2], O[0][3],
+                O[3][0], O[3][1], O[3][2], O[3][3], O[9][0], O[9][1]);
         }
     }
-    x->x = O[0][0]; x->y = O[0][1]; x->z = O[0][2]; x->w = O[0][3];
+    x->x = O[0][0];
+    x->y = O[0][1];
+    x->z = O[0][2];
+    x->w = O[0][3];
     x->w = vp_clamp_w(x->w);
     for (k = 0; k < 4; k++) {
         float c = O[3][k];
-        if (c != c) c = 1.0f;                    /* NaN reads as 1, like xemu */
+        if (c != c) c = 1.0f; /* NaN reads as 1, like xemu */
         x->col[k] = c < 0 ? 0 : (c > 1 ? 1 : c);
         c = s_vp.specular_enable ? O[4][k] : (k == 3 ? 1.0f : 0.0f);
         if (c != c) c = 1.0f;
@@ -2703,16 +2908,16 @@ static const XfVert *vp_vertex(uint32_t index)
     x->uv[0] = O[9][0];
     x->uv[1] = O[9][1];
     if (tex_size_from_format(s_gpu.tex.color)) {
-        x->uv[0] *= (float)s_gpu.tex.width;
-        x->uv[1] *= (float)s_gpu.tex.height;
+        x->uv[0] *= (float) s_gpu.tex.width;
+        x->uv[1] *= (float) s_gpu.tex.height;
     }
     for (k = 0; k < 3; k++) {
         const Texture *st = &s_stage[k + 1];
         x->uvn[k][0] = O[10 + k][0];
         x->uvn[k][1] = O[10 + k][1];
         if (tex_size_from_format(st->color)) {
-            x->uvn[k][0] *= (float)st->width;
-            x->uvn[k][1] *= (float)st->height;
+            x->uvn[k][0] *= (float) st->width;
+            x->uvn[k][1] *= (float) st->height;
         }
     }
     x->ok = (x->x == x->x) && (x->y == x->y) && fabsf(x->x) < 1e6f && fabsf(x->y) < 1e6f;
@@ -2725,11 +2930,10 @@ static const XfVert *vp_vertex(uint32_t index)
 #define ZB_H 1024
 static float s_zbuf[ZB_W * ZB_H];
 
-static uint8_t s_sbuf[ZB_W * ZB_H];      /* stencil, one byte per pixel */
+static uint8_t s_sbuf[ZB_W * ZB_H]; /* stencil, one byte per pixel */
 
 /* The rectangle SET_CLEAR_RECT_* names (inclusive), clipped to the buffers. */
-static void clear_rect(uint32_t *x0, uint32_t *y0, uint32_t *x1, uint32_t *y1)
-{
+static void clear_rect(uint32_t *x0, uint32_t *y0, uint32_t *x1, uint32_t *y1) {
     *x0 = s_vp.clear_rx & 0xFFF;
     *x1 = ((s_vp.clear_rx >> 16) & 0xFFF) + 1;
     *y0 = s_vp.clear_ry & 0xFFF;
@@ -2741,72 +2945,73 @@ static void clear_rect(uint32_t *x0, uint32_t *y0, uint32_t *x1, uint32_t *y1)
 /* Depth (CLEAR_SURFACE bit 0) and/or stencil (bit 1), inside the clear
  * rectangle only. The clear value is Z24S8: depth in the top 24 bits, in the
  * units the shaders scale oPos.z to; stencil in the low 8. */
-static void zbuf_clear_bits(uint32_t param)
-{
-    float z = (float)(s_vp.zclear >> 8);
-    uint8_t st = (uint8_t)(s_vp.zclear & 0xFF);
+static void zbuf_clear_bits(uint32_t param) {
+    float z = (float) (s_vp.zclear >> 8);
+    uint8_t st = (uint8_t) (s_vp.zclear & 0xFF);
     uint32_t x0, y0, x1, y1, x, y;
     clear_rect(&x0, &y0, &x1, &y1);
     for (y = y0; y < y1; y++)
         for (x = x0; x < x1; x++) {
-            if (param & 1u) s_zbuf[(size_t)y * ZB_W + x] = z;
-            if (param & 2u) s_sbuf[(size_t)y * ZB_W + x] = st;
+            if (param & 1u) s_zbuf[(size_t) y * ZB_W + x] = z;
+            if (param & 2u) s_sbuf[(size_t) y * ZB_W + x] = st;
         }
 }
 
-static void zbuf_clear(void)
-{
+static void zbuf_clear(void) {
     zbuf_clear_bits(1u);
 }
 
-static int stencil_cmp(uint32_t func, uint32_t ref, uint32_t val)
-{
+static int stencil_cmp(uint32_t func, uint32_t ref, uint32_t val) {
     switch (func) {
-    case 0x0200: return 0;
-    case 0x0201: return ref <  val;
-    case 0x0202: return ref == val;
-    case 0x0203: return ref <= val;
-    case 0x0204: return ref >  val;
-    case 0x0205: return ref != val;
-    case 0x0206: return ref >= val;
-    default:     return 1;
+        case 0x0200: return 0;
+        case 0x0201: return ref < val;
+        case 0x0202: return ref == val;
+        case 0x0203: return ref <= val;
+        case 0x0204: return ref > val;
+        case 0x0205: return ref != val;
+        case 0x0206: return ref >= val;
+        default: return 1;
     }
 }
 
-static void stencil_apply(uint8_t *s, uint32_t op)
-{
+static void stencil_apply(uint8_t *s, uint32_t op) {
     uint32_t v = *s, n;
     switch (op) {
-    case 0x0000: n = 0; break;                                   /* ZERO    */
-    case 0x1E01: n = s_vp.stencil_ref; break;                    /* REPLACE */
-    case 0x1E02: n = v < 255 ? v + 1 : 255; break;               /* INCRSAT */
-    case 0x1E03: n = v > 0 ? v - 1 : 0; break;                   /* DECRSAT */
-    case 0x150A: n = ~v & 0xFF; break;                           /* INVERT  */
-    case 0x8507: n = (v + 1) & 0xFF; break;                      /* INCR    */
-    case 0x8508: n = (v - 1) & 0xFF; break;                      /* DECR    */
-    default:     return;                                         /* KEEP    */
+        case 0x0000: n = 0;
+            break; /* ZERO    */
+        case 0x1E01: n = s_vp.stencil_ref;
+            break; /* REPLACE */
+        case 0x1E02: n = v < 255 ? v + 1 : 255;
+            break; /* INCRSAT */
+        case 0x1E03: n = v > 0 ? v - 1 : 0;
+            break; /* DECRSAT */
+        case 0x150A: n = ~v & 0xFF;
+            break; /* INVERT  */
+        case 0x8507: n = (v + 1) & 0xFF;
+            break; /* INCR    */
+        case 0x8508: n = (v - 1) & 0xFF;
+            break; /* DECR    */
+        default: return; /* KEEP    */
     }
-    *s = (uint8_t)((v & ~s_vp.stencil_wmask) | (n & s_vp.stencil_wmask));
+    *s = (uint8_t) ((v & ~s_vp.stencil_wmask) | (n & s_vp.stencil_wmask));
 }
 
-static int depth_pass(float z, float d)
-{
+static int depth_pass(float z, float d) {
     switch (s_vp.depth_func) {
-    case 0x0200: return 0;
-    case 0x0201: return z <  d;
-    case 0x0202: return z == d;
-    case 0x0203: return z <= d;
-    case 0x0204: return z >  d;
-    case 0x0205: return z != d;
-    case 0x0206: return z >= d;
-    default:     return 1;
+        case 0x0200: return 0;
+        case 0x0201: return z < d;
+        case 0x0202: return z == d;
+        case 0x0203: return z <= d;
+        case 0x0204: return z > d;
+        case 0x0205: return z != d;
+        case 0x0206: return z >= d;
+        default: return 1;
     }
 }
 
 /* Perspective-correct, Gouraud-shaded, depth-tested triangle. */
-static void raster_triangle_xf(const XfVert *a, const XfVert *b, const XfVert *c)
-{
-    uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+static void raster_triangle_xf(const XfVert *a, const XfVert *b, const XfVert *c) {
+    uint8_t *mem = (uint8_t *) xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
     float area, iwa, iwb, iwc;
     int minx, maxx, miny, maxy, x, y;
@@ -2836,7 +3041,7 @@ static void raster_triangle_xf(const XfVert *a, const XfVert *b, const XfVert *c
             {
                 int sl;
                 fprintf(stderr, "  [VPZERO]   program start %u:\n", s_vp.start);
-                for (sl = (int)s_vp.start; sl < VP_PROG_LEN; sl++) {
+                for (sl = (int) s_vp.start; sl < VP_PROG_LEN; sl++) {
                     fprintf(stderr, "  [VPZERO]   prog %3d: %08X %08X %08X %08X\n", sl,
                             s_vp.prog[sl][0], s_vp.prog[sl][1], s_vp.prog[sl][2], s_vp.prog[sl][3]);
                     if (s_vp.prog[sl][3] & 1) break;
@@ -2871,7 +3076,7 @@ static void raster_triangle_xf(const XfVert *a, const XfVert *b, const XfVert *c
         int cw = area < 0;
         int front = (s_vp.front_face == 0x0900) ? cw : !cw;
         if ((s_vp.cull_face == 0x0404 && front) || (s_vp.cull_face == 0x0405 && !front)
-                || s_vp.cull_face == 0x0408) {
+            || s_vp.cull_face == 0x0408) {
             s_vp.rej_cull++;
             return;
         }
@@ -2879,14 +3084,14 @@ static void raster_triangle_xf(const XfVert *a, const XfVert *b, const XfVert *c
     if (!surface_begin_batch(mem))
         return;
 
-    minx = (int)floorf(fminf(a->x, fminf(b->x, c->x)));
-    maxx = (int)ceilf (fmaxf(a->x, fmaxf(b->x, c->x)));
-    miny = (int)floorf(fminf(a->y, fminf(b->y, c->y)));
-    maxy = (int)ceilf (fmaxf(a->y, fmaxf(b->y, c->y)));
-    if (minx < (int)s_gpu.clip_x) minx = (int)s_gpu.clip_x;
-    if (miny < (int)s_gpu.clip_y) miny = (int)s_gpu.clip_y;
-    if (maxx > (int)(s_gpu.clip_x + s_gpu.clip_w)) maxx = (int)(s_gpu.clip_x + s_gpu.clip_w);
-    if (maxy > (int)(s_gpu.clip_y + s_gpu.clip_h)) maxy = (int)(s_gpu.clip_y + s_gpu.clip_h);
+    minx = (int) floorf(fminf(a->x, fminf(b->x, c->x)));
+    maxx = (int) ceilf(fmaxf(a->x, fmaxf(b->x, c->x)));
+    miny = (int) floorf(fminf(a->y, fminf(b->y, c->y)));
+    maxy = (int) ceilf(fmaxf(a->y, fmaxf(b->y, c->y)));
+    if (minx < (int) s_gpu.clip_x) minx = (int) s_gpu.clip_x;
+    if (miny < (int) s_gpu.clip_y) miny = (int) s_gpu.clip_y;
+    if (maxx > (int) (s_gpu.clip_x + s_gpu.clip_w)) maxx = (int) (s_gpu.clip_x + s_gpu.clip_w);
+    if (maxy > (int) (s_gpu.clip_y + s_gpu.clip_h)) maxy = (int) (s_gpu.clip_y + s_gpu.clip_h);
     if (maxx > ZB_W) maxx = ZB_W;
     if (maxy > ZB_H) maxy = ZB_H;
     if (minx >= maxx || miny >= maxy) {
@@ -2895,11 +3100,13 @@ static void raster_triangle_xf(const XfVert *a, const XfVert *b, const XfVert *c
         return;
     }
     s_vp.drawn++;
-    iwa = 1.0f / a->w; iwb = 1.0f / b->w; iwc = 1.0f / c->w;
+    iwa = 1.0f / a->w;
+    iwb = 1.0f / b->w;
+    iwc = 1.0f / c->w;
 
     for (y = miny; y < maxy; y++) {
         for (x = minx; x < maxx; x++) {
-            float px = (float)x + 0.5f, py = (float)y + 0.5f;
+            float px = (float) x + 0.5f, py = (float) y + 0.5f;
             float w0 = (b->x - a->x) * (py - a->y) - (b->y - a->y) * (px - a->x);
             float w1 = (c->x - b->x) * (py - b->y) - (c->y - b->y) * (px - b->x);
             float w2 = (a->x - c->x) * (py - c->y) - (a->y - c->y) * (px - c->x);
@@ -2909,17 +3116,19 @@ static void raster_triangle_xf(const XfVert *a, const XfVert *b, const XfVert *c
             if (!((w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
                 continue;
             /* Barycentrics: w1 is opposite a, w2 opposite b, w0 opposite c. */
-            la = w1 / area; lb = w2 / area; lc = w0 / area;
+            la = w1 / area;
+            lb = w2 / area;
+            lc = w0 / area;
             z = la * a->z + lb * b->z + lc * c->z;
             {
                 /* Stencil test, then depth test, then the matching stencil
                  * op -- the fixed order of the NV2A (and GL). */
-                size_t zi = (size_t)y * ZB_W + (size_t)x;
+                size_t zi = (size_t) y * ZB_W + (size_t) x;
                 float *zp = &s_zbuf[zi];
                 uint8_t *sp = &s_sbuf[zi];
                 if (s_vp.stencil_test
-                        && !stencil_cmp(s_vp.stencil_func, s_vp.stencil_ref & s_vp.stencil_fmask,
-                                        *sp & s_vp.stencil_fmask)) {
+                    && !stencil_cmp(s_vp.stencil_func, s_vp.stencil_ref & s_vp.stencil_fmask,
+                                    *sp & s_vp.stencil_fmask)) {
                     stencil_apply(sp, s_vp.op_fail);
                     continue;
                 }
@@ -2937,35 +3146,38 @@ static void raster_triangle_xf(const XfVert *a, const XfVert *b, const XfVert *c
                 if ((s_vp.color_mask & 0x01010101u) == 0)
                     continue;
             }
-            pa = la * iwa; pb = lb * iwb; pc = lc * iwc;
+            pa = la * iwa;
+            pb = lb * iwb;
+            pc = lc * iwc;
             iw = pa + pb + pc;
             if (iw == 0.0f) continue;
-            pa /= iw; pb /= iw; pc /= iw;
+            pa /= iw;
+            pb /= iw;
+            pc /= iw;
             for (k = 0; k < 4; k++) {
                 col[k] = pa * a->col[k] + pb * b->col[k] + pc * c->col[k];
                 spec[k] = pa * a->spec[k] + pb * b->spec[k] + pc * c->spec[k];
             }
-            argb = ((uint32_t)(col[3] * 255.0f + 0.5f) << 24)
-                 | ((uint32_t)(col[0] * 255.0f + 0.5f) << 16)
-                 | ((uint32_t)(col[1] * 255.0f + 0.5f) << 8)
-                 |  (uint32_t)(col[2] * 255.0f + 0.5f);
+            argb = ((uint32_t) (col[3] * 255.0f + 0.5f) << 24)
+                   | ((uint32_t) (col[0] * 255.0f + 0.5f) << 16)
+                   | ((uint32_t) (col[1] * 255.0f + 0.5f) << 8)
+                   | (uint32_t) (col[2] * 255.0f + 0.5f);
             {
                 float t0[4] = {1.0f, 1.0f, 1.0f, 1.0f};
                 int sampled = 0;
                 uint32_t texel = 0;
                 if (textured) {
-                float su = pa * a->uv[0] + pb * b->uv[0] + pc * c->uv[0];
-                float sv = pa * a->uv[1] + pb * b->uv[1] + pc * c->uv[1];
-                /* Negative coordinates wrap like any other: shift into range
-                 * before the unsigned conversion wrap_coord expects. */
-                if (su < 0.0f) su += (float)s_gpu.tex.width * (floorf(-su / (float)s_gpu.tex.width) + 1.0f);
-                if (sv < 0.0f) sv += (float)s_gpu.tex.height * (floorf(-sv / (float)s_gpu.tex.height) + 1.0f);
-                sampled = sample_texture((uint32_t)su, (uint32_t)sv, &texel);
-                if (sampled)
-                    comb_unpack(texel, t0);
+                    float su = pa * a->uv[0] + pb * b->uv[0] + pc * c->uv[0];
+                    float sv = pa * a->uv[1] + pb * b->uv[1] + pc * c->uv[1];
+                    /* Negative coordinates wrap like any other: shift into range
+                     * before the unsigned conversion wrap_coord expects. */
+                    if (su < 0.0f) su += (float) s_gpu.tex.width * (floorf(-su / (float) s_gpu.tex.width) + 1.0f);
+                    if (sv < 0.0f) sv += (float) s_gpu.tex.height * (floorf(-sv / (float) s_gpu.tex.height) + 1.0f);
+                    sampled = sample_texture((uint32_t) su, (uint32_t) sv, &texel);
+                    if (sampled)
+                        comb_unpack(texel, t0);
                 }
-                if (comb_active())
-                {
+                if (comb_active()) {
                     float tn[3][4];
                     int st;
                     for (st = 1; st < 4; st++) {
@@ -2976,15 +3188,14 @@ static void raster_triangle_xf(const XfVert *a, const XfVert *b, const XfVert *c
                             uint32_t tex2;
                             float su2 = pa * a->uvn[st - 1][0] + pb * b->uvn[st - 1][0] + pc * c->uvn[st - 1][0];
                             float sv2 = pa * a->uvn[st - 1][1] + pb * b->uvn[st - 1][1] + pc * c->uvn[st - 1][1];
-                            if (su2 < 0.0f) su2 += (float)tx->width * (floorf(-su2 / (float)tx->width) + 1.0f);
-                            if (sv2 < 0.0f) sv2 += (float)tx->height * (floorf(-sv2 / (float)tx->height) + 1.0f);
-                            if (sample_stage(st, (uint32_t)su2, (uint32_t)sv2, &tex2))
+                            if (su2 < 0.0f) su2 += (float) tx->width * (floorf(-su2 / (float) tx->width) + 1.0f);
+                            if (sv2 < 0.0f) sv2 += (float) tx->height * (floorf(-sv2 / (float) tx->height) + 1.0f);
+                            if (sample_stage(st, (uint32_t) su2, (uint32_t) sv2, &tex2))
                                 comb_unpack(tex2, o);
                         }
                     }
-                    argb = comb_eval(t0, col, spec, (const float (*)[4])tn);
-                }
-                else if (sampled)
+                    argb = comb_eval(t0, col, spec, (const float (*)[4]) tn);
+                } else if (sampled)
                     argb = modulate(texel, argb);
                 if (comb_trace) {
                     static unsigned shown_fmt[256];
@@ -2994,13 +3205,13 @@ static void raster_triangle_xf(const XfVert *a, const XfVert *b, const XfVert *c
                         int k2;
                         shown++;
                         fprintf(stderr, "  [COMB] active=%d control=%08X stageprog=%08X final0=%08X final1=%08X"
-                                        " t0=%.2f %.2f %.2f %.2f v0=%.2f %.2f %.2f %.2f -> %08X"
-                                        " blend=%u sf=%04X df=%04X atest=%u afunc=%04X aref=%u texfmt=%02X\n",
+                                " t0=%.2f %.2f %.2f %.2f v0=%.2f %.2f %.2f %.2f -> %08X"
+                                " blend=%u sf=%04X df=%04X atest=%u afunc=%04X aref=%u texfmt=%02X\n",
                                 comb_active(), s_comb.control, s_comb.stage_prog, s_comb.final0, s_comb.final1,
                                 t0[0], t0[1], t0[2], t0[3], col[0], col[1], col[2], col[3], argb,
                                 s_gpu.blend, s_gpu.blend_sf, s_gpu.blend_df, s_gpu.alpha_test,
                                 s_gpu.alpha_func, s_gpu.alpha_ref, s_gpu.tex.color);
-                        for (k2 = 0; k2 < (int)(s_comb.control & 0xFF) && k2 < 8; k2++)
+                        for (k2 = 0; k2 < (int) (s_comb.control & 0xFF) && k2 < 8; k2++)
                             fprintf(stderr, "  [COMB]   stage %d: cI %08X cO %08X aI %08X aO %08X f0 %08X f1 %08X\n",
                                     k2, s_comb.color_icw[k2], s_comb.color_ocw[k2], s_comb.alpha_icw[k2],
                                     s_comb.alpha_ocw[k2], s_comb.factor0[k2], s_comb.factor1[k2]);
@@ -3014,10 +3225,9 @@ static void raster_triangle_xf(const XfVert *a, const XfVert *b, const XfVert *c
     s_gpu.drawn_offset = s_gpu.color_offset;
 }
 
-static void xf_lerp(XfVert *o, const XfVert *p, const XfVert *q, float t)
-{
-    const float *a = (const float *)p, *b2 = (const float *)q;
-    float *d = (float *)o;
+static void xf_lerp(XfVert *o, const XfVert *p, const XfVert *q, float t) {
+    const float *a = (const float *) p, *b2 = (const float *) q;
+    float *d = (float *) o;
     size_t k, n = offsetof(XfVert, ok) / sizeof(float);
     for (k = 0; k < n; k++)
         d[k] = a[k] + (b2[k] - a[k]) * t;
@@ -3036,17 +3246,22 @@ static void xf_lerp(XfVert *o, const XfVert *p, const XfVert *q, float t)
 typedef void (*XfTriFn)(void *ctx, const XfVert *a, const XfVert *b, const XfVert *c);
 
 static void raster_tri_clip(const XfVert *a, const XfVert *b, const XfVert *c,
-                            XfTriFn emit, void *ctx)
-{
+                            XfTriFn emit, void *ctx) {
     const float eps = 1e-3f;
     XfVert in[3], out[6];
     int i, m = 0;
 
-    /* Only triangles with an unusable vertex are clipped. A usable screen
-     * position is drawn as-is whatever its w: 2D shaders (NFL 2K5's coach
-     * matchup pie charts) leave w at 0 or below with valid x/y, and clipping
-     * those on w turned them into screen-filling spikes. */
-    if (a->ok && b->ok && c->ok) {
+    /* A triangle with vertices on both sides of the eye plane (some w > eps,
+ * some w <= eps) must be clipped: dividing by a w at or behind the eye
+ * throws its vertex to the far side of the screen. NFL 2K5's ground and
+ * stadium polygons near the camera are like this, with every position
+ * finite (ok), so they used to be drawn as-is -- black wedges and a
+ * missing field in software, garbage slabs on the GPU. Clipping them is
+ * always safe; the pie-chart case below has *all* w at or below 0. */
+    int front = (a->w > eps) + (b->w > eps) + (c->w > eps);
+    int straddles = front > 0 && front < 3;
+
+    if (a->ok && b->ok && c->ok && !straddles) {
         emit(ctx, a, b, c);
         return;
     }
@@ -3057,13 +3272,15 @@ static void raster_tri_clip(const XfVert *a, const XfVert *b, const XfVert *c,
         static int clip_on = -1;
         if (clip_on < 0)
             clip_on = getenv("RECOMP_CLIP") != NULL;
-        if (!clip_on) {
+        if (!clip_on && !straddles) {
             s_vp.rej_bad++;
             if (getenv("RECOMP_VP_TRACE") && (s_vp.rej_bad % 400000) == 1) {
                 const XfVert *vv[3];
                 int q, sl;
                 uint32_t k;
-                vv[0] = a; vv[1] = b; vv[2] = c;
+                vv[0] = a;
+                vv[1] = b;
+                vv[2] = c;
                 fprintf(stderr, "  [VPBAD] prim %u idx %u start %u const_load %u\n",
                         s_gpu.prim, s_gpu.idx_count, s_vp.start, s_vp.const_load);
                 for (q = 0; q < 3; q++) {
@@ -3076,7 +3293,7 @@ static void raster_tri_clip(const XfVert *a, const XfVert *b, const XfVert *c,
                     if (s_gpu.attr[k].size)
                         fprintf(stderr, "  [VPBAD]   attr%u type %u size %u stride %u\n", k,
                                 s_gpu.attr[k].type, s_gpu.attr[k].size, s_gpu.attr[k].stride);
-                for (sl = (int)s_vp.start; sl < VP_PROG_LEN; sl++) {
+                for (sl = (int) s_vp.start; sl < VP_PROG_LEN; sl++) {
                     fprintf(stderr, "  [VPBAD]   prog %3d: %08X %08X %08X %08X\n", sl,
                             s_vp.prog[sl][0], s_vp.prog[sl][1], s_vp.prog[sl][2], s_vp.prog[sl][3]);
                     if (s_vp.prog[sl][3] & 1) break;
@@ -3089,14 +3306,18 @@ static void raster_tri_clip(const XfVert *a, const XfVert *b, const XfVert *c,
             return;
         }
     }
-    in[0] = *a; in[1] = *b; in[2] = *c;
+    in[0] = *a;
+    in[1] = *b;
+    in[2] = *c;
     for (i = 0; i < 3; i++) {
         XfVert *v = &in[i];
         if (!(v->w == v->w) || !(v->x == v->x) || !(v->y == v->y) || !(v->z == v->z)) {
             s_vp.rej_bad++;
             return;
         }
-        v->x *= v->w; v->y *= v->w; v->z *= v->w;
+        v->x *= v->w;
+        v->y *= v->w;
+        v->z *= v->w;
     }
     for (i = 0; i < 3; i++) {
         const XfVert *p = &in[i], *q = &in[(i + 1) % 3];
@@ -3112,7 +3333,9 @@ static void raster_tri_clip(const XfVert *a, const XfVert *b, const XfVert *c,
     }
     for (i = 0; i < m; i++) {
         XfVert *v = &out[i];
-        v->x /= v->w; v->y /= v->w; v->z /= v->w;
+        v->x /= v->w;
+        v->y /= v->w;
+        v->z /= v->w;
         v->ok = (v->x == v->x) && (v->y == v->y);
     }
     for (i = 1; i + 1 < m; i++)
@@ -3123,8 +3346,7 @@ static void raster_tri_clip(const XfVert *a, const XfVert *b, const XfVert *c,
  * program and near-plane clipping, in draw order. Shared by the software
  * rasterizer and the GPU renderers, so both draw exactly the same
  * triangles (as batch_triangles does for 2D). */
-static void batch_triangles_xf(XfTriFn emit, void *ctx)
-{
+static void batch_triangles_xf(XfTriFn emit, void *ctx) {
     uint32_t i, n = s_gpu.idx_count;
     const uint16_t *ix = s_gpu.idx;
 
@@ -3138,7 +3360,7 @@ static void batch_triangles_xf(XfTriFn emit, void *ctx)
         case NV_PRIM_TRIANGLE_STRIP:
             for (i = 0; i + 2 < n; i++) {
                 if (i & 1) raster_tri_clip(XV(i + 1), XV(i), XV(i + 2), emit, ctx);
-                else       raster_tri_clip(XV(i), XV(i + 1), XV(i + 2), emit, ctx);
+                else raster_tri_clip(XV(i), XV(i + 1), XV(i + 2), emit, ctx);
             }
             break;
         case NV_PRIM_TRIANGLE_FAN:
@@ -3159,28 +3381,26 @@ static void batch_triangles_xf(XfTriFn emit, void *ctx)
             }
             break;
         default:
-            break;                             /* points and lines: not yet */
+            break; /* points and lines: not yet */
     }
 #undef XV
 }
 
-static void raster_xf_cb(void *ctx, const XfVert *a, const XfVert *b, const XfVert *c)
-{
-    (void)ctx;
+static void raster_xf_cb(void *ctx, const XfVert *a, const XfVert *b, const XfVert *c) {
+    (void) ctx;
     raster_triangle_xf(a, b, c);
 }
 
 /* Batches drawn through a vertex program (3D) since the last present: a
  * frame without any is a full-screen 2D card (nv2a_gpu_present.inc.c). */
 static volatile LONG s_frame_vp_draws;
-static unsigned s_begin_seq;               /* BEGINs seen (RECOMP_IDX_DUMP: which draws share one) */
-static int s_elements_seen;                 /* this BEGIN has had ARRAY_ELEMENT indices */
+static unsigned s_begin_seq; /* BEGINs seen (RECOMP_IDX_DUMP: which draws share one) */
+static int s_elements_seen; /* this BEGIN has had ARRAY_ELEMENT indices */
 #include "nv2a_gpu_d3d11.inc.c"
 
 /* Draw the current batch through the vertex program. */
 
-static void raster_batch_xf(void)
-{
+static void raster_batch_xf(void) {
     if (gpu_enabled()) {
         if (gpu_draw_batch(0))
             return;
@@ -3195,8 +3415,7 @@ static void raster_batch_xf(void)
 /* Count constant arrays once per batch, never from the per-vertex fetch path.
  * This is deliberately opt-in and bounded so input diagnostics do not change
  * normal match pacing. */
-static void trace_constant_arrays(void)
-{
+static void trace_constant_arrays(void) {
     static uint32_t batches, counts[NV_VERTEX_ATTRS], reports;
     uint32_t a, mask = 0;
     if (!env_cached("RECOMP_ATTR_TRACE"))
@@ -3222,8 +3441,7 @@ static void trace_constant_arrays(void)
     fprintf(stderr, "\n");
 }
 
-static void trace_zeta_surface(void)
-{
+static void trace_zeta_surface(void) {
     static uint32_t seen[32][9], count;
     uint32_t i;
     uint32_t key[9] = {
@@ -3248,44 +3466,52 @@ static void trace_zeta_surface(void)
 /* RECOMP_VB_WATCH=1: does the title rewrite a skinned batch's vertex data
  * after the draw was executed? Each such draw records a hash of the vertex
  * range it read; every later kick rehashes it. */
-static struct { uint32_t addr, len, hash, kick; } s_vbw[64];
+static struct {
+    uint32_t addr, len, hash, kick;
+} s_vbw[64];
+
 static uint32_t s_vbw_kick;
-static int vbw_hash(uint32_t addr, uint32_t len, uint32_t *result)
-{
+
+static int vbw_hash(uint32_t addr, uint32_t len, uint32_t *result) {
     uint32_t h = 2166136261u, i, done = 0;
     uint8_t bytes[4096];
     while (done < len) {
         size_t count = len - done;
         if (count > sizeof(bytes)) count = sizeof(bytes);
-        if (!pb_diagnostic_read((uint64_t)addr + done,bytes,count)) return 0;
-        for (i=0;i<count;i++) h=(h ^ bytes[i])*16777619u;
-        done += (uint32_t)count;
+        if (!pb_diagnostic_read((uint64_t) addr + done, bytes, count)) return 0;
+        for (i = 0; i < count; i++) h = (h ^ bytes[i]) * 16777619u;
+        done += (uint32_t) count;
     }
-    *result=h;
+    *result = h;
     return 1;
 }
-static void vbw_record(void)
-{
+
+static void vbw_record(void) {
     static int on = -1;
     uint32_t i, maxi = 0, len, k;
     if (on < 0) on = getenv("RECOMP_VB_WATCH") != NULL;
     if (!on || s_gpu.attr[1].type != 5 || !s_gpu.attr[0].stride || !s_gpu.idx_count) return;
     for (i = 0; i < s_gpu.idx_count; i++) if (s_gpu.idx[i] > maxi) maxi = s_gpu.idx[i];
-    uint64_t length=((uint64_t)maxi+1)*s_gpu.attr[0].stride;
+    uint64_t length = ((uint64_t) maxi + 1) * s_gpu.attr[0].stride;
     if (length > (1u << 20)) return;
-    len=(uint32_t)length;
-    {   /* static or rewritten between draws? per address, summary every 5 s */
-        static struct { uint32_t addr, hash, draws, changes; } t[256];
+    len = (uint32_t) length;
+    {
+        /* static or rewritten between draws? per address, summary every 5 s */
+        static struct {
+            uint32_t addr, hash, draws, changes;
+        } t[256];
         static DWORD last;
         uint32_t h, q;
-        if (!vbw_hash(s_gpu.attr[0].offset,len,&h)) {
-            fprintf(stderr,"  [VBWATCH] vertex hash unavailable at %08X\n",s_gpu.attr[0].offset);
+        if (!vbw_hash(s_gpu.attr[0].offset, len, &h)) {
+            fprintf(stderr, "  [VBWATCH] vertex hash unavailable at %08X\n", s_gpu.attr[0].offset);
             return;
         }
         for (q = 0; q < 256; q++)
             if (!t[q].addr || t[q].addr == s_gpu.attr[0].offset) {
                 if (t[q].addr && t[q].hash != h) t[q].changes++;
-                t[q].addr = s_gpu.attr[0].offset; t[q].hash = h; t[q].draws++;
+                t[q].addr = s_gpu.attr[0].offset;
+                t[q].hash = h;
+                t[q].draws++;
                 break;
             }
         if (GetTickCount() - last > 5000) {
@@ -3294,7 +3520,8 @@ static void vbw_record(void)
             for (q = 0; q < 256 && t[q].addr; q++) {
                 if (t[q].changes) {
                     dyn++;
-                    if (dyn <= 12) fprintf(stderr, "  [VBDYN] %08X changed %u of %u draws\n", t[q].addr, t[q].changes, t[q].draws);
+                    if (dyn <= 12) fprintf(stderr, "  [VBDYN] %08X changed %u of %u draws\n", t[q].addr, t[q].changes,
+                                           t[q].draws);
                 } else stat++;
             }
             fprintf(stderr, "  [VBDYN] skinned buffers: %u static, %u rewritten\n", stat, dyn);
@@ -3302,14 +3529,18 @@ static void vbw_record(void)
     }
     for (k = 0; k < 64; k++)
         if (!s_vbw[k].len || s_vbw[k].addr == s_gpu.attr[0].offset) {
-            s_vbw[k].addr = s_gpu.attr[0].offset; s_vbw[k].len = len;
-            if (!vbw_hash(s_vbw[k].addr,len,&s_vbw[k].hash)) { s_vbw[k].len=0; return; }
+            s_vbw[k].addr = s_gpu.attr[0].offset;
+            s_vbw[k].len = len;
+            if (!vbw_hash(s_vbw[k].addr, len, &s_vbw[k].hash)) {
+                s_vbw[k].len = 0;
+                return;
+            }
             s_vbw[k].kick = s_vbw_kick;
             return;
         }
 }
-void nv2a_vb_watch_kick(void)
-{
+
+void nv2a_vb_watch_kick(void) {
     static int shown;
     uint32_t k;
     s_vbw_kick++;
@@ -3317,9 +3548,9 @@ void nv2a_vb_watch_kick(void)
         uint32_t d, hash;
         if (!s_vbw[k].len || s_vbw[k].kick == s_vbw_kick) continue;
         d = s_vbw_kick - s_vbw[k].kick;
-        if (!vbw_hash(s_vbw[k].addr,s_vbw[k].len,&hash)) {
-            fprintf(stderr,"  [VBWATCH] vertex hash unavailable at %08X\n",s_vbw[k].addr);
-            s_vbw[k].len=0;
+        if (!vbw_hash(s_vbw[k].addr, s_vbw[k].len, &hash)) {
+            fprintf(stderr, "  [VBWATCH] vertex hash unavailable at %08X\n", s_vbw[k].addr);
+            s_vbw[k].len = 0;
         } else if (hash != s_vbw[k].hash) {
             if (shown++ < 40)
                 fprintf(stderr, "  [VBWATCH] skinned vertex data %08X (+%u) changed %u kick(s) after its draw\n",
@@ -3333,8 +3564,7 @@ void nv2a_vb_watch_kick(void)
 
 /* RECOMP_DRAW_LOG=<ms>: list 600 draws starting that long after the first
  * draw (one scene's worth): layout, program, texture. */
-static void draw_list_log(void)
-{
+static void draw_list_log(void) {
     static int on = -1;
     static DWORD t0;
     static unsigned n;
@@ -3342,7 +3572,7 @@ static void draw_list_log(void)
     if (on < 0) on = getenv("RECOMP_DRAW_LOG") != NULL;
     if (!on || n >= 600) return;
     if (!t0) t0 = GetTickCount();
-    if (GetTickCount() - t0 < (DWORD)atoi(getenv("RECOMP_DRAW_LOG"))) return;
+    if (GetTickCount() - t0 < (DWORD) atoi(getenv("RECOMP_DRAW_LOG"))) return;
     n++;
     fprintf(stderr, "  [DRAWLOG] #%u prim %u idx %u vpstart %u mode %u tex %08X fmt %02X %ux%u |",
             n, s_gpu.prim, s_gpu.idx_count, s_vp.start, s_vp.mode, s_gpu.tex.valid ? s_gpu.tex.offset : 0,
@@ -3354,8 +3584,7 @@ static void draw_list_log(void)
     fputc('\n', stderr);
 }
 
-static void draw_primitive(void)
-{
+static void draw_primitive(void) {
     float v[4];
     uint32_t i;
 
@@ -3365,7 +3594,7 @@ static void draw_primitive(void)
     surface_stage_reset();
     if (!snapshot_textures()) {
         static unsigned failures;
-        if (failures++ < 8) fprintf(stderr,"  [GPU] unreadable texture batch skipped\n");
+        if (failures++ < 8) fprintf(stderr, "  [GPU] unreadable texture batch skipped\n");
         return;
     }
 #endif
@@ -3383,7 +3612,7 @@ static void draw_primitive(void)
         lastvp[s_gpu.prim & 15] = vp_active();
         if ((s_gpu.draws % 2000) == 0) {
             int k;
-            fprintf(stderr, "[PRIM] t=%lu", (unsigned long)GetTickCount());
+            fprintf(stderr, "[PRIM] t=%lu", (unsigned long) GetTickCount());
             for (k = 1; k < 11; k++)
                 if (counts[k]) fprintf(stderr, " %d:%u(n%u%s)", k, counts[k], lastn[k], lastvp[k] ? ",vp" : "");
             fprintf(stderr, "\n");
@@ -3401,24 +3630,38 @@ static void draw_primitive(void)
         static unsigned at;
         static unsigned want = 13, wfmt = 0xFFFFFFFFu;
         static FILE *df;
-        static int state;                       /* 0 waiting, 1 dumping, 2 done */
-        if (!t0) { t0 = GetTickCount(); sscanf(env_cached("RECOMP_IDX_DUMP"), "%u,%u,%x", &at, &want, &wfmt); }
-        #define IDX_MATCH ((want == 999 || s_vp.start == want) && (wfmt == 0xFFFFFFFFu || (s_gpu.tex.valid && s_gpu.tex.color == wfmt)))
-        if (state == 0 && GetTickCount() - t0 >= at && IDX_MATCH) { state = 1; df = fopen("logs\\idxdump.txt", "w"); at = GetTickCount(); }
-        if (state == 1 && GetTickCount() - at > 120) { state = 2; if (df) fclose(df); df = NULL; }
+        static int state; /* 0 waiting, 1 dumping, 2 done */
+        if (!t0) {
+            t0 = GetTickCount();
+            sscanf(env_cached("RECOMP_IDX_DUMP"), "%u,%u,%x", &at, &want, &wfmt);
+        }
+#define IDX_MATCH ((want == 999 || s_vp.start == want) && (wfmt == 0xFFFFFFFFu || (s_gpu.tex.valid && s_gpu.tex.color == wfmt)))
+        if (state == 0 && GetTickCount() - t0 >= at && IDX_MATCH) {
+            state = 1;
+            df = fopen("logs\\idxdump.txt", "w");
+            at = GetTickCount();
+        }
+        if (state == 1 && GetTickCount() - at > 120) {
+            state = 2;
+            if (df) fclose(df);
+            df = NULL;
+        }
         if (state == 1 && df && IDX_MATCH) {
             uint32_t k;
-            fprintf(df, "D %u prim %u n %u tex %08X %ux%u a0 %u/%u/%u a1 %u/%u/%u begin %u\n", s_gpu.draws, s_gpu.prim, s_gpu.idx_count,
+            fprintf(df, "D %u prim %u n %u tex %08X %ux%u a0 %u/%u/%u a1 %u/%u/%u begin %u\n", s_gpu.draws, s_gpu.prim,
+                    s_gpu.idx_count,
                     s_gpu.tex.valid ? s_gpu.tex.offset : 0, s_gpu.tex.width, s_gpu.tex.height,
                     s_gpu.attr[0].type, s_gpu.attr[0].size, s_gpu.attr[0].stride,
                     s_gpu.attr[1].type, s_gpu.attr[1].size, s_gpu.attr[1].stride, s_begin_seq);
             for (k = 0; k < VP_CONSTS; k++)
                 fprintf(df, "C %u %g %g %g %g\n", k, s_vp.c[k][0], s_vp.c[k][1], s_vp.c[k][2], s_vp.c[k][3]);
-            {   /* the program, decoded elsewhere: raw words */
+            {
+                /* the program, decoded elsewhere: raw words */
                 uint32_t q;
                 fprintf(df, "P");
                 for (q = s_vp.start; q < s_vp.start + 40 && q < VP_PROG_LEN; q++)
-                    fprintf(df, " %08X%08X%08X%08X", s_vp.prog[q][0], s_vp.prog[q][1], s_vp.prog[q][2], s_vp.prog[q][3]);
+                    fprintf(df, " %08X%08X%08X%08X", s_vp.prog[q][0], s_vp.prog[q][1], s_vp.prog[q][2],
+                            s_vp.prog[q][3]);
                 fprintf(df, "\n");
             }
             fprintf(df, "I");
@@ -3431,12 +3674,15 @@ static void draw_primitive(void)
                 fprintf(df, "V %u %g %g %g %g %g\n", s_gpu.idx[k], p[0], p[1], p[2], b[0], b[1]);
                 {
                     float V[16][4], O[16][4];
-                    uint32_t a; int r;
+                    uint32_t a;
+                    int r;
                     for (a = 0; a < NV_VERTEX_ATTRS; a++) fetch_attr(&s_gpu.attr[a], s_gpu.idx[k], V[a]);
                     vp_run(V, O);
-                    fprintf(df, "O %g %g %g %g a0 %d D %g %g %g %g T %g %g", O[0][0], O[0][1], O[0][2], O[0][3], s_vp_dbg_a0, O[3][0], O[3][1], O[3][2], O[3][3], O[9][0], O[9][1]);
+                    fprintf(df, "O %g %g %g %g a0 %d D %g %g %g %g T %g %g", O[0][0], O[0][1], O[0][2], O[0][3],
+                            s_vp_dbg_a0, O[3][0], O[3][1], O[3][2], O[3][3], O[9][0], O[9][1]);
                     for (r = 0; r < 12; r++)
-                        fprintf(df, " R%d %g %g %g %g", r, s_vp_dbg_r[r][0], s_vp_dbg_r[r][1], s_vp_dbg_r[r][2], s_vp_dbg_r[r][3]);
+                        fprintf(df, " R%d %g %g %g %g", r, s_vp_dbg_r[r][0], s_vp_dbg_r[r][1], s_vp_dbg_r[r][2],
+                                s_vp_dbg_r[r][3]);
                     fprintf(df, "\n");
                 }
             }
@@ -3475,24 +3721,23 @@ static void draw_primitive(void)
         if (vp_active()) {
             s_frame_vp_draws++;
             raster_batch_xf();
-        }
-        else if (!(gpu_enabled() && gpu_draw_batch(1))) {
+        } else if (!(gpu_enabled() && gpu_draw_batch(1))) {
             if (gpu_enabled())
                 gpu_cpu_access();
             raster_batch();
         }
 #if defined(_WIN32)
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        static unsigned faults;
-        if (faults++ < 8)
-            fprintf(stderr, "  [GPU] batch %u faulted (exception 0x%08lX); skipped\n",
-                    s_gpu.draws, (unsigned long)GetExceptionCode());
-    }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+            static unsigned faults;
+            if (faults++ < 8)
+                fprintf(stderr, "  [GPU] batch %u faulted (exception 0x%08lX); skipped\n",
+                        s_gpu.draws, (unsigned long) GetExceptionCode());
+        }
 #else
     }
 #endif
-    if (!surface_stage_flush((const uint8_t *)xbox_GetMemoryOffset()))
-        fprintf(stderr,"  [GPU] framebuffer copy failed; output may be partial\n");
+    if (!surface_stage_flush((const uint8_t *) xbox_GetMemoryOffset()))
+        fprintf(stderr, "  [GPU] framebuffer copy failed; output may be partial\n");
     surface_stage_reset();
 
     /* An array attribute leaves its last element behind as the inline value
@@ -3508,7 +3753,9 @@ static void draw_primitive(void)
             float v[4];
             if (s_gpu.attr[a].size && fetch_attr(&s_gpu.attr[a], last, v)) {
                 if (s_gpu.attr[a].type == 0 && s_gpu.attr[a].stride) {
-                    float t = v[0]; v[0] = v[2]; v[2] = t;
+                    float t = v[0];
+                    v[0] = v[2];
+                    v[2] = t;
                 }
                 if (s_gpu.attr[a].type == 6) {
                     uint32_t c;
@@ -3519,8 +3766,8 @@ static void draw_primitive(void)
             }
         }
 #if defined(_WIN32)
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-    }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        }
 #else
     }
 #endif
@@ -3529,7 +3776,7 @@ static void draw_primitive(void)
         static int shown;
         if (shown++ < 6) {
             fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
-                            " off 0x%08X type %u size %u stride %u\n",
+                    " off 0x%08X type %u size %u stride %u\n",
                     s_gpu.prim, s_gpu.idx_count, s_gpu.attr[0].offset,
                     s_gpu.attr[0].type, s_gpu.attr[0].size, s_gpu.attr[0].stride);
             /* The texture stage, for either kind of batch. This used to print
@@ -3538,7 +3785,7 @@ static void draw_primitive(void)
              * texture state at all, and the reason a quad sampled flat was
              * invisible. */
             fprintf(stderr, "  [GPU]   tex: off 0x%08X %ux%u pitch %u"
-                            " colour 0x%02X swizzled %d valid %d\n",
+                    " colour 0x%02X swizzled %d valid %d\n",
                     s_gpu.tex.offset, s_gpu.tex.width, s_gpu.tex.height,
                     s_gpu.tex.pitch, s_gpu.tex.color,
                     d3d8_format_is_swizzled(s_gpu.tex.color), s_gpu.tex.valid);
@@ -3566,7 +3813,7 @@ static void draw_primitive(void)
                                 k, t[0], t[1]);
                 }
                 fprintf(stderr, "  [GPU]   tex: off 0x%08X %ux%u pitch %u"
-                                " colour 0x%02X valid %d\n",
+                        " colour 0x%02X valid %d\n",
                         s_gpu.tex.offset, s_gpu.tex.width, s_gpu.tex.height,
                         s_gpu.tex.pitch, s_gpu.tex.color, s_gpu.tex.valid);
             }
@@ -3574,7 +3821,7 @@ static void draw_primitive(void)
                 /* Every attribute the batch has, not just position. If the
                  * other streams carry data and position does not, the problem
                  * is one buffer rather than the whole vertex path. */
-                const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+                const uint8_t *mem = (const uint8_t *) xbox_GetMemoryOffset();
                 uint32_t a, k;
                 for (a = 0; a < NV_VERTEX_ATTRS; a++) {
                     const VertexAttr *at = &s_gpu.attr[a];
@@ -3583,8 +3830,8 @@ static void draw_primitive(void)
                         continue;
 #if defined(__linux__)
                     uint8_t bytes[64];
-                    if (!pb_diagnostic_read(at->offset,bytes,sizeof bytes)) {
-                        fprintf(stderr,"  [GPU] attr%u bytes unavailable\n",a);
+                    if (!pb_diagnostic_read(at->offset, bytes, sizeof bytes)) {
+                        fprintf(stderr, "  [GPU] attr%u bytes unavailable\n", a);
                         continue;
                     }
                     for (k = 0; k < sizeof bytes; ++k) if (bytes[k]) ++nz;
@@ -3593,7 +3840,7 @@ static void draw_primitive(void)
                         if (mem[at->offset + k]) nz++;
 #endif
                     fprintf(stderr, "  [GPU]   attr%-2u off 0x%08X type %u"
-                                    " size %u stride %-3u  %u/64 bytes set\n",
+                            " size %u stride %-3u  %u/64 bytes set\n",
                             a, at->offset, at->type, at->size, at->stride, nz);
                 }
             }
@@ -3601,14 +3848,14 @@ static void draw_primitive(void)
                 /* Raw bytes at the array, in case the values read as zero:
                  * that looks the same whether the offset is wrong or the
                  * buffer genuinely has not been filled yet. */
-                const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+                const uint8_t *mem = (const uint8_t *) xbox_GetMemoryOffset();
                 uint32_t k;
                 fprintf(stderr, "  [GPU]   bytes @0x%08X:", s_gpu.attr[0].offset);
 #if defined(__linux__)
                 uint8_t bytes[32];
-                if (pb_diagnostic_read(s_gpu.attr[0].offset,bytes,sizeof bytes)) {
-                    for (k = 0; k < sizeof bytes; ++k) fprintf(stderr," %02X",bytes[k]);
-                } else fprintf(stderr," unavailable");
+                if (pb_diagnostic_read(s_gpu.attr[0].offset, bytes, sizeof bytes)) {
+                    for (k = 0; k < sizeof bytes; ++k) fprintf(stderr, " %02X", bytes[k]);
+                } else fprintf(stderr, " unavailable");
 #else
                 for (k = 0; k < 32; k++)
                     fprintf(stderr, " %02X", mem[s_gpu.attr[0].offset + k]);
@@ -3634,23 +3881,29 @@ static void draw_primitive(void)
  * the strip's winding alternation -- a fan's centre and last vertex). The
  * rest used to be dropped, which removed the end of every large mesh: holes
  * in faces and missing pieces of players (2026-10-02). */
-static void idx_make_room(uint32_t need)
-{
+static void idx_make_room(uint32_t need) {
     uint32_t n = s_gpu.idx_count, keep = 0, k;
     uint16_t carry[4];
     if (n + need <= NV_MAX_INDICES)
         return;
     switch (s_gpu.prim) {
-    case NV_PRIM_TRIANGLES:      keep = n % 3; break;
-    case NV_PRIM_QUADS:          keep = n % 4; break;
-    case NV_PRIM_LINES:          keep = n % 2; break;
-    case NV_PRIM_TRIANGLE_STRIP:
-    case NV_PRIM_QUAD_STRIP:     keep = (n % 2 == 0) ? 2 : 3; break;
-    case NV_PRIM_LINE_STRIP:
-    case NV_PRIM_LINE_LOOP:      keep = 1; break;
-    case NV_PRIM_TRIANGLE_FAN:
-    case NV_PRIM_POLYGON:        keep = 2; break;
-    default:                     keep = 0; break;
+        case NV_PRIM_TRIANGLES: keep = n % 3;
+            break;
+        case NV_PRIM_QUADS: keep = n % 4;
+            break;
+        case NV_PRIM_LINES: keep = n % 2;
+            break;
+        case NV_PRIM_TRIANGLE_STRIP:
+        case NV_PRIM_QUAD_STRIP: keep = (n % 2 == 0) ? 2 : 3;
+            break;
+        case NV_PRIM_LINE_STRIP:
+        case NV_PRIM_LINE_LOOP: keep = 1;
+            break;
+        case NV_PRIM_TRIANGLE_FAN:
+        case NV_PRIM_POLYGON: keep = 2;
+            break;
+        default: keep = 0;
+            break;
     }
     if (keep > n) keep = n;
     if (s_gpu.prim == NV_PRIM_TRIANGLE_FAN || s_gpu.prim == NV_PRIM_POLYGON) {
@@ -3682,8 +3935,7 @@ static void idx_make_room(uint32_t need)
  * float and D3DCOLOR formats every inline batch actually uses; a packed
  * sub-dword attribute would need the unpadded layout.
  */
-static void draw_inline_array(void)
-{
+static void draw_inline_array(void) {
     VertexAttr saved[NV_VERTEX_ATTRS];
     uint32_t off = 0, a, i, vsize, count;
 
@@ -3694,16 +3946,22 @@ static void draw_inline_array(void)
         if (!s_gpu.attr[a].size)
             continue;
         switch (s_gpu.attr[a].type) {
-        case 0:  bytes = 4;                        break;  /* D3DCOLOR   */
-        case 2:  bytes = 4 * s_gpu.attr[a].size;   break;  /* float      */
-        case 4:  bytes = s_gpu.attr[a].size;       break;  /* ubyte norm */
-        /* Shorts are two bytes each. Sizing them as floats pushed every later
-         * attribute 4 bytes too far: NFL 2K5's movie quad (float3, short2,
-         * D3DCOLOR, float2 = 28 bytes) decoded at stride 32 with x = 0. */
-        case 1:                                            /* short norm */
-        case 5:  bytes = 2 * s_gpu.attr[a].size;   break;  /* short      */
-        case 6:  bytes = 4;                        break;  /* packed CMP */
-        default: bytes = 4 * s_gpu.attr[a].size;   break;
+            case 0: bytes = 4;
+                break; /* D3DCOLOR   */
+            case 2: bytes = 4 * s_gpu.attr[a].size;
+                break; /* float      */
+            case 4: bytes = s_gpu.attr[a].size;
+                break; /* ubyte norm */
+            /* Shorts are two bytes each. Sizing them as floats pushed every later
+             * attribute 4 bytes too far: NFL 2K5's movie quad (float3, short2,
+             * D3DCOLOR, float2 = 28 bytes) decoded at stride 32 with x = 0. */
+            case 1: /* short norm */
+            case 5: bytes = 2 * s_gpu.attr[a].size;
+                break; /* short      */
+            case 6: bytes = 4;
+                break; /* packed CMP */
+            default: bytes = 4 * s_gpu.attr[a].size;
+                break;
         }
         s_gpu.attr[a].offset = off;
         off += (bytes + 3u) & ~3u;
@@ -3722,7 +3980,7 @@ static void draw_inline_array(void)
             s_gpu.attr[a].stride = vsize;
 
     for (i = 0; i < count; i++)
-        s_gpu.idx[i] = (uint16_t)i;
+        s_gpu.idx[i] = (uint16_t) i;
     s_gpu.idx_count = count;
 
     s_gpu.inline_active = 1;
@@ -3748,8 +4006,7 @@ out:
  * carries and what this rasteriser samples; a second texcoord set or a normal
  * would need the D3D11 translator, not more slots here.
  */
-static void draw_immediate(void)
-{
+static void draw_immediate(void) {
     VertexAttr saved[NV_VERTEX_ATTRS];
     uint32_t i;
 
@@ -3761,17 +4018,20 @@ static void draw_immediate(void)
     /* Offsets are byte offsets into inline_buf here, not guest addresses --
      * fetch_attr reads them that way while inline_active is set, which is
      * also why 0 is a legal offset for position. */
-    s_gpu.attr[0].type = 2; s_gpu.attr[0].size = 4;   /* position float4  */
+    s_gpu.attr[0].type = 2;
+    s_gpu.attr[0].size = 4; /* position float4  */
     s_gpu.attr[0].offset = 0;
-    s_gpu.attr[3].type = 0; s_gpu.attr[3].size = 4;   /* diffuse D3DCOLOR */
+    s_gpu.attr[3].type = 0;
+    s_gpu.attr[3].size = 4; /* diffuse D3DCOLOR */
     s_gpu.attr[3].offset = 16;
-    s_gpu.attr[9].type = 2; s_gpu.attr[9].size = 2;   /* texcoord0 float2 */
+    s_gpu.attr[9].type = 2;
+    s_gpu.attr[9].size = 2; /* texcoord0 float2 */
     s_gpu.attr[9].offset = 20;
     s_gpu.attr[0].stride = s_gpu.attr[3].stride = s_gpu.attr[9].stride =
-        IMM_VERTEX_DWORDS * 4;
+                                                  IMM_VERTEX_DWORDS * 4;
 
     for (i = 0; i < s_gpu.imm_count && i < NV_MAX_INDICES; i++)
-        s_gpu.idx[i] = (uint16_t)i;
+        s_gpu.idx[i] = (uint16_t) i;
     s_gpu.idx_count = i;
 
     /* fetch_attr bounds-checks against inline_count dwords. */
@@ -3786,13 +4046,12 @@ static void draw_immediate(void)
 }
 
 /* A vertex is complete: append it in the layout draw_immediate describes. */
-static void imm_emit_vertex(void)
-{
+static void imm_emit_vertex(void) {
     uint32_t at = s_gpu.imm_count * IMM_VERTEX_DWORDS;
 
     if (!s_gpu.prim || at + IMM_VERTEX_DWORDS > NV_MAX_INLINE)
         return;
-    memcpy(&s_gpu.inline_buf[at],     s_gpu.imm_pos, 4 * sizeof(float));
+    memcpy(&s_gpu.inline_buf[at], s_gpu.imm_pos, 4 * sizeof(float));
     memcpy(&s_gpu.inline_buf[at + 4], &s_gpu.imm_diffuse, sizeof(uint32_t));
     memcpy(&s_gpu.inline_buf[at + 5], s_gpu.imm_tex, 2 * sizeof(float));
     s_gpu.imm_count++;
@@ -3803,35 +4062,42 @@ static void imm_emit_vertex(void)
  * Split out because it is a range test against five separate bases, and that
  * reads better than five more cases in an already long switch.
  */
-static int imm_vertex_method(uint32_t method, uint32_t param)
-{
-    union { uint32_t u; float f; } v;
+static int imm_vertex_method(uint32_t method, uint32_t param) {
+    union {
+        uint32_t u;
+        float f;
+    } v;
     v.u = param;
 
     /* Every SET_VERTEX_DATA* write is also the attribute's inline value
      * (xemu pgraph.c), whatever else it does below. */
-    if (method >= 0x1880 && method < 0x1880 + NV_VERTEX_ATTRS * 8) {        /* DATA2F_M */
+    if (method >= 0x1880 && method < 0x1880 + NV_VERTEX_ATTRS * 8) {
+        /* DATA2F_M */
         uint32_t a = (method - 0x1880) / 8, c = ((method - 0x1880) % 8) / 4;
         s_attr_inline[a][c] = v.f;
         s_attr_inline[a][2] = 0.0f;
         s_attr_inline[a][3] = 1.0f;
-    } else if (method >= 0x1900 && method < 0x1900 + NV_VERTEX_ATTRS * 4) { /* DATA2S */
+    } else if (method >= 0x1900 && method < 0x1900 + NV_VERTEX_ATTRS * 4) {
+        /* DATA2S */
         uint32_t a = (method - 0x1900) / 4;
-        s_attr_inline[a][0] = (float)(int16_t)(param & 0xFFFF);
-        s_attr_inline[a][1] = (float)(int16_t)(param >> 16);
+        s_attr_inline[a][0] = (float) (int16_t) (param & 0xFFFF);
+        s_attr_inline[a][1] = (float) (int16_t) (param >> 16);
         s_attr_inline[a][2] = 0.0f;
         s_attr_inline[a][3] = 1.0f;
-    } else if (method >= 0x1940 && method < 0x1940 + NV_VERTEX_ATTRS * 4) { /* DATA4UB */
+    } else if (method >= 0x1940 && method < 0x1940 + NV_VERTEX_ATTRS * 4) {
+        /* DATA4UB */
         uint32_t a = (method - 0x1940) / 4;
-        s_attr_inline[a][0] = (float)(param & 0xFF) / 255.0f;
-        s_attr_inline[a][1] = (float)((param >> 8) & 0xFF) / 255.0f;
-        s_attr_inline[a][2] = (float)((param >> 16) & 0xFF) / 255.0f;
-        s_attr_inline[a][3] = (float)(param >> 24) / 255.0f;
-    } else if (method >= 0x1980 && method < 0x1980 + NV_VERTEX_ATTRS * 8) { /* DATA4S_M */
+        s_attr_inline[a][0] = (float) (param & 0xFF) / 255.0f;
+        s_attr_inline[a][1] = (float) ((param >> 8) & 0xFF) / 255.0f;
+        s_attr_inline[a][2] = (float) ((param >> 16) & 0xFF) / 255.0f;
+        s_attr_inline[a][3] = (float) (param >> 24) / 255.0f;
+    } else if (method >= 0x1980 && method < 0x1980 + NV_VERTEX_ATTRS * 8) {
+        /* DATA4S_M */
         uint32_t a = (method - 0x1980) / 8, part = ((method - 0x1980) % 8) / 4;
-        s_attr_inline[a][part * 2 + 0] = (float)(int16_t)(param & 0xFFFF);
-        s_attr_inline[a][part * 2 + 1] = (float)(int16_t)(param >> 16);
-    } else if (method >= 0x1A00 && method < 0x1A00 + NV_VERTEX_ATTRS * 16) { /* DATA4F_M */
+        s_attr_inline[a][part * 2 + 0] = (float) (int16_t) (param & 0xFFFF);
+        s_attr_inline[a][part * 2 + 1] = (float) (int16_t) (param >> 16);
+    } else if (method >= 0x1A00 && method < 0x1A00 + NV_VERTEX_ATTRS * 16) {
+        /* DATA4F_M */
         s_attr_inline[(method - 0x1A00) / 16][((method - 0x1A00) % 16) / 4] = v.f;
     }
     if (method >= 0x1900 && method < 0x1900 + NV_VERTEX_ATTRS * 4)
@@ -3842,28 +4108,29 @@ static int imm_vertex_method(uint32_t method, uint32_t param)
     if (method >= NV097_SET_VERTEX4F && method < NV097_SET_VERTEX4F + 16) {
         uint32_t c = (method - NV097_SET_VERTEX4F) / 4;
         s_gpu.imm_pos[c] = v.f;
-        if (c == 3)                      /* w completes the vertex */
+        if (c == 3) /* w completes the vertex */
             imm_emit_vertex();
         return 1;
     }
     if (method >= NV097_SET_VERTEX3F && method < NV097_SET_VERTEX3F + 12) {
         uint32_t c = (method - NV097_SET_VERTEX3F) / 4;
         s_gpu.imm_pos[c] = v.f;
-        if (c == 2) {                    /* z completes it, w is implicitly 1 */
+        if (c == 2) {
+            /* z completes it, w is implicitly 1 */
             s_gpu.imm_pos[3] = 1.0f;
             imm_emit_vertex();
         }
         return 1;
     }
     if (method >= NV097_SET_VERTEX_DATA2F_M
-            && method < NV097_SET_VERTEX_DATA2F_M + NV_VERTEX_ATTRS * 8) {
+        && method < NV097_SET_VERTEX_DATA2F_M + NV_VERTEX_ATTRS * 8) {
         uint32_t off = method - NV097_SET_VERTEX_DATA2F_M;
-        if (off / 8 == 9)                /* attribute 9 is texture coord 0 */
+        if (off / 8 == 9) /* attribute 9 is texture coord 0 */
             s_gpu.imm_tex[(off % 8) / 4] = v.f;
         return 1;
     }
     if (method >= NV097_SET_VERTEX_DATA4F_M
-            && method < NV097_SET_VERTEX_DATA4F_M + NV_VERTEX_ATTRS * 16) {
+        && method < NV097_SET_VERTEX_DATA4F_M + NV_VERTEX_ATTRS * 16) {
         uint32_t off = method - NV097_SET_VERTEX_DATA4F_M;
         uint32_t attr = off / 16, c = (off % 16) / 4;
         if (attr == 0) {
@@ -3876,13 +4143,14 @@ static int imm_vertex_method(uint32_t method, uint32_t param)
         return 1;
     }
     if (method >= NV097_SET_VERTEX_DATA4UB
-            && method < NV097_SET_VERTEX_DATA4UB + NV_VERTEX_ATTRS * 4) {
-        if ((method - NV097_SET_VERTEX_DATA4UB) / 4 == 3)   /* diffuse */
+        && method < NV097_SET_VERTEX_DATA4UB + NV_VERTEX_ATTRS * 4) {
+        if ((method - NV097_SET_VERTEX_DATA4UB) / 4 == 3) /* diffuse */
             s_gpu.imm_diffuse = param;
         return 1;
     }
     return 0;
 }
+
 /* A run of method words from one header (nv2a_pb_scan), for the long runs
  * that are data rather than state: transform constants and program words,
  * INLINE_ARRAY vertices and ARRAY_ELEMENT16 indices. The same effect as one
@@ -3890,15 +4158,16 @@ static int imm_vertex_method(uint32_t method, uint32_t param)
  * dispatcher's checks: those were ~9% of the game thread in play
  * (2026-10-03). Returns the words consumed; 0 = take the per-word path. */
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
-uint32_t nv2a_pb_exec_run(uint32_t subch, uint32_t method, int noninc, const uint32_t *w, uint32_t n)
-{
+
+uint32_t nv2a_pb_exec_run(uint32_t subch, uint32_t method, int noninc, const uint32_t *w, uint32_t n) {
     static int traced = -1;
     uint32_t i;
     if (traced < 0)
         traced = getenv("RECOMP_PB_DRAW_TRACE") || getenv("RECOMP_PB_EXEC_VERBOSE") || getenv("RECOMP_TEX_TRACE");
     if (subch != 0 || n < 2 || traced)
         return 0;
-    if (!noninc && method >= NV097_SET_TRANSFORM_CONSTANT && method + (n - 1) * 4 < NV097_SET_TRANSFORM_CONSTANT + 0x80) {
+    if (!noninc && method >= NV097_SET_TRANSFORM_CONSTANT && method + (n - 1) * 4 < NV097_SET_TRANSFORM_CONSTANT +
+        0x80) {
         uint32_t slot = (method - NV097_SET_TRANSFORM_CONSTANT) / 4;
         for (i = 0; i < n; i++, slot++) {
             if (s_vp.const_load < VP_CONSTS) {
@@ -3924,9 +4193,9 @@ uint32_t nv2a_pb_exec_run(uint32_t subch, uint32_t method, int noninc, const uin
     }
     if (noninc && method == NV097_INLINE_ARRAY) {
         uint32_t room;
-        nv2a_pb_exec_method(subch, method, w[0]);       /* flushes a pending DRAW_ARRAYS batch */
+        nv2a_pb_exec_method(subch, method, w[0]); /* flushes a pending DRAW_ARRAYS batch */
         if (!s_gpu.prim)
-            return n;                                   /* outside BEGIN/END: dropped, as per word */
+            return n; /* outside BEGIN/END: dropped, as per word */
         room = NV_MAX_INLINE - s_gpu.inline_count;
         if (room > n - 1) room = n - 1;
         else if (room < n - 1) {
@@ -3934,7 +4203,8 @@ uint32_t nv2a_pb_exec_run(uint32_t subch, uint32_t method, int noninc, const uin
             if (!warned++) fprintf(stderr, "  [GPU] INLINE_ARRAY batch over %u dwords: tail dropped\n", NV_MAX_INLINE);
         }
         memcpy(&s_gpu.inline_buf[s_gpu.inline_count], w + 1, room * 4);
-        {   /* evidence for docs/XBOX-LIMITATION-AUDIT.md: did the old 4096 cap ever bite? */
+        {
+            /* evidence for docs/XBOX-LIMITATION-AUDIT.md: did the old 4096 cap ever bite? */
             static int noted;
             if (s_gpu.inline_count <= 4096 && s_gpu.inline_count + room > 4096 && !noted++)
                 fprintf(stderr, "  [GPU] INLINE_ARRAY batch past 4096 dwords (%u): the old cap would have cut it\n",
@@ -3944,21 +4214,20 @@ uint32_t nv2a_pb_exec_run(uint32_t subch, uint32_t method, int noninc, const uin
         return n;
     }
     if (noninc && method == NV097_ARRAY_ELEMENT16) {
-        nv2a_pb_exec_method(subch, method, w[0]);       /* flushes a pending DRAW_ARRAYS batch */
+        nv2a_pb_exec_method(subch, method, w[0]); /* flushes a pending DRAW_ARRAYS batch */
         if (!s_gpu.prim)
             return n;
         for (i = 1; i < n; i++) {
             idx_make_room(2);
-            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(w[i] & 0xFFFF);
-            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(w[i] >> 16);
+            s_gpu.idx[s_gpu.idx_count++] = (uint16_t) (w[i] & 0xFFFF);
+            s_gpu.idx[s_gpu.idx_count++] = (uint16_t) (w[i] >> 16);
         }
         return n;
     }
     return 0;
 }
 
-void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
-{
+void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param) {
     static int inited;
     if (!inited) {
         inited = 1;
@@ -3986,14 +4255,21 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         static int shown[8];
         int slot = -1;
         switch (method) {
-        case NV097_SET_SURFACE_CLIP_HORIZONTAL: slot = 0; break;
-        case NV097_SET_SURFACE_CLIP_VERTICAL:   slot = 1; break;
-        case NV097_SET_SURFACE_FORMAT:          slot = 2; break;
-        case NV097_SET_SURFACE_PITCH:           slot = 3; break;
-        case NV097_SET_SURFACE_COLOR_OFFSET:    slot = 4; break;
-        case NV097_SET_COLOR_CLEAR_VALUE:       slot = 5; break;
-        case NV097_CLEAR_SURFACE:               slot = 6; break;
-        default: break;
+            case NV097_SET_SURFACE_CLIP_HORIZONTAL: slot = 0;
+                break;
+            case NV097_SET_SURFACE_CLIP_VERTICAL: slot = 1;
+                break;
+            case NV097_SET_SURFACE_FORMAT: slot = 2;
+                break;
+            case NV097_SET_SURFACE_PITCH: slot = 3;
+                break;
+            case NV097_SET_SURFACE_COLOR_OFFSET: slot = 4;
+                break;
+            case NV097_SET_COLOR_CLEAR_VALUE: slot = 5;
+                break;
+            case NV097_CLEAR_SURFACE: slot = 6;
+                break;
+            default: break;
         }
         if (slot >= 0 && shown[slot]++ < 4)
             fprintf(stderr, "  [GPU] subch %u method 0x%04X param 0x%08X\n",
@@ -4004,8 +4280,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      * texture offset / format word per stage, and the context-DMA methods.
      * Format bits 0-1 pick the DMA object (1 = A, 2 = B) the offset is in. */
     if (subch == 0 && f_textrace
-            && ((method >= 0x1B00 && method < 0x1C00 && ((method & 0x3F) == 0 || (method & 0x3F) == 4))
-                || (method >= 0x0180 && method < 0x01A0))) {
+        && ((method >= 0x1B00 && method < 0x1C00 && ((method & 0x3F) == 0 || (method & 0x3F) == 4))
+            || (method >= 0x0180 && method < 0x01A0))) {
         static uint32_t seen[512][2];
         static unsigned nseen;
         unsigned k;
@@ -4016,64 +4292,75 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * header in guest memory with that Format and Data == 0. */
 #if defined(__linux__)
         {
-            static int pending,dumps;
-            static uint32_t zva[8],zdraw[8],nz,zdone;
+            static int pending, dumps;
+            static uint32_t zva[8], zdraw[8], nz, zdone;
             extern volatile uint32_t g_nv2a_pb_last_word_va;
-            if (method==0x1B00 && param==0 && nz<8) {
-                zva[nz]=g_nv2a_pb_last_word_va;zdraw[nz]=s_gpu.draws;nz++;
-                if (nz<=4) {
+            if (method == 0x1B00 && param == 0 && nz < 8) {
+                zva[nz] = g_nv2a_pb_last_word_va;
+                zdraw[nz] = s_gpu.draws;
+                nz++;
+                if (nz <= 4) {
                     uint32_t words[8];
-                    if (pb_diagnostic_read(0xA6AA14u,words,sizeof(words)))
-                        fprintf(stderr,"  [TEXZERO] D3D buffers: A6AA14=%08X A6AA18=%08X A6AA20=%08X %08X %08X A6AA2C=%08X A6AA30=%08X\n",
-                            words[0],words[1],words[3],words[4],words[5],words[6],words[7]);
-                    else fprintf(stderr,"  [TEXZERO] D3D buffers unavailable (unreadable)\n");
+                    if (pb_diagnostic_read(0xA6AA14u, words, sizeof(words)))
+                        fprintf(
+                            stderr,
+                            "  [TEXZERO] D3D buffers: A6AA14=%08X A6AA18=%08X A6AA20=%08X %08X %08X A6AA2C=%08X A6AA30=%08X\n",
+                            words[0], words[1], words[3], words[4], words[5], words[6], words[7]);
+                    else fprintf(stderr, "  [TEXZERO] D3D buffers unavailable (unreadable)\n");
                 }
-                if (nz==1) {
-                    uint32_t words[0x4400/4],nonzero=0;
-                    if (pb_diagnostic_read(0x80000000u,words,sizeof(words))) {
-                        for (uint32_t i=0;i<0x4000;i++) nonzero+=((const uint8_t *)words)[i]!=0;
-                        fprintf(stderr,"  [TEXZERO] phys 0..0x4000: %u nonzero bytes; first: %08X %08X %08X %08X; palette@0x4000: %08X %08X %08X %08X\n",
-                            nonzero,words[0],words[1],words[0x100/4],words[0x2000/4],words[0x4000/4],words[0x4004/4],words[0x4100/4],words[0x43FC/4]);
-                    } else fprintf(stderr,"  [TEXZERO] physical diagnostic unavailable (unreadable)\n");
+                if (nz == 1) {
+                    uint32_t words[0x4400 / 4], nonzero = 0;
+                    if (pb_diagnostic_read(0x80000000u, words, sizeof(words))) {
+                        for (uint32_t i = 0; i < 0x4000; i++) nonzero += ((const uint8_t *) words)[i] != 0;
+                        fprintf(
+                            stderr,
+                            "  [TEXZERO] phys 0..0x4000: %u nonzero bytes; first: %08X %08X %08X %08X; palette@0x4000: %08X %08X %08X %08X\n",
+                            nonzero, words[0], words[1], words[0x100 / 4], words[0x2000 / 4], words[0x4000 / 4],
+                            words[0x4004 / 4], words[0x4100 / 4], words[0x43FC / 4]);
+                    } else fprintf(stderr, "  [TEXZERO] physical diagnostic unavailable (unreadable)\n");
                 }
-                if (nz<=3) {
+                if (nz <= 3) {
                     uint32_t words[96];
-                    if (pb_diagnostic_read((uint64_t)zva[nz-1]-16,words,sizeof(words))) {
-                        fprintf(stderr,"  [TEXZERO] stream from %08X:",zva[nz-1]-16);
-                        for(uint32_t i=0;i<96;i++) {
-                            if (!(i&7)) fprintf(stderr,"\n  [TEXZERO]  ");
-                            fprintf(stderr," %08X",words[i]);
+                    if (pb_diagnostic_read((uint64_t) zva[nz - 1] - 16, words, sizeof(words))) {
+                        fprintf(stderr, "  [TEXZERO] stream from %08X:", zva[nz - 1] - 16);
+                        for (uint32_t i = 0; i < 96; i++) {
+                            if (!(i & 7)) fprintf(stderr, "\n  [TEXZERO]  ");
+                            fprintf(stderr, " %08X", words[i]);
                         }
-                        fprintf(stderr,"\n");
-                    } else fprintf(stderr,"  [TEXZERO] stream unavailable (unreadable)\n");
+                        fprintf(stderr, "\n");
+                    } else fprintf(stderr, "  [TEXZERO] stream unavailable (unreadable)\n");
                 }
             }
-            if (nz && zdone<nz && s_gpu.draws>zdraw[zdone]+20000u) {
+            if (nz && zdone < nz && s_gpu.draws > zdraw[zdone] + 20000u) {
                 uint32_t words[3];
-                if (pb_diagnostic_read(zva[zdone],words,sizeof(words)))
-                    fprintf(stderr,"  [TEXZERO] offset word at %08X (read 0 at draw %u) now %08X, next %08X %08X\n",zva[zdone],zdraw[zdone],words[0],words[1],words[2]);
-                else fprintf(stderr,"  [TEXZERO] offset word at %08X unavailable (unreadable)\n",zva[zdone]);
+                if (pb_diagnostic_read(zva[zdone], words, sizeof(words)))
+                    fprintf(stderr, "  [TEXZERO] offset word at %08X (read 0 at draw %u) now %08X, next %08X %08X\n",
+                            zva[zdone], zdraw[zdone], words[0], words[1], words[2]);
+                else fprintf(stderr, "  [TEXZERO] offset word at %08X unavailable (unreadable)\n", zva[zdone]);
                 zdone++;
             }
-            if (method==0x1B00) pending=param==0;
-            else if (method==0x1B04 && pending && dumps<4) {
-                pending=0;dumps++;
-                uint32_t found=0;
-                fprintf(stderr,"  [TEXZERO] format %08X with offset 0; headers:\n",param);
-                for(uint32_t address=0x10000;address<0x04000000 && found<24;address+=4096) {
+            if (method == 0x1B00) pending = param == 0;
+            else if (method == 0x1B04 && pending && dumps < 4) {
+                pending = 0;
+                dumps++;
+                uint32_t found = 0;
+                fprintf(stderr, "  [TEXZERO] format %08X with offset 0; headers:\n", param);
+                for (uint32_t address = 0x10000; address < 0x04000000 && found < 24; address += 4096) {
                     uint32_t words[1024];
-                    if (!pb_diagnostic_read(address,words,sizeof(words))) {
-                        fprintf(stderr,"  [TEXZERO] scan stopped at %08X (unreadable)\n",address);break;
+                    if (!pb_diagnostic_read(address, words, sizeof(words))) {
+                        fprintf(stderr, "  [TEXZERO] scan stopped at %08X (unreadable)\n", address);
+                        break;
                     }
-                    for(uint32_t i=0;i<1024 && found<24;i++) {
-                        if ((words[i]&0xFFF0FFFCu)!=(param&0xFFF0FFFCu)) continue;
-                        uint32_t header[8],at=address+i*4;
-                        if (!pb_diagnostic_read((uint64_t)at-12,header,sizeof(header))) {
-                            fprintf(stderr,"  [TEXZERO] header at %08X unavailable (unreadable)\n",at);continue;
+                    for (uint32_t i = 0; i < 1024 && found < 24; i++) {
+                        if ((words[i] & 0xFFF0FFFCu) != (param & 0xFFF0FFFCu)) continue;
+                        uint32_t header[8], at = address + i * 4;
+                        if (!pb_diagnostic_read((uint64_t) at - 12, header, sizeof(header))) {
+                            fprintf(stderr, "  [TEXZERO] header at %08X unavailable (unreadable)\n", at);
+                            continue;
                         }
                         found++;
-                        fprintf(stderr,"  [TEXZERO]   %08X: %08X %08X %08X [%08X] %08X %08X %08X %08X\n",at-12,
-                            header[0],header[1],header[2],header[3],header[4],header[5],header[6],header[7]);
+                        fprintf(stderr, "  [TEXZERO]   %08X: %08X %08X %08X [%08X] %08X %08X %08X %08X\n", at - 12,
+                                header[0], header[1], header[2], header[3], header[4], header[5], header[6], header[7]);
                     }
                 }
             }
@@ -4086,78 +4373,87 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             static uint32_t zva[8], zdraw[8], nz, zdone;
             {
                 extern uint32_t g_nv2a_pb_last_word_va;
-                const uint8_t *gm = (const uint8_t *)xbox_GetMemoryOffset();
+                const uint8_t *gm = (const uint8_t *) xbox_GetMemoryOffset();
                 if (method == 0x1B00 && param == 0 && nz < 8) {
-                    zva[nz] = g_nv2a_pb_last_word_va; zdraw[nz] = s_gpu.draws; nz++;
+                    zva[nz] = g_nv2a_pb_last_word_va;
+                    zdraw[nz] = s_gpu.draws;
+                    nz++;
                     if (nz <= 4)
-                        fprintf(stderr, "  [TEXZERO] D3D buffers: A6AA14=%08X A6AA18=%08X A6AA20=%08X %08X %08X A6AA2C=%08X A6AA30=%08X\n",
-                                *(const uint32_t *)(gm + 0xA6AA14u), *(const uint32_t *)(gm + 0xA6AA18u),
-                                *(const uint32_t *)(gm + 0xA6AA20u), *(const uint32_t *)(gm + 0xA6AA24u),
-                                *(const uint32_t *)(gm + 0xA6AA28u), *(const uint32_t *)(gm + 0xA6AA2Cu),
-                                *(const uint32_t *)(gm + 0xA6AA30u));
+                        fprintf(
+                            stderr,
+                            "  [TEXZERO] D3D buffers: A6AA14=%08X A6AA18=%08X A6AA20=%08X %08X %08X A6AA2C=%08X A6AA30=%08X\n",
+                            *(const uint32_t *) (gm + 0xA6AA14u), *(const uint32_t *) (gm + 0xA6AA18u),
+                            *(const uint32_t *) (gm + 0xA6AA20u), *(const uint32_t *) (gm + 0xA6AA24u),
+                            *(const uint32_t *) (gm + 0xA6AA28u), *(const uint32_t *) (gm + 0xA6AA2Cu),
+                            *(const uint32_t *) (gm + 0xA6AA30u));
                     if (nz == 1) {
                         uint32_t w, nzb = 0;
                         for (w = 0; w < 0x4000; w++) nzb += gm[0x80000000u + w] != 0;
-                        fprintf(stderr, "  [TEXZERO] phys 0..0x4000: %u nonzero bytes; first: %08X %08X %08X %08X; palette@0x4000: %08X %08X %08X %08X\n",
-                                nzb, *(const uint32_t *)(gm + 0x80000000u), *(const uint32_t *)(gm + 0x80000004u),
-                                *(const uint32_t *)(gm + 0x80000100u), *(const uint32_t *)(gm + 0x80002000u),
-                                *(const uint32_t *)(gm + 0x80004000u), *(const uint32_t *)(gm + 0x80004004u),
-                                *(const uint32_t *)(gm + 0x80004100u), *(const uint32_t *)(gm + 0x800043FCu));
+                        fprintf(
+                            stderr,
+                            "  [TEXZERO] phys 0..0x4000: %u nonzero bytes; first: %08X %08X %08X %08X; palette@0x4000: %08X %08X %08X %08X\n",
+                            nzb, *(const uint32_t *) (gm + 0x80000000u), *(const uint32_t *) (gm + 0x80000004u),
+                            *(const uint32_t *) (gm + 0x80000100u), *(const uint32_t *) (gm + 0x80002000u),
+                            *(const uint32_t *) (gm + 0x80004000u), *(const uint32_t *) (gm + 0x80004004u),
+                            *(const uint32_t *) (gm + 0x80004100u), *(const uint32_t *) (gm + 0x800043FCu));
                     }
                     if (nz <= 3) {
                         uint32_t w;
                         fprintf(stderr, "  [TEXZERO] stream from %08X:", zva[nz - 1] - 16);
                         for (w = 0; w < 96; w++) {
                             if ((w & 7) == 0) fprintf(stderr, "\n  [TEXZERO]  ");
-                            fprintf(stderr, " %08X", *(const uint32_t *)(gm + zva[nz - 1] - 16 + w * 4));
+                            fprintf(stderr, " %08X", *(const uint32_t *) (gm + zva[nz - 1] - 16 + w * 4));
                         }
                         fprintf(stderr, "\n");
                     }
                 }
                 if (nz && zdone < nz && s_gpu.draws > zdraw[zdone] + 20000u) {
                     fprintf(stderr, "  [TEXZERO] offset word at %08X (read 0 at draw %u) now %08X, next %08X %08X\n",
-                            zva[zdone], zdraw[zdone], *(const uint32_t *)(gm + zva[zdone]),
-                            *(const uint32_t *)(gm + zva[zdone] + 4), *(const uint32_t *)(gm + zva[zdone] + 8));
+                            zva[zdone], zdraw[zdone], *(const uint32_t *) (gm + zva[zdone]),
+                            *(const uint32_t *) (gm + zva[zdone] + 4), *(const uint32_t *) (gm + zva[zdone] + 8));
                     zdone++;
                 }
             }
             if (method == 0x1B00)
                 pending = (param == 0);
             else if (method == 0x1B04 && pending && dumps < 4) {
-                const uint8_t *gm = (const uint8_t *)xbox_GetMemoryOffset();
+                const uint8_t *gm = (const uint8_t *) xbox_GetMemoryOffset();
                 uint32_t a, found = 0;
                 pending = 0;
                 dumps++;
                 fprintf(stderr, "  [TEXZERO] format %08X with offset 0; headers:\n", param);
 #if defined(_WIN32)
-                __try {
+        __try {
 #endif
-                    for (a = 0x10000u; a < 0x04000000u && found < 24; a += 4) {
-                        if ((*(const uint32_t *)(gm + a) & 0xFFF0FFFCu) != (param & 0xFFF0FFFCu))
-                            continue;
-                        found++;
-                        fprintf(stderr, "  [TEXZERO]   %08X: %08X %08X %08X [%08X] %08X %08X %08X %08X\n", a - 12,
-                                *(const uint32_t *)(gm + a - 12), *(const uint32_t *)(gm + a - 8),
-                                *(const uint32_t *)(gm + a - 4), *(const uint32_t *)(gm + a),
-                                *(const uint32_t *)(gm + a + 4), *(const uint32_t *)(gm + a + 8),
-                                *(const uint32_t *)(gm + a + 12), *(const uint32_t *)(gm + a + 16));
-                    }
+        for (a = 0x10000u; a < 0x04000000u && found < 24; a += 4) {
+            if ((*(const uint32_t *) (gm + a) & 0xFFF0FFFCu) != (param & 0xFFF0FFFCu))
+                continue;
+            found++;
+            fprintf(stderr, "  [TEXZERO]   %08X: %08X %08X %08X [%08X] %08X %08X %08X %08X\n", a - 12,
+                    *(const uint32_t *) (gm + a - 12), *(const uint32_t *) (gm + a - 8),
+                    *(const uint32_t *) (gm + a - 4), *(const uint32_t *) (gm + a),
+                    *(const uint32_t *) (gm + a + 4), *(const uint32_t *) (gm + a + 8),
+                    *(const uint32_t *) (gm + a + 12), *(const uint32_t *) (gm + a + 16));
+        }
 #if defined(_WIN32)
-                } __except (EXCEPTION_EXECUTE_HANDLER) {
-                    fprintf(stderr, "  [TEXZERO]   (scan stopped at %08X)\n", a);
-                }
+                } __except(EXCEPTION_EXECUTE_HANDLER) {
+            fprintf(stderr, "  [TEXZERO]   (scan stopped at %08X)\n", a);
+        }
 #endif
             }
         }
 #endif
         if (k == nseen && nseen < 512) {
-            seen[nseen][0] = method; seen[nseen][1] = param; nseen++;
+            seen[nseen][0] = method;
+            seen[nseen][1] = param;
+            nseen++;
             fprintf(stderr, "  [TEXTRACE] method %04X = %08X (stage %u %s) draws %u\n", method, param,
                     method >= 0x1B00 ? (method - 0x1B00) >> 6 : 0,
                     method < 0x1B00 ? "ctxdma" : (method & 0x3F) ? "format" : "offset", s_gpu.draws);
         }
     }
-    if (subch != 0) {                      /* 3D class lives on subchannel 0 */
+    if (subch != 0) {
+        /* 3D class lives on subchannel 0 */
         note_unhandled(method, param);
         return;
     }
@@ -4181,356 +4477,372 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         return;
     }
     switch (method) {
-    case NV097_SET_ALPHA_TEST_ENABLE: s_gpu.alpha_test = param; break;
-    case NV097_SET_ALPHA_FUNC:        s_gpu.alpha_func = param; break;
-    case NV097_SET_ALPHA_REF:         s_gpu.alpha_ref  = param & 0xFF; break;
-    case NV097_SET_BLEND_ENABLE:      s_gpu.blend      = param; break;
-    case NV097_SET_BLEND_FUNC_SFACTOR: s_gpu.blend_sf  = param; break;
-    case NV097_SET_BLEND_FUNC_DFACTOR: s_gpu.blend_df  = param; break;
-    case NV097_SET_BLEND_EQUATION:    s_gpu.blend_eq   = param; break;
-    case NV097_SET_BLEND_COLOR:       s_gpu.blend_color = param; break;
-    case NV097_SET_WINDOW_CLIP_TYPE:  s_gpu.window_clip_type = param & 1; break;
-    case NV097_SET_SURFACE_CLIP_HORIZONTAL:
-        s_gpu.clip_x = param & 0xFFFF;
-        s_gpu.clip_w = (param >> 16) & 0xFFFF;
-        break;
-    case NV097_SET_SURFACE_CLIP_VERTICAL:
-        s_gpu.clip_y = param & 0xFFFF;
-        s_gpu.clip_h = (param >> 16) & 0xFFFF;
-        break;
-    case NV097_SET_SURFACE_FORMAT:
-        s_gpu.format = param;
-        break;
-    case NV097_SET_SURFACE_PITCH:
-        s_gpu.pitch = param & 0xFFFF;      /* colour pitch; zeta is the top half */
-        s_gpu.zeta_pitch = param >> 16;
-        break;
-    case NV097_SET_SURFACE_COLOR_OFFSET:
-        if (getenv("RECOMP_SURF_TRACE") && param != s_gpu.color_offset) {
-            static unsigned shown;
-            if (shown++ < 400)
-                fprintf(stderr, "  [SURF] color %08X -> %08X (pitch %u clip %ux%u fmt %08X) flips %u draws %u\n",
-                        s_gpu.color_offset, param, s_gpu.pitch, s_gpu.clip_w, s_gpu.clip_h,
-                        s_gpu.format, s_gpu.flips, s_gpu.draws);
-        }
-        s_gpu.color_offset = param;
-        break;
-    case NV097_SET_SURFACE_ZETA_OFFSET:
-        s_gpu.zeta_offset = param;
-        break;
-    case NV097_SET_COLOR_CLEAR_VALUE:
-        s_gpu.clear_color = param;
-        break;
-    case NV097_CLEAR_SURFACE:
-        if (gpu_enabled() && gpu_clear(param))
+        case NV097_SET_ALPHA_TEST_ENABLE: s_gpu.alpha_test = param;
             break;
-        if (gpu_enabled())
-            gpu_cpu_access();
-        clear_surface(param);
-        if (param & 3u)                    /* NV097_CLEAR_SURFACE_Z / _STENCIL */
-            zbuf_clear_bits(param);
-        break;
+        case NV097_SET_ALPHA_FUNC: s_gpu.alpha_func = param;
+            break;
+        case NV097_SET_ALPHA_REF: s_gpu.alpha_ref = param & 0xFF;
+            break;
+        case NV097_SET_BLEND_ENABLE: s_gpu.blend = param;
+            break;
+        case NV097_SET_BLEND_FUNC_SFACTOR: s_gpu.blend_sf = param;
+            break;
+        case NV097_SET_BLEND_FUNC_DFACTOR: s_gpu.blend_df = param;
+            break;
+        case NV097_SET_BLEND_EQUATION: s_gpu.blend_eq = param;
+            break;
+        case NV097_SET_BLEND_COLOR: s_gpu.blend_color = param;
+            break;
+        case NV097_SET_WINDOW_CLIP_TYPE: s_gpu.window_clip_type = param & 1;
+            break;
+        case NV097_SET_SURFACE_CLIP_HORIZONTAL:
+            s_gpu.clip_x = param & 0xFFFF;
+            s_gpu.clip_w = (param >> 16) & 0xFFFF;
+            break;
+        case NV097_SET_SURFACE_CLIP_VERTICAL:
+            s_gpu.clip_y = param & 0xFFFF;
+            s_gpu.clip_h = (param >> 16) & 0xFFFF;
+            break;
+        case NV097_SET_SURFACE_FORMAT:
+            s_gpu.format = param;
+            break;
+        case NV097_SET_SURFACE_PITCH:
+            s_gpu.pitch = param & 0xFFFF; /* colour pitch; zeta is the top half */
+            s_gpu.zeta_pitch = param >> 16;
+            break;
+        case NV097_SET_SURFACE_COLOR_OFFSET:
+            if (getenv("RECOMP_SURF_TRACE") && param != s_gpu.color_offset) {
+                static unsigned shown;
+                if (shown++ < 400)
+                    fprintf(stderr, "  [SURF] color %08X -> %08X (pitch %u clip %ux%u fmt %08X) flips %u draws %u\n",
+                            s_gpu.color_offset, param, s_gpu.pitch, s_gpu.clip_w, s_gpu.clip_h,
+                            s_gpu.format, s_gpu.flips, s_gpu.draws);
+            }
+            s_gpu.color_offset = param;
+            break;
+        case NV097_SET_SURFACE_ZETA_OFFSET:
+            s_gpu.zeta_offset = param;
+            break;
+        case NV097_SET_COLOR_CLEAR_VALUE:
+            s_gpu.clear_color = param;
+            break;
+        case NV097_CLEAR_SURFACE:
+            if (gpu_enabled() && gpu_clear(param))
+                break;
+            if (gpu_enabled())
+                gpu_cpu_access();
+            clear_surface(param);
+            if (param & 3u) /* NV097_CLEAR_SURFACE_Z / _STENCIL */
+                zbuf_clear_bits(param);
+            break;
 
-    case NV097_SET_BEGIN_END:
-        if (getenv("RECOMP_PB_DRAW_TRACE"))
-            fprintf(stderr, "  [GPU] BEGIN_END param=%u prior-prim=%u inline=%u indices=%u\n",
-                    param, s_gpu.prim, s_gpu.inline_count, s_gpu.idx_count);
-        s_elements_seen = 0;
-        if (param) {
-            s_begin_seq++;
-            s_gpu.prim = param;
-            s_gpu.idx_count = 0;
-            s_gpu.draw_arrays_active = 0;
-            s_gpu.inline_count = 0;
-            s_gpu.imm_count = 0;
-        } else {
-            /* Three ways a batch can have arrived, and only one is in use at
-             * a time: vertices completed by SET_VERTEX4F, a payload written
-             * with INLINE_ARRAY, or indices into the title's own arrays. */
-            if (s_gpu.imm_count)
-                draw_immediate();
-            else if (s_gpu.inline_count)
-                draw_inline_array();
-            else
-                draw_primitive();
-            s_gpu.prim = 0;
-            s_gpu.draw_arrays_active = 0;
-            s_gpu.inline_count = 0;
-            s_gpu.imm_count = 0;
-        }
-        break;
-
-    case NV097_INLINE_ARRAY:
-        /* Vertex data, not a pointer to it. Buffered rather than decoded here
-         * because the format is only fully known at END. */
-        if (s_gpu.prim && s_gpu.inline_count < NV_MAX_INLINE) {
-            if (s_gpu.draw_arrays_active && s_gpu.idx_count) {
-                draw_primitive();
+        case NV097_SET_BEGIN_END:
+            if (getenv("RECOMP_PB_DRAW_TRACE"))
+                fprintf(stderr, "  [GPU] BEGIN_END param=%u prior-prim=%u inline=%u indices=%u\n",
+                        param, s_gpu.prim, s_gpu.inline_count, s_gpu.idx_count);
+            s_elements_seen = 0;
+            if (param) {
+                s_begin_seq++;
+                s_gpu.prim = param;
                 s_gpu.idx_count = 0;
                 s_gpu.draw_arrays_active = 0;
+                s_gpu.inline_count = 0;
+                s_gpu.imm_count = 0;
+            } else {
+                /* Three ways a batch can have arrived, and only one is in use at
+                 * a time: vertices completed by SET_VERTEX4F, a payload written
+                 * with INLINE_ARRAY, or indices into the title's own arrays. */
+                if (s_gpu.imm_count)
+                    draw_immediate();
+                else if (s_gpu.inline_count)
+                    draw_inline_array();
+                else
+                    draw_primitive();
+                s_gpu.prim = 0;
+                s_gpu.draw_arrays_active = 0;
+                s_gpu.inline_count = 0;
+                s_gpu.imm_count = 0;
             }
-            if (getenv("RECOMP_PB_DRAW_TRACE") && s_gpu.inline_count < 8) {
-                extern volatile uint32_t g_nv2a_pb_last_word_va;
-                fprintf(stderr, "  [GPU] INLINE[%u]=%08X prim=%u src_va=0x%08X\n",
-                        s_gpu.inline_count, param, s_gpu.prim,
-                        g_nv2a_pb_last_word_va);
-            }
-            s_gpu.inline_buf[s_gpu.inline_count++] = param;
-        }
-        break;
-
-    case NV097_DRAW_ARRAYS: {
-        /* The method this title actually draws with, and the reason the
-         * executor reported zero draws while geometry was being submitted the
-         * whole time: BEGIN_END arrived, END arrived, and in between came a
-         * run description rather than the index list the draw path wanted, so
-         * every batch ended with idx_count == 0 and was dropped in silence.
-         *
-         * Expanded into indices because that is what the rasteriser consumes,
-         * and an implicit run is just the indices start..start+count-1. */
-        uint32_t start = param & 0x00FFFFFFu;
-        uint32_t count = ((param >> 24) & 0xFFu) + 1u;
-        uint32_t i;
-
-        if (!s_gpu.prim)
             break;
-        /* xemu keeps one (start,count) entry per DRAW_ARRAYS and submits each
-         * as a separate draw.  It only joins immediately adjacent ranges.
-         * Concatenating discontinuous triangle strips manufactured triangles
-         * between the last vertex of one field tile and the first vertex of
-         * the next, producing the large pale/white wedges seen in game. */
-        /* Once this BEGIN has had ARRAY_ELEMENT indices, a run joins them as
-         * more indices of the same primitive (xemu DRAW_ARRAYS with
-         * inline_elements_length): no flush, the strip carries on. */
-        if (s_elements_seen) {
+
+        case NV097_INLINE_ARRAY:
+            /* Vertex data, not a pointer to it. Buffered rather than decoded here
+             * because the format is only fully known at END. */
+            if (s_gpu.prim && s_gpu.inline_count < NV_MAX_INLINE) {
+                if (s_gpu.draw_arrays_active && s_gpu.idx_count) {
+                    draw_primitive();
+                    s_gpu.idx_count = 0;
+                    s_gpu.draw_arrays_active = 0;
+                }
+                if (getenv("RECOMP_PB_DRAW_TRACE") && s_gpu.inline_count < 8) {
+                    extern volatile uint32_t g_nv2a_pb_last_word_va;
+                    fprintf(stderr, "  [GPU] INLINE[%u]=%08X prim=%u src_va=0x%08X\n",
+                            s_gpu.inline_count, param, s_gpu.prim,
+                            g_nv2a_pb_last_word_va);
+                }
+                s_gpu.inline_buf[s_gpu.inline_count++] = param;
+            }
+            break;
+
+        case NV097_DRAW_ARRAYS: {
+            /* The method this title actually draws with, and the reason the
+             * executor reported zero draws while geometry was being submitted the
+             * whole time: BEGIN_END arrived, END arrived, and in between came a
+             * run description rather than the index list the draw path wanted, so
+             * every batch ended with idx_count == 0 and was dropped in silence.
+             *
+             * Expanded into indices because that is what the rasteriser consumes,
+             * and an implicit run is just the indices start..start+count-1. */
+            uint32_t start = param & 0x00FFFFFFu;
+            uint32_t count = ((param >> 24) & 0xFFu) + 1u;
+            uint32_t i;
+
+            if (!s_gpu.prim)
+                break;
+            /* xemu keeps one (start,count) entry per DRAW_ARRAYS and submits each
+             * as a separate draw.  It only joins immediately adjacent ranges.
+             * Concatenating discontinuous triangle strips manufactured triangles
+             * between the last vertex of one field tile and the first vertex of
+             * the next, producing the large pale/white wedges seen in game. */
+            /* Once this BEGIN has had ARRAY_ELEMENT indices, a run joins them as
+             * more indices of the same primitive (xemu DRAW_ARRAYS with
+             * inline_elements_length): no flush, the strip carries on. */
+            if (s_elements_seen) {
+                for (i = 0; i < count; i++) {
+                    idx_make_room(1);
+                    s_gpu.idx[s_gpu.idx_count++] = (uint16_t) (start + i);
+                }
+                break;
+            }
+            if (s_gpu.draw_arrays_active && s_gpu.idx_count
+                && start != (uint32_t) s_gpu.idx[s_gpu.idx_count - 1] + 1u) {
+                draw_primitive();
+                s_gpu.idx_count = 0;
+            }
+            s_gpu.draw_arrays_active = 1;
             for (i = 0; i < count; i++) {
                 idx_make_room(1);
-                s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(start + i);
+                s_gpu.idx[s_gpu.idx_count++] = (uint16_t) (start + i);
             }
             break;
         }
-        if (s_gpu.draw_arrays_active && s_gpu.idx_count
-                && start != (uint32_t)s_gpu.idx[s_gpu.idx_count - 1] + 1u) {
-            draw_primitive();
-            s_gpu.idx_count = 0;
-        }
-        s_gpu.draw_arrays_active = 1;
-        for (i = 0; i < count; i++) {
-            idx_make_room(1);
-            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(start + i);
-        }
-        break;
-    }
 
-    case 0x1808:                           /* NV097_ARRAY_ELEMENT32 */
-        /* One index per word. D3D sends the last index of an odd-length
-         * 16-bit list this way, so without it every such draw lost its final
-         * vertex. */
-        /* A DRAW_ARRAYS run before it in this BEGIN is the start of the same
-         * primitive (xemu pgraph_expand_draw_arrays): its indices are already
-         * in the list, so the strip simply continues. Flushing here cut every
-         * mixed strip in two and lost the two triangles across the cut --
-         * the holes in player faces and bodies (2026-10-09). */
-        s_gpu.draw_arrays_active = 0;
-        s_elements_seen = 1;
-        if (s_gpu.prim) {
-            idx_make_room(1);
-            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)param;
-        }
-        break;
-    case NV097_ARRAY_ELEMENT16:
-        /* Two 16-bit indices per parameter word. Continues a preceding
-         * DRAW_ARRAYS run of this BEGIN, as above. */
-        s_gpu.draw_arrays_active = 0;
-        s_elements_seen = 1;
-        if (s_gpu.prim) {
-            idx_make_room(2);
-            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param & 0xFFFF);
-            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param >> 16);
-        }
-        break;
-    case NV097_SET_TEXTURE_OFFSET:
-        /* A texture offset is a DMA-object offset, exactly like a surface or a
-         * vertex array offset -- physical, and reachable only through the
-         * contiguous window when it names contiguous memory. */
-        s_gpu.tex.offset = dma_resolve(param);
-        record_tex_reg(method, param);
-        break;
-
-    case NV097_SET_TEXTURE_CONTROL0:
-        /* Stage 0 on or off. A batch drawn with the stage disabled must not
-         * sample whatever texture happens to still be bound -- that painted
-         * untextured shapes with a stale image. */
-        s_gpu.tex.enabled = (param >> 30) & 1;
-        record_tex_reg(method, param);
-        break;
-
-    case NV097_SET_TEXTURE_PALETTE:
-        /* Bit 0 picks the DMA context, 3:2 the length; the palette itself
-         * is 64-byte aligned, so the rest of the word is its offset. This
-         * was decoded from 0x1B0C (CONTROL0) until 2026-09-24, so every
-         * paletted texture read a palette from a meaningless address. */
-        s_gpu.tex.palette = dma_resolve(param & ~0x3Fu);
-        record_tex_reg(method, param);
-        break;
-
-    case NV097_SET_FLIP_READ:
-        s_gpu.flip_read = param;
-        return;
-
-    case NV097_SET_FLIP_WRITE:
-        s_gpu.flip_write = param;
-        return;
-
-    case NV097_SET_FLIP_MODULO:
-        s_gpu.flip_modulo = param;
-        return;
-
-    case NV097_FLIP_INCREMENT_WRITE:
-        s_gpu.flip_write = s_gpu.flip_modulo
-                         ? (s_gpu.flip_write + 1) % s_gpu.flip_modulo
-                         : s_gpu.flip_write + 1;
-        s_gpu.flips++;
-        return;
-
-    case NV097_FLIP_STALL:
-        /* The stall ends when the buffer being read is the one just finished.
-         * There is no scanout here to wait for, so that is now. */
-        s_gpu.flip_read = s_gpu.flip_write;
-        /* The surface drawn into up to here is a finished frame: show it. */
-        if (gpu_enabled())
-            gpu_flip();
-        /* RECOMP_SHOT_PREFIX=<path prefix>: every RECOMP_SHOT_SECONDS (default
-         * 30) write the finished frame as <prefix>-<n>.bmp, straight from the
-         * surface -- works when the window is minimised or the screen is
-         * locked, which window capture does not (2026-09-25). */
-        if (getenv("RECOMP_SHOT_PREFIX")) {
-            static DWORD next_shot;
-            static unsigned shot_n;
-            DWORD now = GetTickCount();
-            if (!next_shot)
-                next_shot = now;
-            if (now >= next_shot && surface_bpp() == 4) {
-                const char *secs = getenv("RECOMP_SHOT_SECONDS");
-                const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
-                uint32_t base = dma_resolve(s_gpu.color_offset);
-                uint32_t w = s_gpu.clip_x + s_gpu.clip_w, h = s_gpu.clip_y + s_gpu.clip_h, y;
-                char path[512];
-                FILE *f;
-                next_shot = now + 1000u * (secs ? (unsigned)atoi(secs) : 30u);
-                snprintf(path, sizeof path, "%s-%03u.bmp", getenv("RECOMP_SHOT_PREFIX"), shot_n++);
-                f = fopen(path, "wb");
-                fprintf(stderr, "  [SHOT] %s t=%lu\n", path, (unsigned long)now);
-                if (f && w && h && w <= 4096 && h <= 4096) {
-                    uint32_t size = 54 + w * h * 4;
-                    uint8_t hdr[54] = { 'B', 'M' };
-                    memcpy(hdr + 2, &size, 4);
-                    hdr[10] = 54; hdr[14] = 40;
-                    memcpy(hdr + 18, &w, 4);
-                    { int32_t nh = -(int32_t)h; memcpy(hdr + 22, &nh, 4); }   /* top-down */
-                    hdr[26] = 1; hdr[28] = 32;
-                    fwrite(hdr, 1, 54, f);
-                    for (y = 0; y < h; y++) {
-#if defined(__linux__)
-                        uint32_t row[4096];
-                        if (!pb_diagnostic_read((uint64_t)base+(uint64_t)y*s_gpu.pitch,row,(size_t)w*4)) {
-                            fclose(f); f=NULL; remove(path);
-                            fprintf(stderr,"  [SHOT] unavailable: unreadable row %u\n",y);
-                            break;
-                        }
-                        fwrite(row,4,w,f);
-#else
-                        fwrite(mem + base + (size_t)y * s_gpu.pitch, 4, w, f);
-#endif
-                    }
-                }
-                if (f)
-                    fclose(f);
+        case 0x1808: /* NV097_ARRAY_ELEMENT32 */
+            /* One index per word. D3D sends the last index of an odd-length
+             * 16-bit list this way, so without it every such draw lost its final
+             * vertex. */
+            /* A DRAW_ARRAYS run before it in this BEGIN is the start of the same
+             * primitive (xemu pgraph_expand_draw_arrays): its indices are already
+             * in the list, so the strip simply continues. Flushing here cut every
+             * mixed strip in two and lost the two triangles across the cut --
+             * the holes in player faces and bodies (2026-10-09). */
+            s_gpu.draw_arrays_active = 0;
+            s_elements_seen = 1;
+            if (s_gpu.prim) {
+                idx_make_room(1);
+                s_gpu.idx[s_gpu.idx_count++] = (uint16_t) param;
             }
-        }
-        xbox_FramebufferWindowSet(dma_resolve(s_gpu.color_offset), s_gpu.pitch);
-        xbox_FramebufferSnapshot(dma_resolve(s_gpu.color_offset), s_gpu.pitch);
-        xbox_FramebufferWindowSize(s_gpu.clip_x + s_gpu.clip_w, s_gpu.clip_y + s_gpu.clip_h);
-        /* And this is a completed swap, which is what a title's own swap
-         * counter counts -- see xbox_Nv2aFrameCounterFlip. */
-        xbox_Nv2aFrameCounterFlip();
-        if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
-            static unsigned n;
-            if (n++ < 8) {
-                fprintf(stderr, "  [GPU] flip %u: read=%u write=%u\n",
-                        s_gpu.flips, s_gpu.flip_read, s_gpu.flip_write);
-                fflush(stderr);
+            break;
+        case NV097_ARRAY_ELEMENT16:
+            /* Two 16-bit indices per parameter word. Continues a preceding
+             * DRAW_ARRAYS run of this BEGIN, as above. */
+            s_gpu.draw_arrays_active = 0;
+            s_elements_seen = 1;
+            if (s_gpu.prim) {
+                idx_make_room(2);
+                s_gpu.idx[s_gpu.idx_count++] = (uint16_t) (param & 0xFFFF);
+                s_gpu.idx[s_gpu.idx_count++] = (uint16_t) (param >> 16);
             }
-        }
-        return;
-
-    case NV097_SET_TEXTURE_FORMAT:
-        if (getenv("RECOMP_TEX_IDENTIFY"))
-            fprintf(stderr, "[TEX] FORMAT param=0x%08X color=0x%02X%s\n",
-                    param, (param >> 8) & 0xFF,
-                    ((param >> 8) & 0xFF) == 0x0B ?
-                        "  <-- matches legal-screen P8 format byte" : "");
-        s_gpu.tex.color = (param >> 8) & 0xFF;
-        /* A swizzled texture carries its own dimensions here, as log2 in
-         * BASE_SIZE_U/V (nv2a_regs.h: 0x00F00000 / 0x0F000000). It has to:
-         * SET_TEXTURE_IMAGE_RECT describes a linear image, and a title that
-         * only uses swizzled textures never sends one -- this title sends it
-         * once and sets a format 3,176 times. Without this the width and
-         * height stayed zero and nothing was ever sampled. */
-        if (tex_size_from_format((param >> 8) & 0xFF)) {
-            s_gpu.tex.width  = 1u << ((param >> 20) & 0xF);
-            s_gpu.tex.height = 1u << ((param >> 24) & 0xF);
-        }
-        record_tex_reg(method, param);
-        break;
-
-    case NV097_SET_TEXTURE_ADDRESS:
-        /* Four bits per axis. 1 is wrap, 3 is clamp-to-edge; the rest (mirror,
-         * border) fall back to clamp, which is wrong at an edge rather than
-         * wrong everywhere. */
-        s_gpu.tex.addr_u =  param        & 0xF;
-        s_gpu.tex.addr_v = (param >>  8) & 0xF;
-        record_tex_reg(method, param);
-        break;
-
-    case NV097_SET_TEXTURE_CONTROL1:
-        /* Pitch lives in the top half. Only meaningful for a linear format; a
-         * swizzled texture has no pitch because it has no rows. */
-        s_gpu.tex.pitch = param >> 16;
-        record_tex_reg(method, param);
-        break;
-
-    case NV097_SET_TEXTURE_IMAGE_RECT:
-        s_gpu.tex.width  = param >> 16;
-        s_gpu.tex.height = param & 0xFFFF;
-        if (getenv("RECOMP_TEX_IDENTIFY"))
-            fprintf(stderr, "[TEX] IMAGE_RECT width=%u height=%u offset=0x%08X\n",
-                    s_gpu.tex.width, s_gpu.tex.height, s_gpu.tex.offset);
-        record_tex_reg(method, param);
-        break;
-
-    default:
-        if (method >= NV_TEX_FIRST && method <= NV_TEX_LAST)
+            break;
+        case NV097_SET_TEXTURE_OFFSET:
+            /* A texture offset is a DMA-object offset, exactly like a surface or a
+             * vertex array offset -- physical, and reachable only through the
+             * contiguous window when it names contiguous memory. */
+            s_gpu.tex.offset = dma_resolve(param);
             record_tex_reg(method, param);
-        if (method >= NV097_SET_VERTEX_DATA_ARRAY_OFFSET
+            break;
+
+        case NV097_SET_TEXTURE_CONTROL0:
+            /* Stage 0 on or off. A batch drawn with the stage disabled must not
+             * sample whatever texture happens to still be bound -- that painted
+             * untextured shapes with a stale image. */
+            s_gpu.tex.enabled = (param >> 30) & 1;
+            record_tex_reg(method, param);
+            break;
+
+        case NV097_SET_TEXTURE_PALETTE:
+            /* Bit 0 picks the DMA context, 3:2 the length; the palette itself
+             * is 64-byte aligned, so the rest of the word is its offset. This
+             * was decoded from 0x1B0C (CONTROL0) until 2026-09-24, so every
+             * paletted texture read a palette from a meaningless address. */
+            s_gpu.tex.palette = dma_resolve(param & ~0x3Fu);
+            record_tex_reg(method, param);
+            break;
+
+        case NV097_SET_FLIP_READ:
+            s_gpu.flip_read = param;
+            return;
+
+        case NV097_SET_FLIP_WRITE:
+            s_gpu.flip_write = param;
+            return;
+
+        case NV097_SET_FLIP_MODULO:
+            s_gpu.flip_modulo = param;
+            return;
+
+        case NV097_FLIP_INCREMENT_WRITE:
+            s_gpu.flip_write = s_gpu.flip_modulo
+                                   ? (s_gpu.flip_write + 1) % s_gpu.flip_modulo
+                                   : s_gpu.flip_write + 1;
+            s_gpu.flips++;
+            return;
+
+        case NV097_FLIP_STALL:
+            /* The stall ends when the buffer being read is the one just finished.
+             * There is no scanout here to wait for, so that is now. */
+            s_gpu.flip_read = s_gpu.flip_write;
+            /* The surface drawn into up to here is a finished frame: show it. */
+            if (gpu_enabled())
+                gpu_flip();
+            /* RECOMP_SHOT_PREFIX=<path prefix>: every RECOMP_SHOT_SECONDS (default
+             * 30) write the finished frame as <prefix>-<n>.bmp, straight from the
+             * surface -- works when the window is minimised or the screen is
+             * locked, which window capture does not (2026-09-25). */
+            if (getenv("RECOMP_SHOT_PREFIX")) {
+                static DWORD next_shot;
+                static unsigned shot_n;
+                DWORD now = GetTickCount();
+                if (!next_shot)
+                    next_shot = now;
+                if (now >= next_shot && surface_bpp() == 4) {
+                    const char *secs = getenv("RECOMP_SHOT_SECONDS");
+                    const uint8_t *mem = (const uint8_t *) xbox_GetMemoryOffset();
+                    uint32_t base = dma_resolve(s_gpu.color_offset);
+                    uint32_t w = s_gpu.clip_x + s_gpu.clip_w, h = s_gpu.clip_y + s_gpu.clip_h, y;
+                    char path[512];
+                    FILE *f;
+                    next_shot = now + 1000u * (secs ? (unsigned) atoi(secs) : 30u);
+                    snprintf(path, sizeof path, "%s-%03u.bmp", getenv("RECOMP_SHOT_PREFIX"), shot_n++);
+                    f = fopen(path, "wb");
+                    fprintf(stderr, "  [SHOT] %s t=%lu\n", path, (unsigned long) now);
+                    if (f && w && h && w <= 4096 && h <= 4096) {
+                        uint32_t size = 54 + w * h * 4;
+                        uint8_t hdr[54] = {'B', 'M'};
+                        memcpy(hdr + 2, &size, 4);
+                        hdr[10] = 54;
+                        hdr[14] = 40;
+                        memcpy(hdr + 18, &w, 4);
+                        {
+                            int32_t nh = -(int32_t) h;
+                            memcpy(hdr + 22, &nh, 4);
+                        } /* top-down */
+                        hdr[26] = 1;
+                        hdr[28] = 32;
+                        fwrite(hdr, 1, 54, f);
+                        for (y = 0; y < h; y++) {
+#if defined(__linux__)
+                            uint32_t row[4096];
+                            if (!pb_diagnostic_read((uint64_t) base + (uint64_t) y * s_gpu.pitch, row,
+                                                    (size_t) w * 4)) {
+                                fclose(f);
+                                f = NULL;
+                                remove(path);
+                                fprintf(stderr, "  [SHOT] unavailable: unreadable row %u\n", y);
+                                break;
+                            }
+                            fwrite(row, 4, w, f);
+#else
+                            fwrite(mem + base + (size_t) y * s_gpu.pitch, 4, w, f);
+#endif
+                        }
+                    }
+                    if (f)
+                        fclose(f);
+                }
+            }
+            xbox_FramebufferWindowSet(dma_resolve(s_gpu.color_offset), s_gpu.pitch);
+            xbox_FramebufferSnapshot(dma_resolve(s_gpu.color_offset), s_gpu.pitch);
+            xbox_FramebufferWindowSize(s_gpu.clip_x + s_gpu.clip_w, s_gpu.clip_y + s_gpu.clip_h);
+            /* And this is a completed swap, which is what a title's own swap
+             * counter counts -- see xbox_Nv2aFrameCounterFlip. */
+            xbox_Nv2aFrameCounterFlip();
+            if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+                static unsigned n;
+                if (n++ < 8) {
+                    fprintf(stderr, "  [GPU] flip %u: read=%u write=%u\n",
+                            s_gpu.flips, s_gpu.flip_read, s_gpu.flip_write);
+                    fflush(stderr);
+                }
+            }
+            return;
+
+        case NV097_SET_TEXTURE_FORMAT:
+            if (getenv("RECOMP_TEX_IDENTIFY"))
+                fprintf(stderr, "[TEX] FORMAT param=0x%08X color=0x%02X%s\n",
+                        param, (param >> 8) & 0xFF,
+                        ((param >> 8) & 0xFF) == 0x0B ? "  <-- matches legal-screen P8 format byte" : "");
+            s_gpu.tex.color = (param >> 8) & 0xFF;
+            /* A swizzled texture carries its own dimensions here, as log2 in
+             * BASE_SIZE_U/V (nv2a_regs.h: 0x00F00000 / 0x0F000000). It has to:
+             * SET_TEXTURE_IMAGE_RECT describes a linear image, and a title that
+             * only uses swizzled textures never sends one -- this title sends it
+             * once and sets a format 3,176 times. Without this the width and
+             * height stayed zero and nothing was ever sampled. */
+            if (tex_size_from_format((param >> 8) & 0xFF)) {
+                s_gpu.tex.width = 1u << ((param >> 20) & 0xF);
+                s_gpu.tex.height = 1u << ((param >> 24) & 0xF);
+            }
+            record_tex_reg(method, param);
+            break;
+
+        case NV097_SET_TEXTURE_ADDRESS:
+            /* Four bits per axis. 1 is wrap, 3 is clamp-to-edge; the rest (mirror,
+             * border) fall back to clamp, which is wrong at an edge rather than
+             * wrong everywhere. */
+            s_gpu.tex.addr_u = param & 0xF;
+            s_gpu.tex.addr_v = (param >> 8) & 0xF;
+            record_tex_reg(method, param);
+            break;
+
+        case NV097_SET_TEXTURE_CONTROL1:
+            /* Pitch lives in the top half. Only meaningful for a linear format; a
+             * swizzled texture has no pitch because it has no rows. */
+            s_gpu.tex.pitch = param >> 16;
+            record_tex_reg(method, param);
+            break;
+
+        case NV097_SET_TEXTURE_IMAGE_RECT:
+            s_gpu.tex.width = param >> 16;
+            s_gpu.tex.height = param & 0xFFFF;
+            if (getenv("RECOMP_TEX_IDENTIFY"))
+                fprintf(stderr, "[TEX] IMAGE_RECT width=%u height=%u offset=0x%08X\n",
+                        s_gpu.tex.width, s_gpu.tex.height, s_gpu.tex.offset);
+            record_tex_reg(method, param);
+            break;
+
+        default:
+            if (method >= NV_TEX_FIRST && method <= NV_TEX_LAST)
+                record_tex_reg(method, param);
+            if (method >= NV097_SET_VERTEX_DATA_ARRAY_OFFSET
                 && method < NV097_SET_VERTEX_DATA_ARRAY_OFFSET + NV_VERTEX_ATTRS * 4) {
-            /* Resolved here, once, so every consumer -- the rasteriser's
-             * attribute reads and the diagnostics alike -- sees the same
-             * address. A vertex array offset is a DMA-object offset exactly
-             * like a surface offset: physical, and addressable only through
-             * the window when it names contiguous memory. */
-            s_gpu.attr[(method - NV097_SET_VERTEX_DATA_ARRAY_OFFSET) / 4].offset =
-                dma_resolve(param);
-        } else if (method >= NV097_SET_VERTEX_DATA_ARRAY_FORMAT
-                && method < NV097_SET_VERTEX_DATA_ARRAY_FORMAT + NV_VERTEX_ATTRS * 4) {
-            VertexAttr *a = &s_gpu.attr[(method - NV097_SET_VERTEX_DATA_ARRAY_FORMAT) / 4];
-            a->type   =  param        & 0x0F;
-            a->size   = (param >> 4)  & 0x0F;
-            a->stride = (param >> 8)  & 0xFF;
-        } else if (!imm_vertex_method(method, param)) {
-            note_unhandled(method, param);
-        }
-        break;
+                /* Resolved here, once, so every consumer -- the rasteriser's
+                 * attribute reads and the diagnostics alike -- sees the same
+                 * address. A vertex array offset is a DMA-object offset exactly
+                 * like a surface offset: physical, and addressable only through
+                 * the window when it names contiguous memory. */
+                s_gpu.attr[(method - NV097_SET_VERTEX_DATA_ARRAY_OFFSET) / 4].offset =
+                        dma_resolve(param);
+            } else if (method >= NV097_SET_VERTEX_DATA_ARRAY_FORMAT
+                       && method < NV097_SET_VERTEX_DATA_ARRAY_FORMAT + NV_VERTEX_ATTRS * 4) {
+                VertexAttr *a = &s_gpu.attr[(method - NV097_SET_VERTEX_DATA_ARRAY_FORMAT) / 4];
+                a->type = param & 0x0F;
+                a->size = (param >> 4) & 0x0F;
+                a->stride = (param >> 8) & 0xFF;
+            } else if (!imm_vertex_method(method, param)) {
+                note_unhandled(method, param);
+            }
+            break;
     }
 }
 
@@ -4542,31 +4854,30 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
  * floats, which is a distinctive enough pair to search guest RAM for. Whatever
  * address that turns up is where the title's writes are landing, and the
  * difference from the programmed offset is the bug. */
-static void find_quad_vertices(void)
-{
-    const uint32_t W = 0x44200000u;   /* 640.0f */
-    const uint32_t H = 0x43F00000u;   /* 480.0f */
-    const uint32_t *ram = (const uint32_t *)xbox_GetMemoryOffset();
+static void find_quad_vertices(void) {
+    const uint32_t W = 0x44200000u; /* 640.0f */
+    const uint32_t H = 0x43F00000u; /* 480.0f */
+    const uint32_t *ram = (const uint32_t *) xbox_GetMemoryOffset();
     uint32_t i, hits = 0;
 #if defined(__linux__)
-    uint32_t staged[1024+8],begin=UINT32_MAX;
-    ram=staged;
+    uint32_t staged[1024 + 8], begin = UINT32_MAX;
+    ram = staged;
 #endif
 
     fprintf(stderr, "[GPU] searching guest RAM for 640.0f/480.0f pairs...\n");
     for (i = 0x1000 / 4; i < (0x04000000u / 4) - 8 && hits < 12; i++) {
-        uint32_t at=i;
+        uint32_t at = i;
 #if defined(__linux__)
-        if (begin==UINT32_MAX || i>=begin+1024) {
-            begin=i & ~1023u;
-            size_t count=0x04000000u/4-begin;
-            if(count>1024+8) count=1024+8;
-            if(!pb_diagnostic_read((uint64_t)begin*4,staged,count*4)) {
-                fprintf(stderr,"  [GPU] quad scan incomplete at %08X (unreadable)\n",begin*4);
+        if (begin == UINT32_MAX || i >= begin + 1024) {
+            begin = i & ~1023u;
+            size_t count = 0x04000000u / 4 - begin;
+            if (count > 1024 + 8) count = 1024 + 8;
+            if (!pb_diagnostic_read((uint64_t) begin * 4, staged, count * 4)) {
+                fprintf(stderr, "  [GPU] quad scan incomplete at %08X (unreadable)\n", begin * 4);
                 return;
             }
         }
-        at=i-begin;
+        at = i - begin;
 #endif
         if (ram[at] != W && ram[at] != H)
             continue;
@@ -4594,7 +4905,7 @@ static void find_quad_vertices(void)
     }
     if (!hits)
         fprintf(stderr, "  [GPU]   none found -- the quad is not in RAM in"
-                        " that form\n");
+                " that form\n");
     fflush(stderr);
 }
 
@@ -4604,30 +4915,29 @@ static void find_quad_vertices(void)
  * the only way to find where is to find the matrix and watch who writes it.
  * Three consecutive real-indefinite values is a distinctive enough signature:
  * ordinary data does not contain runs of 0xFFC00000. */
-static void find_nan_matrices(void)
-{
+static void find_nan_matrices(void) {
     const uint32_t NAN_NEG = 0xFFC00000u;
-    const uint32_t *ram = (const uint32_t *)xbox_GetMemoryOffset();
+    const uint32_t *ram = (const uint32_t *) xbox_GetMemoryOffset();
     uint32_t i, hits = 0;
 #if defined(__linux__)
-    uint32_t staged[1024+20],begin=UINT32_MAX;
-    ram=staged;
+    uint32_t staged[1024 + 20], begin = UINT32_MAX;
+    ram = staged;
 #endif
 
     fprintf(stderr, "[GPU] searching guest RAM for NaN matrices...\n");
     for (i = 0x1000 / 4; i < (0x04000000u / 4) - 20 && hits < 10; i++) {
-        uint32_t at=i;
+        uint32_t at = i;
 #if defined(__linux__)
-        if(begin==UINT32_MAX || i>=begin+1024) {
-            begin=i & ~1023u;
-            size_t count=0x04000000u/4-begin;
-            if(count>1024+20) count=1024+20;
-            if(!pb_diagnostic_read((uint64_t)begin*4,staged,count*4)) {
-                fprintf(stderr,"  [GPU] NaN scan incomplete at %08X (unreadable)\n",begin*4);
+        if (begin == UINT32_MAX || i >= begin + 1024) {
+            begin = i & ~1023u;
+            size_t count = 0x04000000u / 4 - begin;
+            if (count > 1024 + 20) count = 1024 + 20;
+            if (!pb_diagnostic_read((uint64_t) begin * 4, staged, count * 4)) {
+                fprintf(stderr, "  [GPU] NaN scan incomplete at %08X (unreadable)\n", begin * 4);
                 return;
             }
         }
-        at=i-begin;
+        at = i - begin;
 #endif
         if (ram[at] != NAN_NEG || ram[at + 1] != NAN_NEG || ram[at + 2] != NAN_NEG)
             continue;
@@ -4643,7 +4953,7 @@ static void find_nan_matrices(void)
     }
     if (!hits)
         fprintf(stderr, "  [GPU]   none in RAM -- the NaNs are computed into"
-                        " registers, not stored\n");
+                " registers, not stored\n");
     fflush(stderr);
 }
 
@@ -4653,10 +4963,9 @@ static void find_nan_matrices(void)
  * for one frame in a thousand cannot be caught by stopping. Both
  * interpretations are printed because the question is usually "is this a
  * pointer or a number", and guessing wrong costs a run. */
-static void peek_addresses(void)
-{
+static void peek_addresses(void) {
     const char *spec = getenv("RECOMP_PEEK");
-    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    const uint8_t *mem = (const uint8_t *) xbox_GetMemoryOffset();
     char buf[256];
     char *tok, *ctx = NULL;
 
@@ -4665,13 +4974,13 @@ static void peek_addresses(void)
     strncpy(buf, spec, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = 0;
     for (tok = strtok_s(buf, ",", &ctx); tok; tok = strtok_s(NULL, ",", &ctx)) {
-        uint32_t va = (uint32_t)strtoul(tok, NULL, 0);
+        uint32_t va = (uint32_t) strtoul(tok, NULL, 0);
         uint32_t v;
         float f;
         if (va < 0x1000u || va >= 0x04000000u)
             continue;
-        if (!pb_diagnostic_read(va,&v,sizeof(v))) {
-            fprintf(stderr,"  [PEEK] 0x%08X = unavailable (unreadable)\n",va);
+        if (!pb_diagnostic_read(va, &v, sizeof(v))) {
+            fprintf(stderr, "  [PEEK] 0x%08X = unavailable (unreadable)\n", va);
             continue;
         }
         memcpy(&f, &v, 4);
@@ -4687,10 +4996,9 @@ static void peek_addresses(void)
  * hand costs one run per level; this costs one run for the whole chain, and
  * prints where it goes wrong when a level is null.
  */
-static void peek_chain(void)
-{
+static void peek_chain(void) {
     const char *spec = getenv("RECOMP_PEEK_CHAIN");
-    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    const uint8_t *mem = (const uint8_t *) xbox_GetMemoryOffset();
     char buf[256], *tok, *ctx = NULL;
     uint32_t cur = 0;
     int step = 0;
@@ -4701,19 +5009,19 @@ static void peek_chain(void)
     buf[sizeof(buf) - 1] = 0;
 
     for (tok = strtok_s(buf, ",", &ctx); tok; tok = strtok_s(NULL, ",", &ctx)) {
-        uint32_t off = (uint32_t)strtoul(tok, NULL, 0);
+        uint32_t off = (uint32_t) strtoul(tok, NULL, 0);
         if (step == 0) {
             cur = off;
             fprintf(stderr, "  [CHAIN] start 0x%08X\n", cur);
         } else {
             if (cur < 0x1000u || cur + 4 >= 0x04000000u) {
                 fprintf(stderr, "  [CHAIN] step %d: 0x%08X is not a guest"
-                                " pointer -- chain ends\n", step, cur);
+                        " pointer -- chain ends\n", step, cur);
                 return;
             }
             uint32_t value;
-            if (!pb_diagnostic_read(cur,&value,sizeof(value))) {
-                fprintf(stderr,"  [CHAIN] step %d: 0x%08X unreadable -- chain ends\n",step,cur);
+            if (!pb_diagnostic_read(cur, &value, sizeof(value))) {
+                fprintf(stderr, "  [CHAIN] step %d: 0x%08X unreadable -- chain ends\n", step, cur);
                 return;
             }
             cur = value + off;
@@ -4724,15 +5032,14 @@ static void peek_chain(void)
     }
     if (cur >= 0x1000u && cur <= 0x04000000u - 4) {
         uint32_t value;
-        if (pb_diagnostic_read(cur,&value,sizeof(value)))
-            fprintf(stderr,"  [CHAIN] final value at 0x%08X = 0x%08X\n",cur,value);
-        else fprintf(stderr,"  [CHAIN] final value at 0x%08X unavailable (unreadable)\n",cur);
+        if (pb_diagnostic_read(cur, &value, sizeof(value)))
+            fprintf(stderr, "  [CHAIN] final value at 0x%08X = 0x%08X\n", cur, value);
+        else fprintf(stderr, "  [CHAIN] final value at 0x%08X unavailable (unreadable)\n", cur);
     }
     fflush(stderr);
 }
 
-void nv2a_pb_exec_report(void)
-{
+void nv2a_pb_exec_report(void) {
     peek_addresses();
     peek_chain();
     if (getenv("RECOMP_FIND_NAN")) {
@@ -4743,17 +5050,20 @@ void nv2a_pb_exec_report(void)
     }
     if (getenv("RECOMP_FIND_QUAD")) {
         static int done;
-        if (!done) { done = 1; find_quad_vertices(); }
+        if (!done) {
+            done = 1;
+            find_quad_vertices();
+        }
     }
     int i, j;
 
     fprintf(stderr, "[GPU] surface 0x%08X pitch %u clip %ux%u+%u+%u"
-                    " clears %u | %u unhandled methods (%d distinct)\n",
+            " clears %u | %u unhandled methods (%d distinct)\n",
             s_gpu.color_offset, s_gpu.pitch, s_gpu.clip_w, s_gpu.clip_h,
             s_gpu.clip_x, s_gpu.clip_y, s_gpu.clears,
             s_gpu.unhandled_total, s_unhandled_count);
     fprintf(stderr, "[GPU] draws %u (%u with coordinates), %u indices;"
-                    " x %.1f..%.1f  y %.1f..%.1f\n",
+            " x %.1f..%.1f  y %.1f..%.1f\n",
             s_gpu.draws, s_gpu.nonzero_draws, s_gpu.verts,
             s_gpu.min_x, s_gpu.max_x, s_gpu.min_y, s_gpu.max_y);
     /* One picture per report rather than per clear: a title clears hundreds of
@@ -4765,14 +5075,14 @@ void nv2a_pb_exec_report(void)
      * of them means the rasteriser is broken. */
     fprintf(stderr, "[GPU] brightest pixel written 0x%08X\n", s_gpu.pixel_max);
     fprintf(stderr, "[GPU] %llu pixels written; draw surface 0x%08X"
-                    " -> 0x%08X, clear surface 0x%08X -> 0x%08X\n",
-            (unsigned long long)s_gpu.pixels, s_gpu.drawn_offset,
+            " -> 0x%08X, clear surface 0x%08X -> 0x%08X\n",
+            (unsigned long long) s_gpu.pixels, s_gpu.drawn_offset,
             dma_resolve(s_gpu.drawn_offset), s_gpu.color_offset,
             dma_resolve(s_gpu.color_offset));
     fprintf(stderr, "[GPU] rasterised %u triangles; %u batches skipped as not"
-                    " screen-space, %u triangles fully off-surface; %u pushbuffer CALLs followed;"
-                    " %u batches / %u vertices through vertex programs\n"
-                    "[GPU] vertex-program triangles: %u drawn, rejected %u bad position, %u zero area, %u culled, %u off surface\n",
+            " screen-space, %u triangles fully off-surface; %u pushbuffer CALLs followed;"
+            " %u batches / %u vertices through vertex programs\n"
+            "[GPU] vertex-program triangles: %u drawn, rejected %u bad position, %u zero area, %u culled, %u off surface\n",
             s_gpu.tris_drawn, s_gpu.batches_untransformed,
             s_gpu.tris_skipped_offscreen, g_nv2a_pb_calls, s_vp.batches, s_vp.verts,
             s_vp.drawn, s_vp.rej_bad, s_vp.rej_area, s_vp.rej_cull, s_vp.rej_clip);
@@ -4782,14 +5092,17 @@ void nv2a_pb_exec_report(void)
      * shows both as flat colour if either half is missing, so the split is
      * what says which half. */
     fprintf(stderr, "[GPU] batches: %u textured, %u with no texcoords,"
-                    " %u with texcoords but no usable stage\n",
+            " %u with texcoords but no usable stage\n",
             s_gpu.batches_textured, s_gpu.batches_no_uv, s_gpu.batches_no_tex);
     for (i = 0; i < s_tex_use_count; i++)
         fprintf(stderr, "  [TEXUSE] 0x%08X %ux%u fmt 0x%02X%s: %u batches\n",
                 s_tex_use[i].offset, s_tex_use[i].width, s_tex_use[i].height,
                 s_tex_use[i].color,
-                d3d8_format_dxt_block_bytes(s_tex_use[i].color) ? " dxt"
-                    : d3d8_format_is_swizzled(s_tex_use[i].color) ? " swz" : " lin",
+                d3d8_format_dxt_block_bytes(s_tex_use[i].color)
+                    ? " dxt"
+                    : d3d8_format_is_swizzled(s_tex_use[i].color)
+                          ? " swz"
+                          : " lin",
                 s_tex_use[i].batches);
 
     if (getenv("RECOMP_TEX_STATE")) {
@@ -4797,7 +5110,7 @@ void nv2a_pb_exec_report(void)
         for (k = 0; k < sizeof s_tex_set / sizeof s_tex_set[0]; k++)
             if (s_tex_set[k])
                 fprintf(stderr, "  [TEX] 0x%04X = 0x%08X\n",
-                        (unsigned)(NV_TEX_FIRST + k * 4), s_tex_reg[k]);
+                        (unsigned) (NV_TEX_FIRST + k * 4), s_tex_reg[k]);
     }
 
     /* Top ten by frequency: selection sort over a small table, once every few
@@ -4810,28 +5123,32 @@ void nv2a_pb_exec_report(void)
      * one seen a thousand times, and ten hides it. */
     {
         int shown = getenv("RECOMP_PB_UNHANDLED_ALL") ? s_unhandled_count : 10;
-    for (i = 0; i < shown && i < s_unhandled_count; i++) {
-        int best = i;
-        for (j = i + 1; j < s_unhandled_count; j++)
-            if (s_unhandled[j].count > s_unhandled[best].count)
-                best = j;
-        if (best != i) {
-            PbUnhandled t = s_unhandled[i];
-            s_unhandled[i] = s_unhandled[best];
-            s_unhandled[best] = t;
-        }
-        {
-            /* The value as well as the count. A method nobody decoded is
-             * a guess until you see what it carried: screen coordinates,
-             * a 0..1 texcoord and a packed colour are told apart at a
-             * glance, and that is what says which vertex encoding a title
-             * is using. */
-            union { uint32_t u; float f; } v;
-            v.u = s_unhandled[i].last_param;
-            fprintf(stderr, "  [GPU]   0x%04X x%-8u last=0x%08X (%.4f)\n",
-                    s_unhandled[i].method, s_unhandled[i].count,
-                    v.u, v.f);
+        for (i = 0; i < shown && i < s_unhandled_count; i++) {
+            int best = i;
+            for (j = i + 1; j < s_unhandled_count; j++)
+                if (s_unhandled[j].count > s_unhandled[best].count)
+                    best = j;
+            if (best != i) {
+                PbUnhandled t = s_unhandled[i];
+                s_unhandled[i] = s_unhandled[best];
+                s_unhandled[best] = t;
+            }
+            {
+                /* The value as well as the count. A method nobody decoded is
+                 * a guess until you see what it carried: screen coordinates,
+                 * a 0..1 texcoord and a packed colour are told apart at a
+                 * glance, and that is what says which vertex encoding a title
+                 * is using. */
+                union {
+                    uint32_t u;
+                    float f;
+                } v;
+                v.u = s_unhandled[i].last_param;
+                fprintf(stderr, "  [GPU]   0x%04X x%-8u last=0x%08X (%.4f)\n",
+                        s_unhandled[i].method, s_unhandled[i].count,
+                        v.u, v.f);
+            }
         }
     }
-    }    fflush(stderr);
+    fflush(stderr);
 }

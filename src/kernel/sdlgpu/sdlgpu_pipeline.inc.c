@@ -181,7 +181,8 @@ static SDL_GPUGraphicsPipeline *sg_pipeline_create(const SgPipeKey *key)
             .num_vertex_attributes = xf ? 7 : 3,
         },
         .primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST,
-        .rasterizer_state = { .fill_mode = SDL_GPU_FILLMODE_FILL, .cull_mode = SDL_GPU_CULLMODE_NONE },
+        .rasterizer_state = { .fill_mode = SDL_GPU_FILLMODE_FILL, .cull_mode = SDL_GPU_CULLMODE_NONE,
+                              .enable_depth_clip = false },
         .depth_stencil_state = {
             .enable_depth_test = (key->depth & 1u) != 0,
             .enable_depth_write = (key->depth & 2u) != 0,

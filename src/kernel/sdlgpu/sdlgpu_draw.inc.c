@@ -228,6 +228,11 @@ static int sg_queue_flush(void) {
         SDL_GPUCommandBuffer *cmd;
         uint8_t *stage = (uint8_t *) SDL_MapGPUTransferBuffer(s_sg.dev, s_sg.upload, true);
 
+        if (!stage) {
+            sg_gpu_error("flush: map");
+            goto failed;
+        }
+
         /* Transfer layout: vertices | surface | textures */
         memcpy(stage, q->vdata, q->vbytes);
         if (sbytes)
@@ -236,6 +241,10 @@ static int sg_queue_flush(void) {
         SDL_UnmapGPUTransferBuffer(s_sg.dev, s_sg.upload);
 
         cmd = SDL_AcquireGPUCommandBuffer(s_sg.dev);
+        if (!cmd) {
+            sg_gpu_error("flush: command buffer");
+            goto failed;
+        }
         {
             SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass(cmd);
             SDL_GPUTransferBufferLocation from = {.transfer_buffer = s_sg.upload, .offset = 0};
@@ -293,6 +302,7 @@ static int sg_queue_flush(void) {
         ok = 1;
     }
 
+failed:
     if (!ok) {
         static int told;
         if (!told++)

@@ -11,7 +11,7 @@
  * whichever stage samples it.
  */
 
-#define SG_MAX_TEXTURES 48
+#define SG_MAX_TEXTURES 512
 
 typedef struct {
     uint64_t        key;        /* sg_texture_key(); 0 = empty or not yet uploaded */
@@ -40,7 +40,7 @@ static uint32_t        s_sg_texture_tick;
  * from guest RAM are remembered (a malloc'd snapshot copy can reuse an
  * address). Limitation: a texture the title rewrites in place after using
  * it in the same frame reaches the GPU one frame late. */
-#define SG_HASH_MEMO 64
+#define SG_HASH_MEMO 1024
 
 typedef struct {
     const uint8_t *pixels;
@@ -152,6 +152,24 @@ static int sg_texture_for_stage(int st, SgTextureUse *use)
         return 0;
     if (!s_texture_snapshot[st].ready || !s_texture_snapshot[st].pixels)
         return 0;
+    /* Render-to-texture: the title samples a surface it drew (screen
+   * effects, replays). If the GPU drew it, guest RAM -- which the snapshot
+   * read -- is stale: finish the queue and download it first. Addresses
+   * are compared as physical (contiguous-window and physical aliases of
+   * the same 64 MB). */
+    {
+        uint32_t lo = tx->offset & 0x03FFFFFFu;
+        uint32_t hi = lo + (uint32_t)s_texture_snapshot[st].bytes;
+        for (i = 0; i < SG_MAX_SURFACES; i++) {
+            SgSurface *s = &s_sg.surf[i];
+            uint32_t slo = s->guest & 0x03FFFFFFu, shi = slo + s->pitch * s->h;
+            if (s->color && s->owner == SG_OWNER_GPU && lo < shi && slo < hi) {
+                sg_queue_flush();
+                sg_download(s);
+                xbox_texture_snapshot_refresh(st);
+            }
+        }
+    }
 
     key = sg_texture_key(st);
     s_sg_texture_tick++;

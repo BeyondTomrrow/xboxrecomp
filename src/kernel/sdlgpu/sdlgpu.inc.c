@@ -200,6 +200,16 @@ static void sg_stats_tick(void)
     s_sg_stats.since_ms = now;
 }
 
+/* A GPU call failed: report it once per call site with SDL's reason, so a
+ * failure shows up in the log instead of as a crash further down (SDL's
+ * calls crash when handed the NULL an earlier failed call returned). */
+#define sg_gpu_error(what)                                                         \
+    do {                                                                           \
+        static int told_;                                                          \
+        if (!told_++)                                                              \
+            fprintf(stderr, "  [SDLGPU] %s failed: %s\n", (what), SDL_GetError()); \
+    } while (0)
+
 static int sg_wanted(void)
 {
     static int wanted = -1;
