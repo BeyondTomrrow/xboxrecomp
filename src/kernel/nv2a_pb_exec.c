@@ -3251,14 +3251,11 @@ static void raster_tri_clip(const XfVert *a, const XfVert *b, const XfVert *c,
     XfVert in[3], out[6];
     int i, m = 0;
 
-    /* A triangle with vertices on both sides of the eye plane (some w > eps,
- * some w <= eps) must be clipped: dividing by a w at or behind the eye
- * throws its vertex to the far side of the screen. NFL 2K5's ground and
- * stadium polygons near the camera are like this, with every position
- * finite (ok), so they used to be drawn as-is -- black wedges and a
- * missing field in software, garbage slabs on the GPU. Clipping them is
- * always safe; the pie-chart case below has *all* w at or below 0. */
-    int front = (a->w > eps) + (b->w > eps) + (c->w > eps);
+    /* A vertex is in front of the near plane when it is in front of the
+    * eye (w > eps) with depth >= 0 (z here is already divided by w, so its
+    * sin is that of the clip-space depth). */
+    int front = (a->w > eps && a->z >= 0.0f) + (b->w > eps && b->z >= 0.0f)
+              + (c->w > eps && c->z >= 0.0f);
     int straddles = front > 0 && front < 3;
 
     if (a->ok && b->ok && c->ok && !straddles) {
@@ -3321,11 +3318,11 @@ static void raster_tri_clip(const XfVert *a, const XfVert *b, const XfVert *c,
     }
     for (i = 0; i < 3; i++) {
         const XfVert *p = &in[i], *q = &in[(i + 1) % 3];
-        int pin = p->w >= eps, qin = q->w >= eps;
+        int pin = p->z >= 0.0f, qin = q->z >= 0.0f;
         if (pin)
             out[m++] = *p;
         if (pin != qin)
-            xf_lerp(&out[m++], p, q, (eps - p->w) / (q->w - p->w));
+            xf_lerp(&out[m++], p, q, p->z / (p->z - q->z));
     }
     if (m < 3) {
         s_vp.rej_clip++;
