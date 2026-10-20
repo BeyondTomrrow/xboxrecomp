@@ -77,6 +77,7 @@ static void sg_collect_xf(void *ctx, const XfVert *a, const XfVert *b, const XfV
                         off, s_gpu.tex.width, s_gpu.tex.height, s_gpu.tex.color,
                         s_gpu.tex.addr_u, s_gpu.tex.addr_v, s_gpu.tex.valid, s_gpu.tex.enabled,
                         comb_active(), s_comb.stage_prog, area);
+
                 for (j = 0; j < 3; j++)
                     fprintf(stderr, "  [UVTRACE]   v%d xy %.1f %.1f z %.0f w %.4f uv %.2f %.2f"
                                     " col %.2f %.2f %.2f %.2f\n",
