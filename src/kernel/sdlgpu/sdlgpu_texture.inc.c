@@ -28,6 +28,7 @@ typedef struct {
     uint32_t         w, h;
     SgCachedTexture *pending;   /* cache slot to mark valid once the upload is issued */
     uint64_t         pending_key;
+    SDL_GPUSampler *sampler;
 } SgTextureUse;
 
 static SgCachedTexture s_sg_textures[SG_MAX_TEXTURES];
@@ -61,6 +62,49 @@ static size_t          s_sg_decode_texels[4];
 static const Texture *sg_stage_texture(int st)
 {
     return st == 0 ? &s_gpu.tex : &s_stage[st];
+}
+
+/* ── Samplers, from the title's own per-stage settings (as the D3D11 path):
+ * SET_TEXTURE_FILTER's magnification filter picks bilinear or point, and
+ * SET_TEXTURE_ADDRESS picks wrap / mirror / clamp per axis. Point stages
+ * stay on mip level 0 (crisp HUD art); bilinear ones filter between the
+ * generated mip levels, so distant detail (the grass) does not shimmer. */
+
+#define SG_SAMPLER_KEYS 128                 /* 1 bit filter, 3 bits u, 3 bits v */
+static SDL_GPUSampler *s_sg_samplers[SG_SAMPLER_KEYS];
+
+static SDL_GPUSamplerAddressMode sg_address_mode(uint32_t m)
+{
+    switch (m) {
+    case 1:  return SDL_GPU_SAMPLERADDRESSMODE_REPEAT;           /* wrap */
+    case 2:  return SDL_GPU_SAMPLERADDRESSMODE_MIRRORED_REPEAT;  /* mirror */
+    default: return SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;    /* clamp; border has no SDL mode */
+    }
+}
+
+static SDL_GPUSampler *sg_sampler_for_stage(int st)
+{
+    const Texture *tx = sg_stage_texture(st);
+    uint32_t filter = s_tex_reg[(0x1B14u + 0x40u * (uint32_t)st - NV_TEX_FIRST) / 4];
+    int linear = ((filter >> 24) & 0xFu) != 1;                  /* MAG_FILTER 1 = point */
+    uint32_t key = (uint32_t)linear | ((tx->addr_u & 7u) << 1) | ((tx->addr_v & 7u) << 4);
+
+    if (!s_sg_samplers[key]) {
+        SDL_GPUSamplerCreateInfo info = {
+            .min_filter = linear ? SDL_GPU_FILTER_LINEAR : SDL_GPU_FILTER_NEAREST,
+            .mag_filter = linear ? SDL_GPU_FILTER_LINEAR : SDL_GPU_FILTER_NEAREST,
+            .mipmap_mode = linear ? SDL_GPU_SAMPLERMIPMAPMODE_LINEAR : SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,
+            .address_mode_u = sg_address_mode(tx->addr_u),
+            .address_mode_v = sg_address_mode(tx->addr_v),
+            .address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+            .min_lod = 0.0f,
+            .max_lod = linear ? 1000.0f : 0.0f,                 /* point: level 0 only */
+        };
+        s_sg_samplers[key] = SDL_CreateGPUSampler(s_sg.dev, &info);
+        if (!s_sg_samplers[key])
+            return s_sg.point;                                  /* still drawable */
+    }
+    return s_sg_samplers[key];
 }
 
 static int sg_stage_sample(int st, uint32_t x, uint32_t y, uint32_t *argb)
@@ -178,7 +222,7 @@ static int sg_texture_for_stage(int st, SgTextureUse *use)
         if (c->key == key && c->w == w && c->h == h) {
             c->last_use = s_sg_texture_tick;
             c->epoch_used = s_sg_queue.epoch;
-            *use = (SgTextureUse){ c->tex, NULL, w, h, NULL, 0 };
+            *use = (SgTextureUse){ c->tex, NULL, w, h, NULL, 0, sg_sampler_for_stage(st) };
             return 1;
         }
     }
@@ -204,11 +248,15 @@ static int sg_texture_for_stage(int st, SgTextureUse *use)
     if (!sg_texture_decode(st, w, h))
         return 0;
     if (!slot->tex || slot->w != w || slot->h != h) {
+        /* A full mip chain, generated on the GPU after each upload */
+        uint32_t levels = 1, big = w > h ? w : h;
+        while (big > 1) { big >>= 1; levels++; }
         SDL_GPUTextureCreateInfo info = {
             .type = SDL_GPU_TEXTURETYPE_2D,
             .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
-            .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER,
-            .width = w, .height = h, .layer_count_or_depth = 1, .num_levels = 1,
+            .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER | SDL_GPU_TEXTUREUSAGE_COLOR_TARGET,
+            .width = w, .height = h, .layer_count_or_depth = 1, .num_levels = levels,
+            .num_levels = levels
         };
         if (slot->tex)
             SDL_ReleaseGPUTexture(s_sg.dev, slot->tex);
@@ -225,13 +273,16 @@ static int sg_texture_for_stage(int st, SgTextureUse *use)
     slot->key = 0;
     slot->last_use = s_sg_texture_tick;
     slot->epoch_used = s_sg_queue.epoch;      /* reserved by this batch */
-    *use = (SgTextureUse){ slot->tex, s_sg_decode[st], w, h, slot, key };
+    *use = (SgTextureUse){ slot->tex, s_sg_decode[st], w, h, slot, key, sg_sampler_for_stage(st)
+    };
+
     return 1;
 }
 
 static int sg_texture_stage0(SgTextureUse *use)
 {
     return sg_texture_for_stage(0, use);
+    use ->sampler = sg_sampler_for_stage(0);
 }
 
 /* The upload for use->pending is in the command buffer: later batches may hit it. */

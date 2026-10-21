@@ -10,8 +10,21 @@
 #include <sys/mman.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#include <string.h>
 #else
 #error "Checked guest-memory copies require Windows or Linux"
+#endif
+
+
+#if !defined(_WIN32)
+/* getpid() is a system call; the process never forks, so ask once. */
+static pid_t self_pid(void)
+{
+    static pid_t pid;
+    if (!pid)
+        pid = getpid();
+    return pid;
+}
 #endif
 
 static bool copy_bounds(uintptr_t base, uint64_t address, const void *buffer,
@@ -37,9 +50,13 @@ bool xbox_guest_memory_read(uintptr_t base, uint64_t address, void *destination,
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
     return true;
 #else
+    if (xbox_guest_memory_direct(base, address, size, false)) {
+        memcpy(destination, (const void *)host, size);
+        return true;
+    }
     struct iovec local = {destination,size};
     struct iovec remote = {(void *)host,size};
-    ssize_t copied = process_vm_readv(getpid(),&local,1,&remote,1,0);
+    ssize_t copied = process_vm_readv(self_pid(),&local,1,&remote,1,0);
     return copied >= 0 && (size_t)copied == size;
 #endif
 }
@@ -54,9 +71,13 @@ bool xbox_guest_memory_write(uintptr_t base, uint64_t address, const void *sourc
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
     return true;
 #else
+    if (xbox_guest_memory_direct(base, address, size, true)) {
+        memcpy((void *)host, source, size);
+        return true;
+    }
     struct iovec local = {(void *)source,size};
     struct iovec remote = {(void *)host,size};
-    ssize_t copied = process_vm_writev(getpid(),&local,1,&remote,1,0);
+    ssize_t copied = process_vm_writev(self_pid(),&local,1,&remote,1,0);
     return copied >= 0 && (size_t)copied == size;
 #endif
 }
@@ -65,6 +86,8 @@ bool xbox_guest_memory_write(uintptr_t base, uint64_t address, const void *sourc
 #include <stdatomic.h>
 #include <stdio.h>
 #include <pthread.h>
+
+bool xbox_guest_memory_direct(uintptr_t base, uint64_t address, size_t size, bool writable);
 
 /* ---- writability: a parsed copy of /proc/self/maps ---------------------- */
 typedef struct { uintptr_t start, end; bool writable; } GuestMapping;
@@ -138,7 +161,7 @@ static bool range_readable(uintptr_t start, uintptr_t end, size_t page)
         for (; at < end && n < BATCH; at += page)
             remote[n++] = (struct iovec){ (void *)at, 1 };
         local[0] = (struct iovec){ sink, n };
-        if (process_vm_readv(getpid(), local, 1, remote, n, 0) != (ssize_t)n)
+        if (process_vm_readv(self_pid(), local, 1, remote, n, 0) != (ssize_t)n)
             return false;
         start = at;
     }
@@ -147,31 +170,44 @@ static bool range_readable(uintptr_t start, uintptr_t end, size_t page)
 #endif
 
 #if defined(__linux__)
-/* Ranges already found accessible, valid for one protection generation.
- * Render targets and font pages are the same few ranges every frame, so
- * almost every check is a lookup here instead of a page probe. */
-#define DIRECT_CACHE 32
-typedef struct { uintptr_t start, end; bool writable; unsigned generation; } DirectRange;
-static DirectRange s_direct[DIRECT_CACHE];
-static unsigned s_direct_next;
+/* Pages already found accessible, one entry per guest page below the
+ * device apertures: (protection generation << 2) | 1 readable | 2 writable.
+ * An entry from an older generation does not count, so VirtualAlloc/Free/
+ * Protect invalidate everything at once (xbox_guest_memory_protection_
+ * changed) without clearing anything, and a stale store from a thread that
+ * raced a protection change cannot validate under the new generation.
+ * Replaces a 32-range cache: a stadium frame touches hundreds of textures
+ * and buffers, so it kept evicting and re-probing with process_vm_readv
+ * (~3% of the command thread with its getpid, 2026-10-21). 4 MB. */
+#define DIRECT_PAGES (0xFD000000u >> 12)
+static _Atomic uint32_t s_page_ok[DIRECT_PAGES];
 
-static bool direct_cached(uintptr_t start, uintptr_t end, bool writable, unsigned gen)
+static uint32_t page_stamp(unsigned gen)
 {
-    bool hit = false;
-    int i;
-    pthread_mutex_lock(&s_maps_lock);
-    for (i = 0; i < DIRECT_CACHE && !hit; i++)
-        hit = s_direct[i].generation == gen && s_direct[i].start <= start && end <= s_direct[i].end
-           && (s_direct[i].writable || !writable);
-    pthread_mutex_unlock(&s_maps_lock);
-    return hit;
+    return (uint32_t)gen << 2;
 }
 
-static void direct_remember(uintptr_t start, uintptr_t end, bool writable, unsigned gen)
+/* Every page of [first, last] known accessible (and writable if asked). */
+static bool pages_known(uint32_t first, uint32_t last, bool writable, unsigned gen)
 {
-    pthread_mutex_lock(&s_maps_lock);
-    s_direct[s_direct_next++ % DIRECT_CACHE] = (DirectRange){ start, end, writable, gen };
-    pthread_mutex_unlock(&s_maps_lock);
+    uint32_t p, need = writable ? 3u : 1u, stamp = page_stamp(gen);
+    for (p = first; p <= last; p++) {
+        uint32_t e = atomic_load_explicit(&s_page_ok[p], memory_order_relaxed);
+        if ((e & ~3u) != stamp || (e & need) != need)
+            return false;
+    }
+    return true;
+}
+
+static void pages_remember(uint32_t first, uint32_t last, bool writable, unsigned gen)
+{
+    uint32_t p, stamp = page_stamp(gen);
+    for (p = first; p <= last; p++) {
+        uint32_t e = atomic_load_explicit(&s_page_ok[p], memory_order_relaxed);
+        uint32_t keep = (e & ~3u) == stamp ? (e & 2u) : 0u;    /* writable stays known */
+        atomic_store_explicit(&s_page_ok[p], stamp | 1u | keep | (writable ? 2u : 0u),
+                              memory_order_relaxed);
+    }
 }
 #endif
 
@@ -191,11 +227,12 @@ bool xbox_guest_memory_direct(uintptr_t base, uint64_t address, size_t size, boo
     end = (host + size + page - 1) & ~(uintptr_t)(page - 1);
     {
         unsigned gen = atomic_load(&s_protection_generation);
-        if (direct_cached(start, end, writable, gen))
+        uint32_t first = (uint32_t)(address >> 12), last = (uint32_t)((address + size - 1) >> 12);
+        if (pages_known(first, last, writable, gen))
             return true;
         if (!range_readable(start, end, page) || (writable && !range_writable(start, end)))
             return false;
-        direct_remember(start, end, writable, gen);
+        pages_remember(first, last, writable, gen);
         return true;
     }
 #else

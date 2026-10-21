@@ -38,12 +38,15 @@ typedef struct {
     SDL_GPUGraphicsPipeline *pipe;
     const void *vertices;
     uint32_t vertex_bytes, vertex_count;
+    const uint32_t  *indices; // Not indexed
+    uint32_t index_count;
     SgTextureUse *tex;
     int tex_count;
     const void *vs_uniform;
     uint32_t vs_uniform_size;
     const void *fs_uniform;
     uint32_t fs_uniform_size;
+
 } SgDraw;
 
 #ifdef SG_HAVE_SHADERS
@@ -85,6 +88,7 @@ static int sg_draw_init(void) {
         fprintf(stderr, "  [SDLGPU] drawing unavailable: %s\n", SDL_GetError());
         return 0;
     }
+
     s_sg.draw_ready = 1;
     return 1;
 #else
@@ -120,6 +124,19 @@ static int sg_vertex_buffer_reserve(uint32_t bytes) {
     return s_sg.vertices != NULL;
 }
 
+static int sg_index_buffer_reserve(uint32_t bytes)
+{
+    SDL_GPUBufferCreateInfo info = { .usage = SDL_GPU_BUFFERUSAGE_INDEX };
+    if (!bytes || bytes <= s_sg.indices_size)
+        return 1;
+    if (s_sg.indices)
+        SDL_ReleaseGPUBuffer(s_sg.dev, s_sg.indices);
+    info.size = bytes * 2;
+    s_sg.indices = SDL_CreateGPUBuffer(s_sg.dev, &info);
+    s_sg.indices_size = s_sg.indices ? info.size : 0;
+    return s_sg.indices != NULL;
+}
+
 /* Grow an array to hold `need` elements of `elem` bytes. Returns the
  * (possibly moved) array, or NULL on failure with the old one untouched. */
 static void *sg_grow(void *p, uint32_t *cap, uint32_t need, size_t elem) {
@@ -142,18 +159,20 @@ static void *sg_grow(void *p, uint32_t *cap, uint32_t need, size_t elem) {
  * when memory runs out. */
 static int sg_queue_draw(const SgDraw *d) {
     SgQueue *q = &s_sg_queue;
-    uint32_t i, tex_bytes = 0;
+    uint32_t i, tex_bytes = 0, ibytes = d->index_count * 4u;
     SgQueuedDraw *qd;
     void *g;
 
     if (q->surface && q->surface != d->surface)
         sg_queue_flush(); /* one target per queue */
-    if (q->count == SG_QUEUE_MAX_DRAWS || q->vbytes + d->vertex_bytes > (64u << 20))
-        sg_queue_flush();
+    if (q->count == SG_QUEUE_MAX_DRAWS || q->vbytes + d->vertex_bytes > (64u << 20) ||
+            q->ubytes > (32u << 20))
+                sg_queue_flush();
 
     for (i = 0; i < (uint32_t) d->tex_count; i++)
         if (d->tex[i].upload)
             tex_bytes += d->tex[i].w * d->tex[i].h * 4;
+
 
     if (!(g = sg_grow(q->draws, &q->cap, q->count + 1, sizeof *q->draws))) return 0;
     q->draws = (SgQueuedDraw *) g;
@@ -163,6 +182,11 @@ static int sg_queue_draw(const SgDraw *d) {
     q->tdata = (uint8_t *) g;
     if (!(g = sg_grow(q->uploads, &q->upload_cap, q->upload_count + 4, sizeof *q->uploads))) return 0;
     q->uploads = (SgQueuedUpload *) g;
+
+    if (!(g = sg_grow(q->idata, &q->icap, q->ibytes + ibytes, 1))) return 0;
+    q->idata = (uint8_t *)g;
+    if (!(g = sg_grow(q->udata, &q->ucap, q->ubytes + d->vs_uniform_size, 1))) return 0;
+    q->udata = (uint8_t *)g;
 
     if (!q->surface) {
         q->surface = d->surface;
@@ -176,9 +200,30 @@ static int sg_queue_draw(const SgDraw *d) {
     memcpy(q->vdata + q->vbytes, d->vertices, d->vertex_bytes);
     q->vbytes += d->vertex_bytes;
 
+    qd->index_offset = q->ibytes;
+    qd->index_count = d->index_count;
+    if (ibytes) {
+        memcpy(q->idata + q->ibytes, d->indices, ibytes);
+        q->ibytes += ibytes;
+    }
+
+    /* Vertex uniforms. A vertex program's 3 KB of constants rarely change
+     * between consecutive draws: identical data is stored once. */
+    if (q->last_vs_size == d->vs_uniform_size && q->ubytes &&
+        memcmp(q->udata + q->last_vs_offset, d->vs_uniform, d->vs_uniform_size) == 0) {
+        qd->vs_offset = q->last_vs_offset;
+        } else {
+            memcpy(q->udata + q->ubytes, d->vs_uniform, d->vs_uniform_size);
+            qd->vs_offset = q->last_vs_offset = q->ubytes;
+            q->last_vs_size = d->vs_uniform_size;
+            q->ubytes += d->vs_uniform_size;
+        }
+
     qd->tex_count = d->tex_count;
     for (i = 0; i < (uint32_t) d->tex_count; i++) {
         SgTextureUse *t = &d->tex[i];
+         qd->tex[i] = t->tex ? t->tex : s_sg.white;      /* the stage's texture */
+        qd->sampler[i] = t->sampler ? t->sampler : s_sg.point;     /* ...and its sampler */
         if (t->upload) {
             uint32_t bytes = t->w * t->h * 4;
             memcpy(q->tdata + q->tbytes, t->upload, bytes);
@@ -186,7 +231,6 @@ static int sg_queue_draw(const SgDraw *d) {
             q->tbytes += bytes;
             sg_texture_commit(t); /* uploaded before any queued draw runs */
         }
-        qd->tex[i] = t->tex ? t->tex : s_sg.white;
     }
 
     qd->scissor = (SDL_Rect){(int) s_gpu.clip_x, (int) s_gpu.clip_y, (int) s_gpu.clip_w, (int) s_gpu.clip_h};
@@ -197,7 +241,7 @@ static int sg_queue_draw(const SgDraw *d) {
     qd->stencil_ref = (Uint8) (s_vp.stencil_ref & 0xFF);
     qd->vs_size = d->vs_uniform_size;
     qd->fs_size = d->fs_uniform_size;
-    memcpy(qd->vs, d->vs_uniform, d->vs_uniform_size);
+   // memcpy(qd->vs, d->vs_uniform, d->vs_uniform_size);
     memcpy(qd->fs, d->fs_uniform, d->fs_uniform_size);
     q->count++;
 
@@ -223,8 +267,8 @@ static int sg_queue_flush(void) {
     }
 
     sbytes = q->upload_surface ? s->w * s->h * 4 : 0;
-    total = q->vbytes + sbytes + q->tbytes;
-    if (sg_vertex_buffer_reserve(q->vbytes) && sg_upload_reserve(total)) {
+    total = q->vbytes + q->ibytes + sbytes + q->tbytes;
+    if (sg_vertex_buffer_reserve(q->vbytes) && sg_index_buffer_reserve(q->ibytes) && sg_upload_reserve(total)) {
         SDL_GPUCommandBuffer *cmd;
         uint8_t *stage = (uint8_t *) SDL_MapGPUTransferBuffer(s_sg.dev, s_sg.upload, true);
 
@@ -232,12 +276,13 @@ static int sg_queue_flush(void) {
             sg_gpu_error("flush: map");
             goto failed;
         }
-
-        /* Transfer layout: vertices | surface | textures */
+        /* Transfer layout: vertices | indices | surface | textures */
         memcpy(stage, q->vdata, q->vbytes);
+        memcpy(stage + q->vbytes, q->idata, q->ibytes);
         if (sbytes)
-            sg_surface_pack(s, stage + q->vbytes);
-        memcpy(stage + q->vbytes + sbytes, q->tdata, q->tbytes);
+            sg_surface_pack(s, stage + q->vbytes + q->ibytes);
+        memcpy(stage + q->vbytes + q->ibytes + sbytes, q->tdata, q->tbytes);
+
         SDL_UnmapGPUTransferBuffer(s_sg.dev, s_sg.upload);
 
         cmd = SDL_AcquireGPUCommandBuffer(s_sg.dev);
@@ -250,20 +295,31 @@ static int sg_queue_flush(void) {
             SDL_GPUTransferBufferLocation from = {.transfer_buffer = s_sg.upload, .offset = 0};
             SDL_GPUBufferRegion to = {.buffer = s_sg.vertices, .offset = 0, .size = q->vbytes};
             SDL_UploadToGPUBuffer(copy, &from, &to, true);
+            if (q->ibytes) {
+                SDL_GPUTransferBufferLocation ifrom = { .transfer_buffer = s_sg.upload, .offset = q->vbytes };
+                SDL_GPUBufferRegion ito = { .buffer = s_sg.indices, .offset = 0, .size = q->ibytes };
+                SDL_UploadToGPUBuffer(copy, &ifrom, &ito, true);
+            }
             if (sbytes) {
-                SDL_GPUTextureTransferInfo src = {.transfer_buffer = s_sg.upload, .offset = q->vbytes};
+                SDL_GPUTextureTransferInfo src = {
+                    .transfer_buffer = s_sg.upload,
+                    .offset = q->vbytes + q->ibytes
+                };
                 SDL_GPUTextureRegion dst = {.texture = s->color, .w = s->w, .h = s->h, .d = 1};
                 SDL_UploadToGPUTexture(copy, &src, &dst, false);
             }
             for (i = 0; i < q->upload_count; i++) {
                 const SgQueuedUpload *u = &q->uploads[i];
                 SDL_GPUTextureTransferInfo src = {
-                    .transfer_buffer = s_sg.upload, .offset = q->vbytes + sbytes + u->offset
+                    .transfer_buffer = s_sg.upload, .offset = q->vbytes + q->ibytes + sbytes + u->offset
                 };
                 SDL_GPUTextureRegion dst = {.texture = u->tex, .w = u->w, .h = u->h, .d = 1};
                 SDL_UploadToGPUTexture(copy, &src, &dst, false);
             }
             SDL_EndGPUCopyPass(copy);
+            for (i = 0; i < q->upload_count; i++)
+                if (q->uploads[i].w > 1 || q->uploads[i].h > 1)    /* 1x1: one level, nothing to generate */
+                    SDL_GenerateMipmapsForGPUTexture(cmd, q->uploads[i].tex);
         }
         {
             SDL_GPUColorTargetInfo target = {
@@ -286,15 +342,28 @@ static int sg_queue_flush(void) {
                     bound = qd->pipe;
                 }
                 for (k = 0; k < qd->tex_count; k++)
-                    tb[k] = (SDL_GPUTextureSamplerBinding){.texture = qd->tex[k], .sampler = s_sg.point};
+                    tb[k] = (SDL_GPUTextureSamplerBinding){.texture = qd->tex[k], .sampler = qd->sampler[k]};
+                for (k = 0; k < qd->tex_count; k++)
+                    if (!tb[k].texture || !tb[k].sampler) {
+                        static int told;
+                        if (told++ < 8)
+                            fprintf(stderr, "  [SDLGPU] draw %u stage %d: texture %p sampler %p (of %u)\n",
+                                    i, k, (void *)tb[k].texture, (void *)tb[k].sampler, qd->tex_count);
+                    }
                 SDL_SetGPUScissor(pass, &qd->scissor);
                 SDL_SetGPUBlendConstants(pass, qd->blend_constant);
                 SDL_SetGPUStencilReference(pass, qd->stencil_ref);
                 SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
                 SDL_BindGPUFragmentSamplers(pass, 0, tb, (Uint32) qd->tex_count);
-                SDL_PushGPUVertexUniformData(cmd, 0, qd->vs, qd->vs_size);
+                SDL_PushGPUVertexUniformData(cmd, 0, q->udata + qd->vs_offset, qd->vs_size);
                 SDL_PushGPUFragmentUniformData(cmd, 0, qd->fs, qd->fs_size);
-                SDL_DrawGPUPrimitives(pass, qd->vertex_count, 1, 0, 0);
+                if (qd->index_count) {
+                    SDL_GPUBufferBinding ib = { .buffer = s_sg.indices, .offset = qd->index_offset };
+                    SDL_BindGPUIndexBuffer(pass, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
+                    SDL_DrawGPUIndexedPrimitives(pass, qd->index_count, 1, 0, 0, 0);
+                } else {
+                    SDL_DrawGPUPrimitives(pass, qd->vertex_count, 1, 0, 0);
+                }
             }
             SDL_EndGPURenderPass(pass);
         }
@@ -312,6 +381,7 @@ failed:
                 s_sg_textures[i].key = 0;
     }
     q->count = q->vbytes = q->tbytes = q->upload_count = 0;
+    q->ibytes = q->ubytes = q->last_vs_size = 0;
     q->surface = NULL;
     q->upload_surface = 0;
     q->epoch++;
@@ -368,7 +438,7 @@ static int sg_draw_flat2d(void) {
     s = sg_surface_current();
     if (!s)
         return sg_fallback(SG_FB_TARGET, 0);
-    pipe = sg_pipeline_current(0);
+    pipe = sg_pipeline_current(0, 0);
     if (!pipe)
         return sg_fallback(SG_FB_BLEND, 0);
     if (s_gpu.tex.valid && !sg_texture_stage0(&tex))
