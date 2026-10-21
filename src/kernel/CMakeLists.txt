@@ -26,6 +26,7 @@ set(KERNEL_SOURCES
     recomp_trace.c
     nv2a_pb_scan.c
     nv2a_pb_exec.c
+
 )
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
@@ -74,6 +75,16 @@ else()
         target_compile_definitions(xbox_kernel PRIVATE SG_HAVE_SHADERS=1)
     else()
         message(STATUS "glslangValidator not found: the SDL3 GPU renderer is unavailable (install glslang)")
+    endif()
+        # Runtime shader compilation for vertex programs translated on the fly
+    # (sdlgpu/sdlgpu_compile.inc.c): glslang's C interface as a library.
+    find_package(glslang CONFIG QUIET)
+    if(glslang_FOUND)
+        target_link_libraries(xbox_kernel PRIVATE
+                glslang::glslang glslang::glslang-default-resource-limits)
+        target_compile_definitions(xbox_kernel PRIVATE SG_HAVE_GLSLANG=1)
+    else()
+        message(STATUS "glslang library not found: vertex programs stay on the CPU")
     endif()
 endif()
 

@@ -15,10 +15,13 @@
 
 layout(location = 0) in vec4 v_col;
 layout(location = 1) in vec4 v_spec;
-layout(location = 2) in vec2 v_uv0;
-layout(location = 3) in vec2 v_uv1;
-layout(location = 4) in vec2 v_uv2;
-layout(location = 5) in vec2 v_uv3;
+layout(location = 2) in vec4 v_t0;
+layout(location = 3) in vec4 v_t1;
+layout(location = 4) in vec4 v_t2;
+layout(location = 5) in vec4 v_t3;
+layout(location = 6) in float v_fog;
+layout(location = 7) in float v_w;
+
 layout(location = 0) out vec4 out_color;
 
 // Texture stages 0..3, decoded to RGBA8 on the CPU through sample_texture /
@@ -42,6 +45,10 @@ layout(set = 3, binding = 0, std140) uniform Shade {
     uvec4 color_ocw[2];   //            RGB output words
     uvec4 alpha_icw[2];   //            alpha input words
     uvec4 alpha_ocw[2];   //            alpha output words
+    uvec4 fog;            // x: fog color, low byte red
+    uvec4 mode;           // per stage: texture-shader mode (stage program, 5 bits each)
+    uvec4 rect;           // per stage: 1 = coordinates in texels (linear texture), 0 = normalised
+    uvec4 depth;
 } sh;
 
 // Same nudge as flat2d.frag: exact texel boundaries land on the same texel
@@ -73,12 +80,61 @@ float shift_negative(float c, float size)
     return c < 0.0 ? c + size * (floor(-c / size) + 1.0) : c;
 }
 
-vec4 fetch(sampler2D t, vec2 uv, uvec4 st)
+// ---- texture stages, as the D3D11 shader samples them (nv2a_gpu_d3d11.hlsl
+// shade(): tex2dc, texdir, the stage-mode branches) ------------------------
+
+vec4 texel(int s, ivec2 at)
 {
-    float u = shift_negative(uv.x + TEXEL_BIAS, float(st.x));
-    float v = shift_negative(uv.y + TEXEL_BIAS, float(st.y));
-    ivec2 at = ivec2(wrap_coord(uint(u), st.x, st.z), wrap_coord(uint(v), st.y, st.w));
-    return texelFetch(t, at, 0);
+    if (s == 0) return texelFetch(tex0, at, 0);
+    if (s == 1) return texelFetch(tex1, at, 0);
+    if (s == 2) return texelFetch(tex2, at, 0);
+    return texelFetch(tex3, at, 0);
+}
+
+// Normalised coordinates -> the point-sampled texel, wrapped or clamped as
+// the software path does (raster_triangle_xf + wrap_coord).
+vec4 tex2d(int s, vec2 nuv)
+{
+    if (s == 0) return texture(tex0, nuv);
+    if (s == 1) return texture(tex1, nuv);
+    if (s == 2) return texture(tex2, nuv);
+    return texture(tex3, nuv);
+}
+
+// Coordinates in the stage's convention: texels for a linear ("rect")
+// texture, normalised otherwise (D3D11 tex2dc).
+vec4 tex2dc(int s, vec2 uv)
+{
+    if (sh.rect[s] != 0u)
+    uv /= vec2(sh.tex[s].xy);
+    return tex2d(s, uv);
+}
+
+// A direction looked up on a 2D texture: remapped onto the face it points
+// at (xemu remapCubeTo2D, D3D11 texdir). Real cube textures are sampled the
+// same way on their first face until cube sampling lands.
+vec4 texdir(int s, vec3 d)
+{
+    vec3 a = max(abs(d), vec3(1e-8));
+    vec2 uv;
+    if (a.x > a.y && a.x > a.z)      uv = (d.x > 0.0 ? vec2(-d.z, d.y) : vec2(d.z, d.y)) / a.x;
+    else if (a.y > a.x && a.y > a.z) uv = (d.y > 0.0 ? vec2(d.x, -d.z) : vec2(d.x, d.z)) / a.y;
+    else                             uv = (d.z > 0.0 ? vec2(d.x, d.y) : vec2(-d.x, d.y)) / a.z;
+    return tex2d(s, uv * 0.5 + 0.5);
+}
+
+// One stage's value for the combiners. on: a texture is bound to the stage.
+vec4 stage_sample(int s, vec4 pt, uint m, bool on)
+{
+    if (m == 0u) return vec4(0.0, 0.0, 0.0, 1.0);                // NONE
+    if (m == 4u) return pt;                                       // PASSTHRU
+    if (!on)     return vec4(1.0);                                // no texture
+    if (m == 1u || m == 2u || m == 6u || m == 7u) {               // PROJECT2D/3D, BUMPENV (plain)
+                                                                  float w = ((m == 1u || m == 2u) && pt.w != 0.0) ? pt.w : 1.0;
+                                                                  return tex2dc(s, pt.xy / w);
+    }
+    if (m == 3u) return texdir(s, pt.xyz);                        // CUBEMAP
+    return vec4(0.0, 0.0, 0.0, 1.0);   // dot-product modes: part 2
 }
 
 // ---- register combiners -----------------------------------------------
@@ -178,6 +234,9 @@ vec4 comb_eval(vec4 t0, vec4 v0, vec4 v1, vec4 tn[3])
         src_r[i] = vec4(0.0);
     src_r[4] = v0;
     src_r[5] = v1;
+    src_r[3] = vec4(float(sh.fog.x & 0xFFu), float((sh.fog.x >> 8) & 0xFFu),
+    float((sh.fog.x >> 16) & 0xFFu), 0.0) / 255.0;
+    src_r[3].a = clamp(v_fog, 0.0, 1.0);
     src_r[8] = t0;
     for (int s = 1; s < 4; s++)
         if (((stage_prog >> uint(s * 5)) & 0x1Fu) != 0u)
@@ -244,15 +303,15 @@ bool alpha_pass(uint a)
 void main()
 {
     bool sampled0 = (sh.misc.z & 1u) != 0u;
-    vec4 t0 = sampled0 ? fetch(tex0, v_uv0, sh.tex[0]) : vec4(1.0);
+    vec4 t0 = stage_sample(0, v_t0, sh.mode.x, sampled0);
     uvec4 c8;
 
     if (sh.prog.x != 0u) {
         // Combiners active. Stages 1..3 read 1.0 unless they are sampled.
         vec4 tn[3];
-        tn[0] = (sh.misc.z & 2u) != 0u ? fetch(tex1, v_uv1, sh.tex[1]) : vec4(1.0);
-        tn[1] = (sh.misc.z & 4u) != 0u ? fetch(tex2, v_uv2, sh.tex[2]) : vec4(1.0);
-        tn[2] = (sh.misc.z & 8u) != 0u ? fetch(tex3, v_uv3, sh.tex[3]) : vec4(1.0);
+        tn[0] = stage_sample(1, v_t1, sh.mode.y, (sh.misc.z & 2u) != 0u);
+        tn[1] = stage_sample(2, v_t2, sh.mode.z, (sh.misc.z & 4u) != 0u);
+        tn[2] = stage_sample(3, v_t3, sh.mode.w, (sh.misc.z & 8u) != 0u);
         c8 = to8(comb_eval(t0, v_col, v_spec, tn));
     } else if (sampled0) {
         // modulate(texel, argb): (t * c + 127) / 255 per channel, in integers.
@@ -264,4 +323,10 @@ void main()
     if (sh.alpha.x != 0u && !alpha_pass(c8.a))
         discard;
     out_color = vec4(c8) / 255.0;
+    float zmax = uintBitsToFloat(sh.depth.y);
+    float zd = (sh.depth.x & 1u) != 0u ? v_w : gl_FragCoord.z * zmax;
+    float cmin = uintBitsToFloat(sh.depth.z), cmax = uintBitsToFloat(sh.depth.w);
+    if ((sh.depth.x & 2u) != 0u && (zd < cmin || zd > cmax))
+    discard;
+    gl_FragDepth = clamp(clamp(zd, cmin, cmax) / zmax, 0.0, 1.0);
 }

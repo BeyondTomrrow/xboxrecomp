@@ -17,17 +17,21 @@
 layout(location = 0) in vec4 in_pos;     // screen x, y (pixels), z (title depth units), w
 layout(location = 1) in vec4 in_col;     // oD0, 0..1 RGBA (diffuse)
 layout(location = 2) in vec4 in_spec;    // oD1, 0..1 RGBA (specular; where 3D lighting lands)
-layout(location = 3) in vec2 in_uv0;     // oT0, in texels of stage 0
-layout(location = 4) in vec2 in_uv1;     // oT1..oT3, in texels of stages 1..3
-layout(location = 5) in vec2 in_uv2;
-layout(location = 6) in vec2 in_uv3;
+layout(location = 3) in vec4 in_t0;     // oT0..oT3 as the program wrote them
+layout(location = 4) in vec4 in_t1;
+layout(location = 5) in vec4 in_t2;
+layout(location = 6) in vec4 in_t3;
+layout(location = 7) in float in_fog;    // oFog, 1 = no fog
 
 layout(location = 0) out vec4 v_col;
 layout(location = 1) out vec4 v_spec;
-layout(location = 2) out vec2 v_uv0;
-layout(location = 3) out vec2 v_uv1;
-layout(location = 4) out vec2 v_uv2;
-layout(location = 5) out vec2 v_uv3;
+layout(location = 2) out vec4 v_t0;     // perspective-correct, all four components
+layout(location = 3) out vec4 v_t1;
+layout(location = 4) out vec4 v_t2;
+layout(location = 5) out vec4 v_t3;
+
+layout(location = 6) out float v_fog;
+layout(location = 7) out float v_w;     // eye distance, for w-buffered depth
 
 layout(set = 1, binding = 0, std140) uniform Viewport {
     vec2  surface_size;   // render target size in pixels
@@ -43,8 +47,10 @@ void main()
     gl_Position = vec4(ndc.x * w, -ndc.y * w, in_pos.z * vp.depth_scale * w, w);
     v_col  = in_col;
     v_spec = in_spec;
-    v_uv0  = in_uv0;
-    v_uv1  = in_uv1;
-    v_uv2  = in_uv2;
-    v_uv3  = in_uv3;
+    v_t0 = in_t0;
+    v_t1 = in_t1;
+    v_t2 = in_t2;
+    v_t3 = in_t3;
+    v_fog = in_fog;
+    v_w = in_pos.w;
 }

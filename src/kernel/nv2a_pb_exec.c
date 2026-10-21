@@ -2201,9 +2201,11 @@ static void comb_stage(float src[16][4], float dst[16][4], uint32_t icw, uint32_
 }
 
 /* Final colour for one fragment. t0: sampled stage-0 texel (RGBA 0..1),
- * v0: interpolated diffuse. Returns ARGB8888. */
+ *
+ * TODO: ADD MORE DOCUMENTATION HERE
+ */
 static uint32_t comb_eval(const float t0[4], const float v0[4], const float v1[4],
-                          const float tn[3][4]) {
+                          const float tn[3][4], const float fogr[4]) {
     float regs[16][4], next[16][4], out[4];
     int stages = (int) (s_comb.control & 0xFF), s, i;
 
@@ -2214,6 +2216,7 @@ static uint32_t comb_eval(const float t0[4], const float v0[4], const float v1[4
         regs[5][i] = v1[i];
         regs[8][i] = t0[i];
     }
+    memcpy(regs[3], fogr, sizeof regs[3]);
     for (s = 1; s < 4; s++)
         if ((s_comb.stage_prog >> (s * 5)) & 0x1F)
             for (i = 0; i < 4; i++)
@@ -3112,7 +3115,7 @@ static void raster_triangle_xf(const XfVert *a, const XfVert *b, const XfVert *c
             float w2 = (a->x - c->x) * (py - c->y) - (a->y - c->y) * (px - c->x);
             float la, lb, lc, pa, pb, pc, iw, z;
             uint32_t argb, k;
-            float col[4], spec[4];
+            float col[4], spec[4], fog;
             if (!((w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
                 continue;
             /* Barycentrics: w1 is opposite a, w2 opposite b, w0 opposite c. */
@@ -3154,6 +3157,7 @@ static void raster_triangle_xf(const XfVert *a, const XfVert *b, const XfVert *c
             pa /= iw;
             pb /= iw;
             pc /= iw;
+            fog = pa * a->fog + pb * b->fog + pc * c->fog;
             for (k = 0; k < 4; k++) {
                 col[k] = pa * a->col[k] + pb * b->col[k] + pc * c->col[k];
                 spec[k] = pa * a->spec[k] + pb * b->spec[k] + pc * c->spec[k];
@@ -3194,7 +3198,17 @@ static void raster_triangle_xf(const XfVert *a, const XfVert *b, const XfVert *c
                                 comb_unpack(tex2, o);
                         }
                     }
-                    argb = comb_eval(t0, col, spec, (const float (*)[4]) tn);
+                    {
+                        /* Register 3, as the D3D11 path builds it: fog colour
+                         * (low byte red) and the clamped fog factor. */
+                        float fogr[4] = {
+                            (float)(s_fog.color & 0xFF) / 255.0f,
+                            (float)((s_fog.color >> 8) & 0xFF) / 255.0f,
+                            (float)((s_fog.color >> 16) & 0xFF) / 255.0f,
+                            fog < 0.0f ? 0.0f : fog > 1.0f ? 1.0f : fog,
+                        };
+                        argb = comb_eval(t0, col, spec, (const float (*)[4])tn, fogr);
+                    }
                 } else if (sampled)
                     argb = modulate(texel, argb);
                 if (comb_trace) {
@@ -3257,6 +3271,10 @@ static void raster_tri_clip(const XfVert *a, const XfVert *b, const XfVert *c,
     int front = (a->w > eps && a->z >= 0.0f) + (b->w > eps && b->z >= 0.0f)
               + (c->w > eps && c->z >= 0.0f);
     int straddles = front > 0 && front < 3;
+    if (a->w < -1.0f && b->w < -1.0f && c->w < -1.0f) {
+        s_vp.rej_clip++;
+        return;
+    }
 
     if (a->ok && b->ok && c->ok && !straddles) {
         emit(ctx, a, b, c);
