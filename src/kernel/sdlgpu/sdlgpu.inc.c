@@ -271,6 +271,7 @@ static int sg_ready(void) {
 #include "sdlgpu_vpcache.inc.c"
 #include "sdlgpu_pipeline.inc.c"
 #include "sdlgpu_draw.inc.c"
+#include "sdlgpu_present.inc.c"
 #include "sdlgpu_xf.inc.c"
 
 
@@ -304,7 +305,11 @@ static void sg_flip(void) {
      * there before nv2a_pb_exec takes that snapshot. */
     if (s_sg.dev) {
         sg_queue_flush();
-        sg_download_all();
+        sg_present_register();
+        if (sg_present_active())
+            sg_present_flip();
+        else
+            sg_download_all();
         sg_stats_tick();
         s_sg_frame++;
         sg_probe_flip();

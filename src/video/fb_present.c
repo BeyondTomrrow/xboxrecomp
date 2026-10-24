@@ -23,10 +23,15 @@ enum {
     FB_MODE_BORDERLESS = 1,
     FB_MODE_FULLSCREEN = 2
 };
+Uint64 gpu_expected_until;
+
+
+typedef int (*FbPresenter)(void *window, int letterbox);
 
 static struct {
     /* Lifecycle */
     SDL_AtomicInt running;
+
     SDL_Thread *thread;
     SDL_Window *window;
 
@@ -54,6 +59,8 @@ static struct {
     /* Presenter handoff & hooks */
     SDL_AtomicInt gpu_present;
 
+    void * volatile  presenter;
+
     void (* volatile key_hook)(unsigned vk);
 
     int mode;
@@ -64,6 +71,8 @@ static struct {
     .width = 640,
     .height = 480,
 };
+
+
 
 static void fb_texture_opaque(SDL_Texture *t)
 {
@@ -276,6 +285,12 @@ static int SDLCALL fb_thread_sdl(void *data) {
         return -1;
     }
 
+    {
+        const char *on = getenv("RECOMP_SDLGPU"), *pres = getenv("RECOMP_SDLGPU_PRESENT");
+        int expect = on && *on && strcmp(on, "0") != 0 && !(pres && strcmp(pres, "0") == 0);
+        gpu_expected_until = expect ? SDL_GetTicks() + 10000 : 0;
+    }
+
     g_fb.rgb_lock = SDL_CreateRWLock();
     SDL_LockRWLockForWriting(g_fb.rgb_lock);
     g_fb.rgb = (uint32_t *) calloc((size_t) g_fb.width * g_fb.height, 4);
@@ -309,24 +324,48 @@ static int SDLCALL fb_thread_sdl(void *data) {
 
         fb_apply_pending_size_sdl(win);
 
-        if (!SDL_GetAtomicInt(&g_fb.gpu_present)) {
-            if (!g_fb.fallback_renderer) {
-                g_fb.fallback_renderer = SDL_CreateRenderer(win, NULL);
-                g_fb.fallback_texture = SDL_CreateTexture(
-                    g_fb.fallback_renderer,
-                    SDL_PIXELFORMAT_BGRX32, /* the frame's alpha is never displayed */
-                    SDL_TEXTUREACCESS_STREAMING,
-                    (int) g_fb.width, (int) g_fb.height
-                );
-                fb_texture_opaque(g_fb.fallback_texture);
+        {
+            FbPresenter presenter = (FbPresenter)SDL_GetAtomicPointer((void **)&g_fb.presenter);
+            if (presenter) {
+                /* The GPU renderer shows its own frames. A window gets exactly
+                 * one owner: the SDL_Renderer goes first  */
+                if (g_fb.fallback_renderer) {
+                    if (g_fb.fallback_texture)
+                        SDL_DestroyTexture(g_fb.fallback_texture);
+                    SDL_DestroyRenderer(g_fb.fallback_renderer);
+                    g_fb.fallback_texture = NULL;
+                    g_fb.fallback_renderer = NULL;
+                }
+                if (!presenter(win, g_fb.ultrawide)) {
+                    SDL_SetAtomicPointer((void **)&g_fb.presenter, NULL);
+                    SDL_SetAtomicInt(&g_fb.gpu_present, 0);   /* back to the SDL_Renderer */
+                }
+            } else if (!SDL_GetAtomicInt(&g_fb.gpu_present) && SDL_GetTicks() >= gpu_expected_until) {
+                if (!g_fb.fallback_renderer) {
+                    g_fb.fallback_renderer = SDL_CreateRenderer(win, NULL);
+                    g_fb.fallback_texture = SDL_CreateTexture(
+                        g_fb.fallback_renderer,
+                        SDL_PIXELFORMAT_BGRX32, /* the frame's alpha is never displayed */
+                        SDL_TEXTUREACCESS_STREAMING,
+                        (int) g_fb.width, (int) g_fb.height
+                    );
+                    fb_texture_opaque(g_fb.fallback_texture);
+                }
+                if (!presenter(win, g_fb.ultrawide)) {
+                    SDL_SetAtomicPointer((void **)&g_fb.presenter, NULL);
+                    SDL_SetAtomicInt(&g_fb.gpu_present, 0);   /* back to the SDL_Renderer */
+                    gpu_expected_until = 0;
+                }
+
+                fb_draw_sdl_fallback();
             }
-            fb_draw_sdl_fallback();
         }
 
         if (dump_path && ++dump_frames == 60)
             xbox_FramebufferDumpBmp(dump_path);
 
-        SDL_Delay(SDL_GetAtomicInt(&g_fb.gpu_present) ? 8 : 16);
+        SDL_Delay(SDL_GetAtomicPointer((void **)&g_fb.presenter) ? 1
+                : SDL_GetAtomicInt(&g_fb.gpu_present) ? 8 : 16);
     }
 
     g_fb.window = NULL;
@@ -428,6 +467,11 @@ void xbox_FramebufferApplyMode(int mode, int w, int h) {
 void *xbox_FramebufferWindowHwnd(void) { return (void *) g_fb.window; }
 uint32_t xbox_FramebufferWindowVa(void) { return (uint32_t) SDL_GetAtomicU32(&g_fb.va); }
 void xbox_FramebufferSetGpuPresent(int on) { SDL_SetAtomicInt(&g_fb.gpu_present, on ? 1 : 0); }
+void xbox_FramebufferSetGpuPresenter(int (*fn)(void *window, int letterbox))
+{
+    SDL_SetAtomicPointer((void **)&g_fb.presenter, (void *)fn);
+    SDL_SetAtomicInt(&g_fb.gpu_present, fn != NULL);   /* no snapshots needed */
+}
 void xbox_FramebufferSetKeyHook(void (*hook)(unsigned vk)) { g_fb.key_hook = hook; }
 
 int xbox_FramebufferDumpBmp(const char *path) {
