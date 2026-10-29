@@ -1278,7 +1278,17 @@ void xbox_Nv2aKick(void)
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
+    /* Rest between polls when nothing needed acknowledging (2026-10-29).
+     * Polling with Sleep(0) alone kept a whole CPU core busy for the whole
+     * run; now the loop spins only while the title is touching these
+     * registers and otherwise sleeps ~0.5 ms on a high-resolution timer.
+     * RECOMP_ACK_SPIN=1 restores the old constant spin. */
+    HANDLE rest = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+    const char *spin_env = getenv("RECOMP_ACK_SPIN");
+    int always_spin = spin_env && *spin_env == '1';
+    unsigned quiet = 0;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        int busy = 0;
         {
             volatile uint32_t *pcrtc =
                 (volatile uint32_t *)((char *)regs + NV2A_PCRTC_INTR_0_OFS);
@@ -1287,6 +1297,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             if (*pcrtc) {          /* the handler wrote its ack */
                 *pcrtc = 0;
                 *pmc &= ~NV2A_PMC_INTR_PCRTC;
+                busy = 1;
             }
         }
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
@@ -1294,17 +1305,23 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
             if (*r & NV2A_ACK[i].busy_mask) {
                 *r &= ~NV2A_ACK[i].busy_mask;
+                busy = 1;
             }
         }
         for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_IDLE[i].offset);
             if (pb_async_behind()) {
-                /* RECOMP_GPU_ASYNC: a submission is still being drawn. */
-                if (*r & NV2A_IDLE[i].idle_mask)
+                /* RECOMP_GPU_ASYNC: a submission is still being drawn. Only
+                 * the change of state counts as activity: the render thread
+                 * being behind is a steady state, not a register write. */
+                if (*r & NV2A_IDLE[i].idle_mask) {
                     *r &= ~NV2A_IDLE[i].idle_mask;
+                    busy = 1;
+                }
             } else if ((*r & NV2A_IDLE[i].idle_mask) != NV2A_IDLE[i].idle_mask) {
                 *r |= NV2A_IDLE[i].idle_mask;
+                busy = 1;
             }
         }
         {
@@ -1366,8 +1383,17 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
         *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
                                + g_memory_offset) = GetTickCount();
 
-        Sleep(0);  /* yield; the waiter is spinning on another core */
+        quiet = busy ? 0 : quiet + 1;
+        if (always_spin || !rest || quiet < 64) {
+            Sleep(0);  /* yield; the waiter is spinning on another core */
+        } else {
+            LARGE_INTEGER due;
+            due.QuadPart = -5000;                  /* 0.5 ms, relative, 100 ns units */
+            SetWaitableTimer(rest, &due, 0, NULL, NULL, FALSE);
+            WaitForSingleObject(rest, 2);
+        }
     }
+    if (rest) CloseHandle(rest);
     return 0;
 }
 

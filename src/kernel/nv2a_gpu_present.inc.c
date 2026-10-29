@@ -1569,7 +1569,11 @@ static int pr_present(uint32_t guest)
                     ID3D11Device_CreateTexture2D(s_gpu11.dev, &od, NULL, &fsr_gen);
                     fsr_w = ow; fsr_h = oh;
                 }
-                if (fsr_out && ow >= td.Width / 2u &&
+                /* Only once the surface has the render scale FSR asked for:
+                 * the first frames after a change still have the old size,
+                 * and a context made for them (6480x4320 at the 9x setting)
+                 * cost a 13 s stall and gigabytes of video memory. */
+                if (fsr_out && ow >= td.Width / 2u && s->scale == g_render_scale &&
                     gxs_fsr_upscale(s->tex, s->dz, s->mv, s->rx, fsr_out, s_vs.framegen ? fsr_gen : NULL, td.Width,
                                     td.Height, ow, oh, jx, jy, dt, fsr_rw != td.Width, 0.25f)) {
                     shown = fsr_out;
