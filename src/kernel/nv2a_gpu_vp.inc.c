@@ -71,7 +71,8 @@ static int gpu_vp_enabled(void)
     static int on = -1;
     if (on < 0) {
         const char *v = env_cached("RECOMP_GPU_VP");
-        on = v && *v && *v != '0';
+        /* SDL_GPU: only the raw-input form (vertices and indices are pulled) */
+        on = v && *v && *v != '0' && (!g_gx_sg || gpu_vp_raw_on());
     }
     return on;
 }
@@ -189,6 +190,46 @@ static const char *k_vp_epilogue =
     "  return o;\n"
     "}\n";
 
+/* SDL_GPU (gx/gx_sdl.c): the same program for Vulkan / Direct3D 12. Vertex
+ * uniforms in space 1 (slot 0 is the draw's pull data, 1 and 2 the buffers
+ * bound at b1 and b2 on Direct3D 11), the raw vertex bytes and the index list
+ * as storage buffers in space 0. With no geometry shader, vs_main below runs
+ * the program for its own vertex and for the other two corners of its
+ * triangle, and rebuilds the triangle as gs_main does. */
+static const char *k_vp_sg_head =
+    "[[vk::binding(0, 1)]] cbuffer VPULL : register(b0, space1) { uint4 vpull; };\n"
+    "[[vk::binding(1, 1)]] cbuffer VC : register(b1, space1) { float4 c[192]; float4 info; float4 clipr; float4 fogp; float4 lightp; };\n"
+    "[[vk::binding(2, 1)]] cbuffer VA : register(b2, space1) { int4 va[16]; float4 vk[16]; };\n"
+    "[[vk::binding(0, 0)]] ByteAddressBuffer RB : register(t0, space0);\n"
+    "[[vk::binding(1, 0)]] StructuredBuffer<uint> IX : register(t1, space0);\n";
+
+static const char *k_vp_sg_main =
+    "PIn vs_main(uint id : SV_VertexID) {\n"
+    "  PIn o = vp_one(IX[vpull.x + id]);\n"
+    "  if (vpull.y != 0u) {\n"
+    "    uint cn = id % 3u, t = vpull.x + id - cn;\n"
+    "    float4 pa = vp_one(IX[t + (cn + 1u) % 3u]).rawscreen, pb = vp_one(IX[t + (cn + 2u) % 3u]).rawscreen;\n"
+    "    float4 p0 = cn == 0u ? o.rawscreen : cn == 1u ? pb : pa;\n"
+    "    float4 p1 = cn == 1u ? o.rawscreen : cn == 2u ? pb : pa;\n"
+    "    float4 p2 = cn == 2u ? o.rawscreen : cn == 0u ? pb : pa;\n"
+    "    precise float2 e1 = p1.xy - p0.xy, e2 = p2.xy - p0.xy;\n"
+    "    precise float b1 = p1.z - p0.z, b2 = p2.z - p0.z;\n"
+    "    if (asfloat(vpull.z) != 0.0) { b1 = (p0.w - p1.w) / (p1.w * p0.w); b2 = (p0.w - p2.w) / (p2.w * p0.w); }\n"
+    "    precise float det = e1.x * e2.y - e1.y * e2.x;\n"
+    "    precise float dx = (b1 * e2.y - b2 * e1.y) / det;\n"
+    "    precise float dy = (b2 * e1.x - b1 * e2.x) / det;\n"
+    "    float slope = max(abs(dx), abs(dy));\n"
+    "    if (isnan(slope) || isinf(slope)) slope = 0;\n"
+    "    float clipped = 0;\n"
+    "    if (p0.w <= 0.0 || abs(p0.x) >= 1e6 || abs(p0.y) >= 1e6) clipped = 1;\n"
+    "    if (p1.w <= 0.0 || abs(p1.x) >= 1e6 || abs(p1.y) >= 1e6) clipped = 1;\n"
+    "    if (p2.w <= 0.0 || abs(p2.x) >= 1e6 || abs(p2.y) >= 1e6) clipped = 1;\n"
+    "    o.tri0 = p0; o.tri1 = p1; o.tri2 = p2;\n"
+    "    o.depthmeta = clipped != 0 ? float2(0, 0) : float2(slope, 1);\n"
+    "  }\n"
+    "  return o;\n"
+    "}\n";
+
 typedef struct { char *p; size_t n, cap; } VpBuf;
 
 static void vpb(VpBuf *b, const char *fmt, ...)
@@ -253,11 +294,15 @@ static char *gpu_vp_translate(uint32_t start, uint32_t *len_out)
         const char *h0 = strstr(k_vp_prelude, "float vrcp");
         const char *h1 = strstr(k_vp_prelude, "PIn vs_main(VSIn i)");
         uint32_t mask = gpu_vp_input_mask(start), k;
+        if (g_gx_sg) {
+            vpb(&b, "%s", k_vp_sg_head);
+            vpb(&b, "%s", strstr(k_vp_prelude_raw, "struct PIn"));
+        } else
         vpb(&b, "%s", k_vp_prelude_raw);
         if (h0 && h1 && h1 > h0)
             vpb(&b, "%.*s", (int)(h1 - h0), h0);
-        vpb(&b, "PIn vs_main(uint vid : SV_VertexID) {\n"
-                "  float4 v[16]; float4 R[13]; float4 O[16]; int a0 = 0; int k;\n"
+        vpb(&b, "%s", g_gx_sg ? "PIn vp_one(uint vid) {\n" : "PIn vs_main(uint vid : SV_VertexID) {\n");
+        vpb(&b, "  float4 v[16]; float4 R[13]; float4 O[16]; int a0 = 0; int k;\n"
                 "  [unroll] for (k = 0; k < 16; k++) v[k] = float4(0, 0, 0, 1);\n"
                 "  [unroll] for (k = 0; k < 13; k++) R[k] = float4(0, 0, 0, 0);\n"
                 "  [unroll] for (k = 0; k < 16; k++) O[k] = float4(0, 0, 0, 1);\n");
@@ -347,6 +392,8 @@ static char *gpu_vp_translate(uint32_t start, uint32_t *len_out)
             break;
     }
     vpb(&b, "%s", k_vp_epilogue);
+    if (g_gx_sg)
+        vpb(&b, "%s", k_vp_sg_main);
     if (len_out)
         *len_out = (slot < VP_PROG_LEN ? slot + 1 : VP_PROG_LEN) - start;
     return b.p;
@@ -427,7 +474,7 @@ static void gpu_vp_compile_job(GpuVpJob *j)
 
     {   /* in the per-user cache folder (kernel_path.c xbox_user_path) */
         char rel[64];
-        snprintf(rel, sizeof rel, "cache\\vp\\%016llX.cso", (unsigned long long)sh);
+        snprintf(rel, sizeof rel, "cache\\vp%s\\%016llX.cso", gx_cache_suffix(), (unsigned long long)sh);
         xbox_user_path(rel, path, sizeof path);
     }
     f = fopen(path, "rb");
@@ -454,8 +501,14 @@ static void gpu_vp_compile_job(GpuVpJob *j)
         }
         code = ID3D10Blob_GetBufferPointer(blob);
         size = ID3D10Blob_GetBufferSize(blob);
-        CreateDirectoryA("cache", NULL);
-        CreateDirectoryA("cache\\vp", NULL);
+        {
+            char dir[MAX_PATH], rel[32];
+            xbox_user_path("cache", dir, sizeof dir);
+            CreateDirectoryA(dir, NULL);
+            snprintf(rel, sizeof rel, "cache\\vp%s", gx_cache_suffix());
+            xbox_user_path(rel, dir, sizeof dir);
+            CreateDirectoryA(dir, NULL);
+        }
         f = fopen(path, "wb");
         if (f) { fwrite(code, 1, size, f); fclose(f); }
         {
@@ -703,6 +756,8 @@ static int gpu_vp_ring_write(ID3D11Buffer *buf, UINT cap, UINT *pos, const void 
         return 0;
     memcpy((uint8_t *)m.pData + *pos, src, size);
     ID3D11DeviceContext_Unmap(s_gpu11.ctx, (ID3D11Resource *)buf, 0);
+    if (g_gx_sg)
+        gxs_buffer_written(buf, *pos, *pos + size);
     *at = *pos;
     *pos += (size + 255u) & ~255u;
     return 1;
@@ -850,6 +905,8 @@ static int gpu_vp_raw_upload(void)
             return 0;
         }
         ID3D11DeviceContext_Unmap(s_gpu11.ctx, (ID3D11Resource *)s_vp_raw, 0);
+        if (g_gx_sg)
+            gxs_buffer_written(s_vp_raw, s_vp_raw_pos, s_vp_raw_pos + total);
     }
     for (k = 0; k < NV_VERTEX_ATTRS; k++) {
         if (span_of[k] < 0)

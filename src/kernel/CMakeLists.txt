@@ -29,6 +29,12 @@ set(KERNEL_SOURCES
 
 )
 
+if(WIN32)
+    # The D3D11 renderer on Vulkan / Direct3D 12 through SDL_GPU (gx/gx_sdl.c);
+    # shaders compiled at run time by dxcompiler.dll (shipped next to the exe).
+    list(APPEND KERNEL_SOURCES gx/gx_sdl.c gx/gx_dxc.cpp)
+endif()
+
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
 target_link_libraries(xbox_kernel PUBLIC SDL3::SDL3)
 

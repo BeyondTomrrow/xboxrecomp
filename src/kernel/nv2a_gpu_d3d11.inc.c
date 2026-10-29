@@ -26,12 +26,10 @@
  * ponytail: depth/stencil clears with a partial rectangle clear the whole
  * buffer; fog is not applied; no mipmaps (level 0 only).
  */
-#define COBJMACROS
 #if defined(_WIN32)
-#include <d3d11.h>
-#include <d3d11_1.h>     /* ID3D11Device1: shared HUD textures */
-#include <d3dcompiler.h>
-#include <d3d11sdklayers.h>
+/* The D3D11 method calls below run on Direct3D 11 itself, or on Vulkan or
+ * Direct3D 12 through SDL_GPU (gx/gx_sdl.c), chosen at start-up. */
+#include "gx/gx_d3d11.h"
 #include <intrin.h>        /* __rdtsc: draw-path profile */
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3dcompiler.lib")
@@ -167,6 +165,7 @@ static struct {
     ID3D11Device *dev;
     ID3D11DeviceContext *ctx;
     ID3D11VertexShader *vs;
+    ID3D11VertexShader *vs_pull;         /* SDL_GPU: vs_pull, the geometry shader's work */
     ID3D11PixelShader *ps;
     ID3D11GeometryShader *gs;
     ID3D11InputLayout *layout;
@@ -227,6 +226,8 @@ static int gpu_renderer_mode(void)
             mode = RENDERER_SDL_GPU;
         else if (r && (! _stricmp(r, "d3d11") || ! _stricmp(r, "dx11")))
             mode = RENDERER_D3D11;
+        else if (r && (! _stricmp(r, "vulkan") || ! _stricmp(r, "vk") || ! _stricmp(r, "d3d12") || ! _stricmp(r, "dx12")))
+            mode = RENDERER_SDL_GPU;     /* gx/gx_sdl.c picks the API */
         else if (g && strcmp(g, "0") == 0)
             mode = RENDERER_CPU;
         else
@@ -306,6 +307,20 @@ static int gpu_init(void)
     }
     ID3D11Device_CreateVertexShader(s_gpu11.dev, ID3D10Blob_GetBufferPointer(vsb), ID3D10Blob_GetBufferSize(vsb), NULL, &s_gpu11.vs);
     ID3D11Device_CreatePixelShader(s_gpu11.dev, ID3D10Blob_GetBufferPointer(psb), ID3D10Blob_GetBufferSize(psb), NULL, &s_gpu11.ps);
+    if (g_gx_sg) {
+        /* No geometry shaders on SDL_GPU: every batch pulls its vertices in
+         * vs_pull, which also rebuilds the original triangle (gs_main). */
+        ID3DBlob *pb = NULL;
+        hr = D3DCompile(k_gpu_hlsl, strlen(k_gpu_hlsl), "nv2a", NULL, NULL, "vs_pull", "vs_5_0",
+                        D3DCOMPILE_IEEE_STRICTNESS, 0, &pb, &err);
+        if (FAILED(hr) || FAILED(ID3D11Device_CreateVertexShader(s_gpu11.dev, ID3D10Blob_GetBufferPointer(pb),
+                                                                 ID3D10Blob_GetBufferSize(pb), NULL, &s_gpu11.vs_pull))) {
+            fprintf(stderr, "  [GPU11] vs_pull failed: %s\n", err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "?");
+            return 0;
+        }
+        ID3D10Blob_Release(pb);
+        fprintf(stderr, "  [GPU11] renderer API: %s\n", gx_backend_name());
+    } else
     if (!env_cached("RECOMP_GPU_PLANE_DEPTH") || *env_cached("RECOMP_GPU_PLANE_DEPTH") != '0') {
         hr = D3DCompile(k_gpu_hlsl, strlen(k_gpu_hlsl), "nv2a", NULL, NULL, "gs_main", "gs_4_0",
                         D3DCOMPILE_IEEE_STRICTNESS, 0, &gsb, &err);
@@ -2293,6 +2308,13 @@ static int gpu_draw_batch_unlocked_body(int flat2d)
             { uint64_t a = DP_NOW();
               if (vpvs && !gpu_vp_bind(vp_nverts, nv, rw, rh, vpvs))
                   vpvs = NULL, nv = 0;
+              /* SDL_GPU: the program reads the raw bytes and this batch's
+               * indices itself, and rebuilds its triangles (gpu_vp_translate). */
+              if (vpvs && g_gx_sg)
+                  gxs_set_pull2(s_vp_raw, s_vp_ib, s_vp_start_index,
+                                !lines && !(env_cached("RECOMP_GPU_PLANE_DEPTH") &&
+                                            *env_cached("RECOMP_GPU_PLANE_DEPTH") == '0'),
+                                c.depthp[0], 0);
               if (s_dp_on) s_dp_acc[2] += __rdtsc() - a; }
             if (!vpvs) {
                 if (s_bound.il != s_gpu11.layout) {
@@ -2303,10 +2325,20 @@ static int gpu_draw_batch_unlocked_body(int flat2d)
                     ID3D11DeviceContext_IASetVertexBuffers(s_gpu11.ctx, 0, 1, &s_gpu11.vb, &stride, &off);
                     s_bound.vb = s_gpu11.vb; s_bound.vb_stride = stride;
                 }
-                if (s_bound.vs != s_gpu11.vs) {
-                    ID3D11DeviceContext_VSSetShader(s_gpu11.ctx, s_gpu11.vs, NULL, 0);
-                    s_bound.vs = s_gpu11.vs;
+                {
+                    ID3D11VertexShader *want = g_gx_sg ? s_gpu11.vs_pull : s_gpu11.vs;
+                    if (s_bound.vs != want) {
+                        ID3D11DeviceContext_VSSetShader(s_gpu11.ctx, want, NULL, 0);
+                        s_bound.vs = want;
+                    }
                 }
+                /* SDL_GPU: the vertex shader reads this batch from the ring
+                 * and, for triangles, does the geometry shader's work. */
+                if (g_gx_sg)
+                    gxs_set_pull(s_gpu11.vb, first_vertex,
+                                 !flat2d && !lines && !(env_cached("RECOMP_GPU_PLANE_DEPTH") &&
+                                                        *env_cached("RECOMP_GPU_PLANE_DEPTH") == '0'),
+                                 c.depthp[0]);
             }
             if (s_bound.gs != gs) {
                 ID3D11DeviceContext_GSSetShader(s_gpu11.ctx, gs, NULL, 0);

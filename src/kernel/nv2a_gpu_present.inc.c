@@ -64,6 +64,7 @@ typedef struct {
     int fps_limit;          /* frame-rate cap in Hz: 30, 60, 120; 0 unlimited; -1 original (game's own 30/60) */
     int widescreen;         /* built-in Hor+ widescreen: the picture fills the window */
     int lighting;           /* 0 classic, 1 enhanced, 2 maximum */
+    int renderer;           /* graphics API from the next start: 0 Direct3D 11, 1 Vulkan, 2 Direct3D 12 (gx/gx_sdl.c) */
 } VideoSettings;
 
 /* NFL 2K5 draws several full-screen backdrops only inside the 640-pixel
@@ -102,11 +103,13 @@ static void vs_load(void)
         else if (!strcmp(key, "fps_limit")) s_vs.fps_limit = v;
         else if (!strcmp(key, "widescreen")) s_vs.widescreen = v != 0;
         else if (!strcmp(key, "lighting")) s_vs.lighting = v;
+        else if (!strcmp(key, "renderer")) s_vs.renderer = v;
     }
     fclose(f);
     if (s_vs.scale < 1) s_vs.scale = 1;
     if (s_vs.scale > 16) s_vs.scale = 16;   /* stable maximum for the supported display modes */
     if (s_vs.lighting < 0 || s_vs.lighting > 2) s_vs.lighting = 0;
+    if (s_vs.renderer < 0 || s_vs.renderer > 2) s_vs.renderer = 0;
     if (s_vs.filter < SF_BILINEAR || s_vs.filter > SF_ENHANCED) s_vs.filter = SF_ENHANCED;
     if (s_vs.crop < 0) s_vs.crop = 0;
     if (s_vs.crop > 40) s_vs.crop = 40;
@@ -135,9 +138,11 @@ static void vs_save(void)
                "; widescreen: 1 fills the screen with a wider view (built-in widescreen), 0 the original 4:3 picture\n"
                "widescreen = %d\n"
                "; lighting: 0 classic Xbox, 1 enhanced material response, 2 maximum material response\n"
-               "lighting = %d\n",
+               "lighting = %d\n"
+               "; renderer: graphics API, used from the next start: 0 Direct3D 11, 1 Vulkan, 2 Direct3D 12\n"
+               "renderer = %d\n",
             s_vs.mode, s_vs.res_w, s_vs.res_h, s_vs.aspect, s_vs.scale, s_vs.filter, s_vs.vsync,
-            s_vs.brightness, s_vs.gamma, s_vs.crop, s_vs.show_fps, s_vs.aniso, s_vs.fps_limit, s_vs.widescreen, s_vs.lighting);
+            s_vs.brightness, s_vs.gamma, s_vs.crop, s_vs.show_fps, s_vs.aniso, s_vs.fps_limit, s_vs.widescreen, s_vs.lighting, s_vs.renderer);
     fclose(f);
 }
 
@@ -215,17 +220,29 @@ static volatile LONG s_menu_open;
 volatile LONG g_xbox_input_blocked;      /* nfl2k5_input_hle.c: game input off while the menu is up */
 static int s_menu_sel;
 
+/* GX_SDL (Vulkan/Direct3D 12, gx/gx_sdl.c): SDL_GPU's register spaces, and
+ * the point-sampled read of Src as its own texture-sampler slot (SrcP). */
 static const char k_present_hlsl[] =
+    "#ifdef GX_SDL\n"
+    "[[vk::binding(0, 3)]] cbuffer P : register(b0, space3) { float4 src; float4 prm; float4 sz; };\n"
+    "//@GX_PAIRS ps_main 0:0 0:1\n"
+    "[[vk::combinedImageSampler]][[vk::binding(0, 2)]] Texture2D Src : register(t0, space2);\n"
+    "[[vk::combinedImageSampler]][[vk::binding(0, 2)]] SamplerState Lin : register(s0, space2);\n"
+    "[[vk::combinedImageSampler]][[vk::binding(1, 2)]] Texture2D SrcP : register(t1, space2);\n"
+    "[[vk::combinedImageSampler]][[vk::binding(1, 2)]] SamplerState Pt : register(s1, space2);\n"
+    "#else\n"
     "cbuffer P : register(b0) { float4 src; float4 prm; float4 sz; };\n"
     "Texture2D Src : register(t0);\n"
     "SamplerState Lin : register(s0); SamplerState Pt : register(s1);\n"
+    "#define SrcP Src\n"
+    "#endif\n"
     "struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
     "V vs_main(uint id : SV_VertexID) {\n"
     "  V o; float2 p = float2((id << 1) & 2, id & 2);\n"
     "  o.pos = float4(p * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = p; return o; }\n"
     "float4 ps_main(V i) : SV_Target {\n"
     "  float2 uv = src.xy + i.uv * src.zw; float4 c;\n"
-    "  if (prm.z == 1.0) c = Src.Sample(Pt, uv);\n"
+    "  if (prm.z == 1.0) c = SrcP.Sample(Pt, uv);\n"
     "  else if (prm.z == 2.0) {\n"
     "    float2 tex = uv * sz.xy, fl = floor(tex), s = frac(tex);\n"
     "    float2 sc = max(floor(sz.zw / (sz.xy * src.zw)), 1.0);\n"
@@ -383,6 +400,32 @@ static void pr_release_bb(void)
     if (s_pr.bb_rtv) { ID3D11RenderTargetView_Release(s_pr.bb_rtv); s_pr.bb_rtv = NULL; }
 }
 
+/* One owner per window: fb_present.c draws with an SDL renderer until a GPU
+ * presenter is registered, and destroys it on its own thread before calling
+ * the presenter the first time. A DXGI flip swap chain on a window that
+ * still has the renderer's is refused (E_ACCESSDENIED, seen with an SDL
+ * built with its Direct3D 11 renderer), so the swap chain waits for that. */
+extern void xbox_FramebufferSetGpuPresenter(int (*fn)(void *window, int letterbox));
+static volatile LONG s_pr_owned;
+
+static int pr_hold_window(void *window, int letterbox)
+{
+    (void)window; (void)letterbox;
+    InterlockedExchange(&s_pr_owned, 1);
+    SDL_Delay(4);                          /* the window thread keeps pumping events */
+    return 1;
+}
+
+static int pr_window_owned(void)
+{
+    static int asked;
+    if (!asked) {
+        asked = 1;
+        xbox_FramebufferSetGpuPresenter(pr_hold_window);
+    }
+    return s_pr_owned != 0;
+}
+
 /* The swap chain on the framebuffer window, (re)sized to its client area. */
 static int pr_swapchain(void)
 {
@@ -392,6 +435,41 @@ static int pr_swapchain(void)
     UINT w, h;
     if (!hw)
         return 0;
+    if (g_gx_sg) {
+        /* Vulkan / Direct3D 12: the SDL_GPU swap chain (gx_sdl.c). */
+        int sw = 0, sh = 0;
+        if (!s_pr.sc) {
+            s_pr.sc = gxs_swapchain(xbox_FramebufferWindowHwnd(), &sw, &sh);
+            if (!s_pr.sc)
+                return 0;
+            s_pr.hwnd = hw;
+            s_pr.bb_w = s_pr.bb_h = 0;
+            xbox_FramebufferSetGpuPresent(1);
+            fprintf(stderr, "  [PRESENT] presenting through %s (SDL_GPU)\n", gx_backend_name());
+        } else
+            gxs_swapchain(xbox_FramebufferWindowHwnd(), &sw, &sh);
+        w = (UINT)sw; h = (UINT)sh;
+        if (!w || !h)
+            return 0;
+        if (w != s_pr.bb_w || h != s_pr.bb_h || !s_pr.bb_rtv) {
+            ID3D11Texture2D *bb = NULL;
+            pr_release_bb();
+            ID3D11DeviceContext_OMSetRenderTargets(s_gpu11.ctx, 0, NULL, NULL);
+            if (FAILED(IDXGISwapChain1_ResizeBuffers(s_pr.sc, 0, w, h, DXGI_FORMAT_UNKNOWN, 0)) ||
+                FAILED(IDXGISwapChain1_GetBuffer(s_pr.sc, 0, &IID_ID3D11Texture2D, (void **)&bb)))
+                return 0;
+            ID3D11Device_CreateRenderTargetView(s_gpu11.dev, (ID3D11Resource *)bb, NULL, &s_pr.bb_rtv);
+            ID3D11Texture2D_Release(bb);
+            s_pr.bb_w = w; s_pr.bb_h = h;
+            s_pr.ovl_valid = 0;
+        }
+        return s_pr.bb_rtv != NULL;
+    }
+    if (!s_pr.sc && !pr_window_owned()) {
+        static int told;
+        if (!told++) fprintf(stderr, "  [PRESENT] waiting for the window's fallback renderer to let go\n");
+        return 0;
+    }
     if (!s_pr.sc || s_pr.hwnd != hw) {
         IDXGIDevice *dxd = NULL;
         IDXGIAdapter *ad = NULL;
@@ -622,7 +700,8 @@ static void pr_draw_hud(float gx, float gy, float gw, float gh)
 /* ---- the settings page -------------------------------------------------- */
 
 enum { MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_LIGHTING, MI_FILTER, MI_VSYNC, MI_BRIGHT, MI_GAMMA, MI_CROP,
-       MI_ANISO, MI_FPS, MI_LIMIT, MI_RESET, MI_CLOSE, MI_COUNT };
+       MI_ANISO, MI_FPS, MI_LIMIT, MI_API, MI_RESET, MI_CLOSE, MI_COUNT };
+static const char *const k_api_names[] = { "Direct3D 11", "Vulkan", "Direct3D 12" };
 static const int k_fps_limits[] = { 30, 60, 120, 0, -1 };
 #define FPS_LIMITS 5
 /* The title's frame-interval hook (src/main.c) re-reads the cap when it
@@ -660,6 +739,9 @@ static void menu_label(int item, char *name, char *val, size_t n)
     case MI_LIMIT:  strcpy(name, "Frame rate cap");
                     if (s_vs.fps_limit < 0) snprintf(val, n, "Original (30/60)");
                     else snprintf(val, n, s_vs.fps_limit ? "%d" : "Unlimited", s_vs.fps_limit); break;
+    case MI_API:    strcpy(name, "Graphics API");
+                    snprintf(val, n, "%s%s", k_api_names[s_vs.renderer % 3],
+                             strcmp(k_api_names[s_vs.renderer % 3], gx_backend_name()) ? "  (after restart)" : ""); break;
     case MI_RESET:  strcpy(name, "Reset to defaults"); break;
     case MI_CLOSE:  strcpy(name, "Close  (F1 / Esc)"); break;
     default:        name[0] = 0; break;
@@ -696,6 +778,7 @@ static void menu_change(int item, int dir)
                       for (k = 0; k < FPS_LIMITS && k_fps_limits[k] != s_vs.fps_limit; k++) {}
                       k = (k >= FPS_LIMITS ? 3 : (k + FPS_LIMITS + dir) % FPS_LIMITS); s_vs.fps_limit = k_fps_limits[k];
                       fps_limit_changed(); } break;
+    case MI_API:    s_vs.renderer = (s_vs.renderer + 3 + dir) % 3; break;
     default: return;
     }
     s_pr.ovl_valid = 0;
@@ -706,6 +789,7 @@ static void menu_activate(int item)
 {
     if (item == MI_RESET) {
         VideoSettings d = { VM_BORDERLESS, 1920, 1080, AR_ORIGINAL, 3, SF_ENHANCED, 1, 100, 100, 0, 0, 8, 0, 1 };
+        d.renderer = s_vs.renderer;          /* the API is not a picture setting */
         s_vs = d;
         InterlockedExchange(&s_vs_dirty, 1);
         vs_save();
@@ -750,7 +834,7 @@ static int menu_rows(void) { int n = menu_page()->count(); return n > 0 ? n : 1;
  * game thread: changes mark the swap chain for re-applying on the next flip
  * and are saved at once. */
 static const int k_vm_items[] = { MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_LIGHTING, MI_FILTER, MI_VSYNC,
-                                  MI_BRIGHT, MI_GAMMA, MI_CROP, MI_ANISO, MI_FPS, MI_LIMIT };
+                                  MI_BRIGHT, MI_GAMMA, MI_CROP, MI_ANISO, MI_FPS, MI_LIMIT, MI_API };
 #define VM_COUNT ((int)(sizeof k_vm_items / sizeof k_vm_items[0]))
 static const int k_vm_aniso[] = { 1, 2, 4, 8, 16 };
 
@@ -760,7 +844,7 @@ const char *xbox_VideoSettingName(int i)
 {
     static const char *names[] = { "Display Mode", "Resolution", "Widescreen", "Aspect Ratio", "Render Scale", "Lighting & Materials",
                                    "Upscaling Filter", "VSync", "Brightness", "Gamma",
-                                   "Overscan Crop", "Texture Filtering", "Show FPS", "Frame Rate Cap" };
+                                   "Overscan Crop", "Texture Filtering", "Show FPS", "Frame Rate Cap", "Graphics API" };
     return (i >= 0 && i < VM_COUNT) ? names[i] : "";
 }
 
@@ -783,6 +867,7 @@ int xbox_VideoSettingValues(int i)
     case MI_BRIGHT: case MI_GAMMA: return 21;
     case MI_CROP: case MI_ANISO: return 5;
     case MI_LIMIT:  return FPS_LIMITS;
+    case MI_API:    return 3;
     }
     return 1;
 }
@@ -815,6 +900,7 @@ static int vm_get(const VideoSettings *vs, int item)
         for (k = 0; k < FPS_LIMITS; k++)
             if (k_fps_limits[k] == vs->fps_limit) return k;
         return 3;
+    case MI_API:    return vs->renderer;
     }
     return 0;
 }
@@ -836,6 +922,7 @@ static void vm_set(VideoSettings *vs, int item, int idx)
     case MI_FPS:    vs->show_fps = idx; break;
     case MI_WIDE:   vs->widescreen = idx; break;
     case MI_LIMIT:  vs->fps_limit = k_fps_limits[idx % FPS_LIMITS]; break;
+    case MI_API:    vs->renderer = idx % 3; break;
     }
 }
 
@@ -868,6 +955,8 @@ void xbox_VideoSettingValueName(int i, int idx, char *buf, size_t n)
     case MI_WIDE:   snprintf(buf, n, "%s", v.widescreen ? "On" : "Off"); break;
     case MI_LIMIT:  if (v.fps_limit < 0) snprintf(buf, n, "Original (30/60)");
                     else if (v.fps_limit) snprintf(buf, n, "%d FPS", v.fps_limit); else snprintf(buf, n, "Unlimited"); break;
+    case MI_API:    snprintf(buf, n, "%s%s", k_api_names[v.renderer % 3],
+                             strcmp(k_api_names[v.renderer % 3], gx_backend_name()) ? " (restart)" : ""); break;
     }
 }
 
