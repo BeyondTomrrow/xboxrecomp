@@ -65,6 +65,7 @@ typedef struct {
     int widescreen;         /* built-in Hor+ widescreen: the picture fills the window */
     int lighting;           /* 0 classic, 1 enhanced, 2 maximum */
     int renderer;           /* graphics API from the next start: 0 Direct3D 11, 1 Vulkan, 2 Direct3D 12 (gx/gx_sdl.c) */
+    int upscaler;           /* 0 off, 1 FSR 3 native AA, 2 quality, 3 balanced, 4 performance, 5 ultra performance */
 } VideoSettings;
 
 /* NFL 2K5 draws several full-screen backdrops only inside the 640-pixel
@@ -104,12 +105,14 @@ static void vs_load(void)
         else if (!strcmp(key, "widescreen")) s_vs.widescreen = v != 0;
         else if (!strcmp(key, "lighting")) s_vs.lighting = v;
         else if (!strcmp(key, "renderer")) s_vs.renderer = v;
+        else if (!strcmp(key, "upscaler")) s_vs.upscaler = v;
     }
     fclose(f);
     if (s_vs.scale < 1) s_vs.scale = 1;
     if (s_vs.scale > 16) s_vs.scale = 16;   /* stable maximum for the supported display modes */
     if (s_vs.lighting < 0 || s_vs.lighting > 2) s_vs.lighting = 0;
     if (s_vs.renderer < 0 || s_vs.renderer > 2) s_vs.renderer = 0;
+    if (s_vs.upscaler < 0 || s_vs.upscaler > 5) s_vs.upscaler = 0;
     if (s_vs.filter < SF_BILINEAR || s_vs.filter > SF_ENHANCED) s_vs.filter = SF_ENHANCED;
     if (s_vs.crop < 0) s_vs.crop = 0;
     if (s_vs.crop > 40) s_vs.crop = 40;
@@ -140,9 +143,11 @@ static void vs_save(void)
                "; lighting: 0 classic Xbox, 1 enhanced material response, 2 maximum material response\n"
                "lighting = %d\n"
                "; renderer: graphics API, used from the next start: 0 Direct3D 11, 1 Vulkan, 2 Direct3D 12\n"
-               "renderer = %d\n",
+               "renderer = %d\n"
+               "; upscaler (Direct3D 12): 0 off, 1 FSR 3 native AA, 2 quality, 3 balanced, 4 performance, 5 ultra performance\n"
+               "upscaler = %d\n",
             s_vs.mode, s_vs.res_w, s_vs.res_h, s_vs.aspect, s_vs.scale, s_vs.filter, s_vs.vsync,
-            s_vs.brightness, s_vs.gamma, s_vs.crop, s_vs.show_fps, s_vs.aniso, s_vs.fps_limit, s_vs.widescreen, s_vs.lighting, s_vs.renderer);
+            s_vs.brightness, s_vs.gamma, s_vs.crop, s_vs.show_fps, s_vs.aniso, s_vs.fps_limit, s_vs.widescreen, s_vs.lighting, s_vs.renderer, s_vs.upscaler);
     fclose(f);
 }
 
@@ -322,6 +327,8 @@ static int pr_init(void)
          * (performance captures); the ini is left alone. */
         const char *e = getenv("NFL2K5_RENDER_SCALE");
         if (e && atoi(e) >= 1 && atoi(e) <= 16) s_vs.scale = atoi(e);
+        e = getenv("NFL2K5_UPSCALER");       /* likewise for the upscaler (0-5) */
+        if (e && atoi(e) >= 0 && atoi(e) <= 5) s_vs.upscaler = atoi(e);
     }
     g_render_scale = (uint32_t)s_vs.scale;
     g_aniso = (uint32_t)s_vs.aniso;
@@ -701,7 +708,11 @@ static void pr_draw_hud(float gx, float gy, float gw, float gh)
 /* ---- the settings page -------------------------------------------------- */
 
 enum { MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_LIGHTING, MI_FILTER, MI_VSYNC, MI_BRIGHT, MI_GAMMA, MI_CROP,
-       MI_ANISO, MI_FPS, MI_LIMIT, MI_API, MI_RESET, MI_CLOSE, MI_COUNT };
+       MI_ANISO, MI_FPS, MI_LIMIT, MI_API, MI_UPSCALE, MI_RESET, MI_CLOSE, MI_COUNT };
+static const char *const k_upscaler_names[] = { "Off", "FSR 3 Native AA", "FSR 3 Quality", "FSR 3 Balanced",
+                                                 "FSR 3 Performance", "FSR 3 Ultra Performance" };
+static const float k_upscaler_ratio[] = { 1.0f, 1.0f, 1.5f, 1.7f, 2.0f, 3.0f };
+static UINT s_fsr_out_h;                 /* last upscale's output height, 0 when off */
 static const char *const k_api_names[] = { "Direct3D 11", "Vulkan", "Direct3D 12" };
 static const int k_fps_limits[] = { 30, 60, 120, 0, -1 };
 #define FPS_LIMITS 5
@@ -743,6 +754,9 @@ static void menu_label(int item, char *name, char *val, size_t n)
     case MI_API:    strcpy(name, "Graphics API");
                     snprintf(val, n, "%s%s", k_api_names[s_vs.renderer % 3],
                              strcmp(k_api_names[s_vs.renderer % 3], gx_backend_name()) ? "  (after restart)" : ""); break;
+    case MI_UPSCALE: strcpy(name, "Upscaling");
+                    snprintf(val, n, "%s%s", k_upscaler_names[s_vs.upscaler % 6],
+                             s_vs.upscaler && !gxs_fsr_available() ? "  (Direct3D 12 only)" : ""); break;
     case MI_RESET:  strcpy(name, "Reset to defaults"); break;
     case MI_CLOSE:  strcpy(name, "Close  (F1 / Esc)"); break;
     default:        name[0] = 0; break;
@@ -780,6 +794,7 @@ static void menu_change(int item, int dir)
                       k = (k >= FPS_LIMITS ? 3 : (k + FPS_LIMITS + dir) % FPS_LIMITS); s_vs.fps_limit = k_fps_limits[k];
                       fps_limit_changed(); } break;
     case MI_API:    s_vs.renderer = (s_vs.renderer + 3 + dir) % 3; break;
+    case MI_UPSCALE: s_vs.upscaler = (s_vs.upscaler + 6 + dir) % 6; break;
     default: return;
     }
     s_pr.ovl_valid = 0;
@@ -791,6 +806,7 @@ static void menu_activate(int item)
     if (item == MI_RESET) {
         VideoSettings d = { VM_BORDERLESS, 1920, 1080, AR_ORIGINAL, 3, SF_ENHANCED, 1, 100, 100, 0, 0, 8, 0, 1 };
         d.renderer = s_vs.renderer;          /* the API is not a picture setting */
+        d.upscaler = s_vs.upscaler;
         s_vs = d;
         InterlockedExchange(&s_vs_dirty, 1);
         vs_save();
@@ -835,7 +851,7 @@ static int menu_rows(void) { int n = menu_page()->count(); return n > 0 ? n : 1;
  * game thread: changes mark the swap chain for re-applying on the next flip
  * and are saved at once. */
 static const int k_vm_items[] = { MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_LIGHTING, MI_FILTER, MI_VSYNC,
-                                  MI_BRIGHT, MI_GAMMA, MI_CROP, MI_ANISO, MI_FPS, MI_LIMIT, MI_API };
+                                  MI_BRIGHT, MI_GAMMA, MI_CROP, MI_ANISO, MI_FPS, MI_LIMIT, MI_API, MI_UPSCALE };
 #define VM_COUNT ((int)(sizeof k_vm_items / sizeof k_vm_items[0]))
 static const int k_vm_aniso[] = { 1, 2, 4, 8, 16 };
 
@@ -845,7 +861,7 @@ const char *xbox_VideoSettingName(int i)
 {
     static const char *names[] = { "Display Mode", "Resolution", "Widescreen", "Aspect Ratio", "Render Scale", "Lighting & Materials",
                                    "Upscaling Filter", "VSync", "Brightness", "Gamma",
-                                   "Overscan Crop", "Texture Filtering", "Show FPS", "Frame Rate Cap", "Graphics API" };
+                                   "Overscan Crop", "Texture Filtering", "Show FPS", "Frame Rate Cap", "Graphics API", "Upscaling" };
     return (i >= 0 && i < VM_COUNT) ? names[i] : "";
 }
 
@@ -869,6 +885,7 @@ int xbox_VideoSettingValues(int i)
     case MI_CROP: case MI_ANISO: return 5;
     case MI_LIMIT:  return FPS_LIMITS;
     case MI_API:    return 3;
+    case MI_UPSCALE: return 6;
     }
     return 1;
 }
@@ -902,6 +919,7 @@ static int vm_get(const VideoSettings *vs, int item)
             if (k_fps_limits[k] == vs->fps_limit) return k;
         return 3;
     case MI_API:    return vs->renderer;
+    case MI_UPSCALE: return vs->upscaler;
     }
     return 0;
 }
@@ -924,6 +942,7 @@ static void vm_set(VideoSettings *vs, int item, int idx)
     case MI_WIDE:   vs->widescreen = idx; break;
     case MI_LIMIT:  vs->fps_limit = k_fps_limits[idx % FPS_LIMITS]; break;
     case MI_API:    vs->renderer = idx % 3; break;
+    case MI_UPSCALE: vs->upscaler = idx % 6; break;
     }
 }
 
@@ -958,6 +977,7 @@ void xbox_VideoSettingValueName(int i, int idx, char *buf, size_t n)
                     else if (v.fps_limit) snprintf(buf, n, "%d FPS", v.fps_limit); else snprintf(buf, n, "Unlimited"); break;
     case MI_API:    snprintf(buf, n, "%s%s", k_api_names[v.renderer % 3],
                              strcmp(k_api_names[v.renderer % 3], gx_backend_name()) ? " (restart)" : ""); break;
+    case MI_UPSCALE: snprintf(buf, n, "%s", k_upscaler_names[v.upscaler % 6]); break;
     }
 }
 
@@ -1459,16 +1479,21 @@ static int pr_present(uint32_t guest)
     if (InterlockedExchange(&s_vs_dirty, 0))
         pr_apply_mode();
     g_render_scale = (uint32_t)s_vs.scale;     /* surfaces follow on their next use */
+    if (s_vs.upscaler && gxs_fsr_available() && s_fsr_out_h) {
+        /* FSR 3: render at the on-screen size over the quality ratio (the
+         * internal-resolution setting does not apply), rounded to a whole
+         * multiple of the guest's 480 lines */
+        float want = (float)s_fsr_out_h / k_upscaler_ratio[s_vs.upscaler % 6] / (float)s->h;
+        uint32_t r = (uint32_t)(want + 0.5f);
+        g_render_scale = r < 1 ? 1 : r > 16 ? 16 : r;
+    }
     g_aniso = (uint32_t)s_vs.aniso;
     g_lighting_profile = (uint32_t)s_vs.lighting;
     s_ana_ar = pr_anamorphic_update();
     g_wide_ar = s_ana_ar > 0.0f ? 0.0f : pr_wanted_wide_ar();
     menu_pad();
 
-    /* RECOMP_MV_SHOW=1 (SDL_GPU): the motion vectors, |x| red, |y| green. */
-    if (FAILED(ID3D11Device_CreateShaderResourceView(s_gpu11.dev,
-                   (ID3D11Resource *)(s->mv && env_cached("RECOMP_MV_SHOW") ? s->mv : s->tex), NULL, &srv)))
-        return 0;
+    ID3D11Texture2D *shown = s->tex;
     {
         /* A widescreen surface is wider than the guest's: it is shown whole,
          * and its proportions follow from its width. */
@@ -1495,13 +1520,61 @@ static int pr_present(uint32_t guest)
                 fprintf(stderr, "  [PRESENT] surface %08X %ux%u +%u cols, frac %.3f, window %dx%d -> picture %.0f,%.0f %.0fx%.0f (aspect mode %d)\n",
                         guest, s->w, s->h, s->ox, frac, s_pr.bb_w, s_pr.bb_h, dx, dy, dw, dh, s_vs.aspect);
         }
+        /* FSR 3 (Direct3D 12): the frame, its depth and motion, upscaled
+         * straight to the size the picture has on screen (render size: that
+         * over the quality ratio, see g_render_scale above). */
+        {
+            static ID3D11Texture2D *fsr_out;
+            static UINT fsr_w, fsr_h, fsr_rw;
+            static float jx, jy;                 /* jitter this frame was rendered with (pixels) */
+            static LARGE_INTEGER last;
+            LARGE_INTEGER t;
+            D3D11_TEXTURE2D_DESC td;
+            ID3D11Texture2D_GetDesc(s->tex, &td);
+            QueryPerformanceCounter(&t);
+            if (s_vs.upscaler && s->mv && s->dz && gxs_fsr_available() && pc.src[2] > 0.0f && pc.src[3] > 0.0f) {
+                UINT ow = (UINT)(dw / pc.src[2] + 0.5f), oh = (UINT)(dh / pc.src[3] + 0.5f);
+                float dt = last.QuadPart ? (float)((t.QuadPart - last.QuadPart) * 1000.0 / s_pr.freq.QuadPart) : 16.7f;
+                if (ow > 16384u) ow = 16384u;
+                if (oh > 16384u) oh = 16384u;
+                s_fsr_out_h = oh;
+                if (!fsr_out || fsr_w != ow || fsr_h != oh) {
+                    D3D11_TEXTURE2D_DESC od;
+                    if (fsr_out) ID3D11Texture2D_Release(fsr_out);
+                    fsr_out = NULL;
+                    memset(&od, 0, sizeof od);
+                    od.Width = ow; od.Height = oh; od.MipLevels = od.ArraySize = 1;
+                    od.Format = DXGI_FORMAT_R8G8B8A8_UNORM; od.SampleDesc.Count = 1;
+                    od.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+                    ID3D11Device_CreateTexture2D(s_gpu11.dev, &od, NULL, &fsr_out);
+                    fsr_w = ow; fsr_h = oh;
+                }
+                if (fsr_out && ow >= td.Width / 2u && gxs_fsr_upscale(s->tex, s->dz, s->mv, s->rx, fsr_out, td.Width,
+                                                                     td.Height, ow, oh, jx, jy, dt, fsr_rw != td.Width, 0.25f))
+                    shown = fsr_out;
+                fsr_rw = td.Width;
+                gxs_fsr_jitter(td.Width, ow, &jx, &jy);  /* the next frame's offset */
+                gxs_set_jitter(2.0f * jx / (float)td.Width, -2.0f * jy / (float)td.Height);
+            } else {
+                s_fsr_out_h = 0;
+                if (jx != 0.0f || jy != 0.0f) {
+                    jx = jy = 0.0f;
+                    gxs_set_jitter(0.0f, 0.0f);
+                }
+            }
+            last = t;
+        }
         /* The surface texture is scale x its guest size once the internal
          * resolution is raised; the shader's texel maths wants its real size. */
         {
             D3D11_TEXTURE2D_DESC td;
-            ID3D11Texture2D_GetDesc(s->tex, &td);
+            ID3D11Texture2D_GetDesc(shown, &td);
             pc.sz[0] = (float)td.Width; pc.sz[1] = (float)td.Height;
         }
+        /* RECOMP_MV_SHOW=1 (SDL_GPU): the motion vectors, |x| red, |y| green. */
+        if (FAILED(ID3D11Device_CreateShaderResourceView(s_gpu11.dev,
+                       (ID3D11Resource *)(s->mv && env_cached("RECOMP_MV_SHOW") ? s->mv : shown), NULL, &srv)))
+            return 0;
         pc.sz[2] = dw; pc.sz[3] = dh;
     }
     if (SUCCEEDED(ID3D11DeviceContext_Map(s_gpu11.ctx, (ID3D11Resource *)s_pr.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {

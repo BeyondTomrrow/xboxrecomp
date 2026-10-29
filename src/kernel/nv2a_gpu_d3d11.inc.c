@@ -66,6 +66,10 @@ typedef struct {
     ID3D11RenderTargetView *ctr_rtv;
     ID3D11Texture2D *mv;                 /* SDL_GPU: motion vectors (R16G16 float, target 1) */
     ID3D11RenderTargetView *mv_rtv;
+    ID3D11Texture2D *dz;                 /* SDL_GPU: depth as R32 float (target 2), for the upscaler */
+    ID3D11RenderTargetView *dz_rtv;
+    ID3D11Texture2D *rx;                 /* SDL_GPU: reactive mask, 2D draws (target 3), for the upscaler */
+    ID3D11RenderTargetView *rx_rtv;
 } GpuSurface;
 
 /* Internal resolution (video settings): every render target is this many
@@ -483,6 +487,10 @@ static void gpu_release_surface(GpuSurface *s)
     if (s->copy) ID3D11Texture2D_Release(s->copy);
     if (s->mv_rtv) ID3D11RenderTargetView_Release(s->mv_rtv);
     if (s->mv) ID3D11Texture2D_Release(s->mv);
+    if (s->dz_rtv) ID3D11RenderTargetView_Release(s->dz_rtv);
+    if (s->dz) ID3D11Texture2D_Release(s->dz);
+    if (s->rx_rtv) ID3D11RenderTargetView_Release(s->rx_rtv);
+    if (s->rx) ID3D11Texture2D_Release(s->rx);
     memset(s, 0, sizeof *s);
 }
 
@@ -642,6 +650,16 @@ retry_surface_create:
             if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, NULL, &s->mv)) &&
                 SUCCEEDED(ID3D11Device_CreateRenderTargetView(s_gpu11.dev, (ID3D11Resource *)s->mv, NULL, &s->mv_rtv)))
                 ID3D11DeviceContext_ClearRenderTargetView(s_gpu11.ctx, s->mv_rtv, zero);
+            td.Format = DXGI_FORMAT_R32_FLOAT;
+            if (s->mv_rtv && SUCCEEDED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, NULL, &s->dz)) &&
+                SUCCEEDED(ID3D11Device_CreateRenderTargetView(s_gpu11.dev, (ID3D11Resource *)s->dz, NULL, &s->dz_rtv))) {
+                static const float far1[4] = { 1, 1, 1, 1 };
+                ID3D11DeviceContext_ClearRenderTargetView(s_gpu11.ctx, s->dz_rtv, far1);
+                td.Format = DXGI_FORMAT_R8_UNORM;
+                if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, NULL, &s->rx)) &&
+                    SUCCEEDED(ID3D11Device_CreateRenderTargetView(s_gpu11.dev, (ID3D11Resource *)s->rx, NULL, &s->rx_rtv)))
+                    ID3D11DeviceContext_ClearRenderTargetView(s_gpu11.ctx, s->rx_rtv, zero);
+            }
         }
         s->dirty = 0;
         if (sc != requested_sc)
@@ -2264,8 +2282,9 @@ static int gpu_draw_batch_unlocked_body(int flat2d)
             ID3D11DepthStencilState *dss = flat2d ? gpu_no_depth() : gpu_depth_state();
             int all = !s_bound.valid;
             if (all || s_bound.rtv != surf->rtv || s_bound.dsv != surf->dsv) {
-                ID3D11RenderTargetView *rts[2] = { surf->rtv, surf->mv_rtv };
-                ID3D11DeviceContext_OMSetRenderTargets(s_gpu11.ctx, surf->mv_rtv ? 2 : 1, rts, surf->dsv);
+                ID3D11RenderTargetView *rts[4] = { surf->rtv, surf->mv_rtv, surf->dz_rtv, surf->rx_rtv };
+                ID3D11DeviceContext_OMSetRenderTargets(s_gpu11.ctx, surf->rx_rtv ? 4 : surf->dz_rtv ? 3 : surf->mv_rtv ? 2 : 1,
+                                                       rts, surf->dsv);
                 s_bound.rtv = surf->rtv; s_bound.dsv = surf->dsv;
                 memset(s_bound.srv, 0, sizeof s_bound.srv);       /* resend textures */
                 s_bound.srv[0] = (ID3D11ShaderResourceView *)(uintptr_t)1;
@@ -2501,6 +2520,7 @@ static int gpu_clear_unlocked(uint32_t param)
             if (s->mv_rtv) {
                 static const float zero[4] = { 0, 0, 0, 0 };
                 ID3D11DeviceContext_ClearRenderTargetView(s_gpu11.ctx, s->mv_rtv, zero);
+                if (s->rx_rtv) ID3D11DeviceContext_ClearRenderTargetView(s_gpu11.ctx, s->rx_rtv, zero);
             }
         } else {
             /* Partial rectangle or channel subset: a solid quad with the
@@ -2537,6 +2557,10 @@ static int gpu_clear_unlocked(uint32_t param)
         if (z < 0.0f) z = 0.0f;
         if (z > 1.0f) z = 1.0f;
         ID3D11DeviceContext_ClearDepthStencilView(s_gpu11.ctx, s->dsv, flags, z, (UINT8)(s_vp.zclear & 0xFF));
+        if (s->dz_rtv && (param & 1u)) {
+            float zz[4] = { z, z, z, z };
+            ID3D11DeviceContext_ClearRenderTargetView(s_gpu11.ctx, s->dz_rtv, zz);
+        }
     }
     s->dirty = 1;
     s->gen++;

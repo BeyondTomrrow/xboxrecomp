@@ -197,7 +197,7 @@ static const char *k_vp_epilogue =
  * the program for its own vertex and for the other two corners of its
  * triangle, and rebuilds the triangle as gs_main does. */
 static const char *k_vp_sg_head =
-    "[[vk::binding(0, 1)]] cbuffer VPULL : register(b0, space1) { uint4 vpull; };\n"
+    "[[vk::binding(0, 1)]] cbuffer VPULL : register(b0, space1) { uint4 vpull; float4 vjit; };\n"
     "[[vk::binding(1, 1)]] cbuffer VC : register(b1, space1) { float4 c[192]; float4 info; float4 clipr; float4 fogp; float4 lightp; };\n"
     "[[vk::binding(2, 1)]] cbuffer VA : register(b2, space1) { int4 va[16]; float4 vk[16]; };\n"
     "[[vk::binding(0, 0)]] ByteAddressBuffer RB : register(t0, space0);\n"
@@ -209,12 +209,13 @@ static const char *k_vp_sg_head =
     "struct PIn { float4 pos:SV_Position; float4 d0:COLOR0; float4 d1:COLOR1;\n"
     "  float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3; float4 wz:TEXCOORD4; float4 rawscreen:TEXCOORD5;\n"
     "  nointerpolation float4 tri0:TEXCOORD6; nointerpolation float4 tri1:TEXCOORD7; nointerpolation float4 tri2:TEXCOORD8;\n"
-    "  nointerpolation float2 depthmeta:TEXCOORD9; float4 mvc:TEXCOORD10; float4 mvp:TEXCOORD11; };\n";
+    "  nointerpolation float2 depthmeta:TEXCOORD9; float4 mvc:TEXCOORD10; float4 mvp:TEXCOORD11;\n"
+    "  nointerpolation float react:TEXCOORD12; };\n";
 
 static const char *k_vp_sg_main =
     "PIn vs_main(uint id : SV_VertexID) {\n"
     "  PIn o = vp_one(IX[vpull.x + id], false);\n"
-    "  o.mvc = o.pos;\n"
+    "  o.mvc = o.pos; o.react = 0;\n"
     "  o.mvp = vpull.w != 0u ? vp_one(IX[vpull.x + id], true).pos : o.pos;\n"
     "  if (vpull.y != 0u) {\n"
     "    uint cn = id % 3u, t = vpull.x + id - cn;\n"
@@ -236,6 +237,7 @@ static const char *k_vp_sg_main =
     "    if (p2.w <= 0.0 || abs(p2.x) >= 1e6 || abs(p2.y) >= 1e6) clipped = 1;\n"
     "    o.tri0 = p0; o.tri1 = p1; o.tri2 = p2;\n"
     "    o.depthmeta = clipped != 0 ? float2(0, 0) : float2(slope, 1);\n"
+    "    o.pos.xy += vjit.xy * o.pos.w;\n"
     "  }\n"
     "  return o;\n"
     "}\n";

@@ -32,7 +32,7 @@ set(KERNEL_SOURCES
 if(WIN32)
     # The D3D11 renderer on Vulkan / Direct3D 12 through SDL_GPU (gx/gx_sdl.c);
     # shaders compiled at run time by dxcompiler.dll (shipped next to the exe).
-    list(APPEND KERNEL_SOURCES gx/gx_sdl.c gx/gx_dxc.cpp)
+    list(APPEND KERNEL_SOURCES gx/gx_sdl.c gx/gx_dxc.cpp gx/gx_ffx.cpp)
 endif()
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
@@ -50,6 +50,16 @@ target_include_directories(xbox_kernel PUBLIC
 if(WIN32)
     # platform contributes the src/ include path and guarded guest-memory copies.
     target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt)
+    # AMD FidelityFX SDK 1.1.4 (MIT), built locally: FSR 3 for gx/gx_ffx.cpp.
+    set(XBOXRECOMP_FFX_SDK "H:/2K5Remade-local/fidelityfx/FidelityFX-SDK-1.1.4/sdk" CACHE PATH "FidelityFX SDK folder")
+    target_include_directories(xbox_kernel PRIVATE ${XBOXRECOMP_FFX_SDK}/include)
+    target_link_libraries(xbox_kernel PUBLIC
+        ${XBOXRECOMP_FFX_SDK}/bin/ffx_sdk/ffx_fsr3_x64.lib
+        ${XBOXRECOMP_FFX_SDK}/bin/ffx_sdk/ffx_fsr3upscaler_x64.lib
+        ${XBOXRECOMP_FFX_SDK}/bin/ffx_sdk/ffx_frameinterpolation_x64.lib
+        ${XBOXRECOMP_FFX_SDK}/bin/ffx_sdk/ffx_opticalflow_x64.lib
+        ${XBOXRECOMP_FFX_SDK}/bin/ffx_sdk/ffx_backend_dx12_x64.lib
+        d3d12 dxgi)
 else()
     # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
     find_package(OpenSSL REQUIRED)

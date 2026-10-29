@@ -29,12 +29,15 @@ struct PIn {
     // with last frame's constants too); equal where nothing is known.
     float4 mvc : TEXCOORD10;
     float4 mvp : TEXCOORD11;
+    nointerpolation float react : TEXCOORD12;   // 1: a 2D draw (HUD, text): the upscaler keeps no history for it
 #endif
 };
 struct POut {
     float4 c : SV_Target;
 #ifdef GX_SDL
     float2 mv : SV_Target1;     // UV offset from this pixel to where it was last frame
+    float  dz : SV_Target2;     // the depth again, readable (FSR 3 reads it; the depth buffer is not)
+    float  rx : SV_Target3;     // reactive mask (MAX-blended)
 #endif
     float  d : SV_Depth;
 };
@@ -50,6 +53,7 @@ PIn vs_main(VIn v)
     o.depthmeta = 0;
 #ifdef GX_SDL
     o.mvc = o.mvp = v.pos;
+    o.react = 0;
 #endif
     return o;
 }
@@ -154,7 +158,7 @@ struct GV {
     float4 pos; float4 d0; float4 d1; float4 t0; float4 t1; float4 t2; float4 t3; float4 wz; float4 rawscreen;
 };
 [[vk::binding(0, 0)]] StructuredBuffer<GV> VB : register(t0, space0);
-[[vk::binding(0, 1)]] cbuffer VPULL : register(b0, space1) { uint4 pull; };
+[[vk::binding(0, 1)]] cbuffer VPULL : register(b0, space1) { uint4 pull; float4 jit; };
 
 PIn vs_pull(uint id : SV_VertexID)
 {
@@ -166,6 +170,7 @@ PIn vs_pull(uint id : SV_VertexID)
     o.tri0 = o.tri1 = o.tri2 = 0;
     o.depthmeta = 0;
     o.mvc = o.mvp = v.pos;                  // built on the CPU: no history, no motion
+    o.react = pull.y != 0u ? 0.0 : 1.0;
     if (pull.y != 0u) {
         uint b = pull.x + (id / 3u) * 3u;
         float4 p0 = VB[b].rawscreen, p1 = VB[b + 1u].rawscreen, p2 = VB[b + 2u].rawscreen;
@@ -186,6 +191,7 @@ PIn vs_pull(uint id : SV_VertexID)
         if (p2.w <= 0.0 || abs(p2.x) >= 1e6 || abs(p2.y) >= 1e6) clipped = 1;
         o.tri0 = p0; o.tri1 = p1; o.tri2 = p2;
         o.depthmeta = clipped != 0 ? float2(0, 0) : float2(slope, 1);
+        o.pos.xy += jit.xy * o.pos.w;           // FSR camera jitter (motion vectors stay unjittered)
     }
     return o;
 }
@@ -368,6 +374,8 @@ POut ps_main(PIn i)
         float2 cur = i.mvc.xy / i.mvc.w, prv = i.mvp.xy / i.mvp.w;
         r.mv = (prv - cur) * float2(0.5, -0.5);
         if (any(isnan(r.mv)) || any(isinf(r.mv)) || i.mvc.w <= 0.0 || i.mvp.w <= 0.0) r.mv = 0;
+        r.dz = r.d;
+        r.rx = i.react * saturate(r.c.a * 4.0);
     }
 #endif
     return r;
