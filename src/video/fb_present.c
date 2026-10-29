@@ -351,11 +351,8 @@ static int SDLCALL fb_thread_sdl(void *data) {
                     );
                     fb_texture_opaque(g_fb.fallback_texture);
                 }
-                if (!presenter(win, g_fb.ultrawide)) {
-                    SDL_SetAtomicPointer((void **)&g_fb.presenter, NULL);
-                    SDL_SetAtomicInt(&g_fb.gpu_present, 0);   /* back to the SDL_Renderer */
-                    gpu_expected_until = 0;
-                }
+                /* (no presenter here: it is NULL on this branch) */
+                gpu_expected_until = 0;
 
                 fb_draw_sdl_fallback();
             }
