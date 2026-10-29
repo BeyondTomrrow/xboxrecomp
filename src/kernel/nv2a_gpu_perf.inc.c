@@ -187,6 +187,11 @@ static void perf_hitch(float ms, float present_ms)
     draws = s_gpu11.draws; texup = s_gpu11.tex_uploads; surfs = s_gpu11.surf_creates; ps = s_ps_ready;
 }
 
+/* Frames presented and the longest frame (us) since the APU's audio report
+ * last took it (apu_vp.c diag_report, once a second). */
+volatile LONG g_xbox_perf_frames;
+volatile LONG g_xbox_perf_worst_us;
+
 static void perf_on_present(int scale, float present_ms)
 {
     LARGE_INTEGER now;
@@ -201,6 +206,8 @@ static void perf_on_present(int scale, float present_ms)
     QueryPerformanceCounter(&now);
     ms = (float)((double)(now.QuadPart - s_perf.last.QuadPart) * 1000.0 / (double)s_perf.freq.QuadPart);
     s_perf.last = now;
+    InterlockedIncrement(&g_xbox_perf_frames);
+    if ((LONG)(ms * 1000.0f) > g_xbox_perf_worst_us) InterlockedExchange(&g_xbox_perf_worst_us, (LONG)(ms * 1000.0f));
     s_perf.ft[s_perf.head] = ms;
     s_perf.head = (s_perf.head + 1) % PERF_RING;
     s_perf.n++;

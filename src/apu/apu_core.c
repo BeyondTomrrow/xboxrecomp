@@ -298,12 +298,33 @@ static volatile float g_game_level;
 extern volatile float g_apu_bed_gain, g_apu_voice_level;
 extern volatile int g_apu_mute_music;
 extern volatile float g_apu_voice_gain;
-void xbox_AudioSetCommentaryGain(float gain) { g_apu_voice_gain = gain < 0.0f ? 0.0f : gain > 1.0f ? 1.0f : gain; }
-void xbox_AudioMuteGameMusic(int mute) { g_apu_mute_music = mute; }
+/* Every change of the host-side mix controls is logged (they are rare: a
+ * theme start/stop, a fade in steps): a control left set is how the crowd
+ * and effects went missing before (AUDIO-FIX-20261021). */
+static void mix_log(const char *what, float was, float now)
+{
+    float dd = now - was;
+    if (dd < 0) dd = -dd;
+    if (dd >= 0.1f || ((now == 0.0f || now == 1.0f) && was != now))
+        fprintf(stderr, "[MIXCTL] t=%lu %s %.2f -> %.2f\n", GetTickCount(), what, was, now);
+}
+void xbox_AudioSetCommentaryGain(float gain)
+{
+    float g = gain < 0.0f ? 0.0f : gain > 1.0f ? 1.0f : gain;
+    mix_log("commentary_gain", g_apu_voice_gain, g);
+    g_apu_voice_gain = g;
+}
+void xbox_AudioMuteGameMusic(int mute)
+{
+    mix_log("mute_game_music", (float)g_apu_mute_music, (float)(mute != 0));
+    g_apu_mute_music = mute;
+}
 float xbox_AudioGameLevel(void) { return g_apu_voice_level; }
 void xbox_AudioSetGameGain(float gain)
 {
-    g_apu_bed_gain = gain < 0.0f ? 0.0f : gain > 1.0f ? 1.0f : gain;
+    float g = gain < 0.0f ? 0.0f : gain > 1.0f ? 1.0f : gain;
+    mix_log("bed_gain", g_apu_bed_gain, g);
+    g_apu_bed_gain = g;
 }
 
 void mcpx_apu_monitor_frame(MCPXAPUState *d)
@@ -337,9 +358,16 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
                     g_test_tone.phase -= 2.0 * M_PI;
             }
         }
-        if (!g_audio_muted)
+        if (!g_audio_muted) {
+            int64_t m0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME), m1;
             mixer_render(d->monitor.frame_buf, MIXER_FRAME_SAMPLES);
-        else
+            m1 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+            if (m1 - m0 > 10000) {
+                static unsigned n;
+                if (n++ < 100)
+                    fprintf(stderr, "[APUSLOW] software mixer %.1f ms (its lock was held)\n", (m1 - m0) / 1000.0);
+            }
+        } else
             memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
         {
             double e = 0;
@@ -425,11 +453,57 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
  * Throttle (timing control for frame pacing)
  * ============================================================ */
 
+/* Paced by the speakers (AUDIO-FIX-20261021, dropouts): a monitor frame runs
+ * when the XAudio2 queue holds less than the target (56 ms) and waits while it
+ * holds more, so the APU follows the audio device's clock and keeps a constant
+ * cushion. Pacing by the wall clock alone kept whatever cushion was left after
+ * the last resync -- often 0-2 x 21 ms -- and every 20-40 ms pause of the
+ * pipeline (an ISR wait, a busy host thread) emptied it: 26-34 underruns per
+ * 10 minutes outside loads. After a pause the queue is refilled at once (the
+ * frames run back to back, as the old 64 ms catch-up did). When the device
+ * stops consuming (unplugged, lost), the wall clock takes over again. RECOMP_AUDIO_LEGACY=1: the old pacing. */
+static int throttle_by_queue(MCPXAPUState *d)
+{
+    int target = xa2_target_samples();
+    int64_t t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    static int64_t last_exit, stall_at;
+    extern int64_t g_apu_stall_total_us;
+    if (!xa2_is_active() || target <= 0 || xa2_legacy())
+        return 0;
+    if (last_exit && t0 - last_exit > 25000) {
+        /* 256 samples of work took over 25 ms of wall time: say how full the
+         * queue still is (an ISR wait is logged as such elsewhere). */
+        static unsigned n;
+        int q = xa2_queued_samples();
+        if (n++ < 200)
+            fprintf(stderr, "[APUSLOW] t=%lu %.1f ms since the last output frame (ISR wait %.1f ms), queue %d ms\n",
+                    GetTickCount(), (t0 - last_exit) / 1000.0, (g_apu_stall_total_us - stall_at) / 1000.0,
+                    q < 0 ? -1 : q / 48);
+    }
+    while (!d->pause_requested) {
+        int q = xa2_queued_samples();
+        int ms;
+        if (q < 0) return 0;              /* not consuming: wall clock */
+        if (q < target) break;
+        ms = (q - target) / 48;           /* time until it drops to the target */
+        if (ms < 1) ms = 1;
+        if (ms > 20) ms = 20;
+        qemu_cond_timedwait(&d->cond, &d->lock, ms);
+    }
+    d->next_frame_time_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    d->sleep_acc_us += (int)(d->next_frame_time_us - t0);
+    last_exit = d->next_frame_time_us;
+    stall_at = g_apu_stall_total_us;
+    return 1;
+}
+
 static void throttle(MCPXAPUState *d)
 {
     if (d->ep_frame_div % 8) {
         return;
     }
+    if (throttle_by_queue(d))
+        return;
 
     int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 
@@ -481,9 +555,24 @@ static void se_frame(MCPXAPUState *d)
     float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
     memset(mixbins, 0, sizeof(mixbins));
 
-    mcpx_apu_vp_frame(d, mixbins);
-    mcpx_apu_dsp_frame(d, mixbins);
-    mcpx_apu_monitor_frame(d);
+    {
+        /* A pipeline frame that takes over 20 ms (it should take well under
+         * one) is logged with where the time went: an audio-thread stall
+         * is what empties the speaker queue (AUDIO-REPORT-HOTKEY-20261022). */
+        int64_t t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME), t1, t2, t3;
+        mcpx_apu_vp_frame(d, mixbins);
+        t1 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+        mcpx_apu_dsp_frame(d, mixbins);
+        t2 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+        mcpx_apu_monitor_frame(d);
+        t3 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+        if (t3 - t0 > 20000) {
+            static unsigned n;
+            if (n++ < 200)
+                fprintf(stderr, "[APUSLOW] t=%lu frame %.1f ms: vp %.1f dsp %.1f monitor/output %.1f\n",
+                        GetTickCount(), (t3 - t0) / 1000.0, (t1 - t0) / 1000.0, (t2 - t1) / 1000.0, (t3 - t2) / 1000.0);
+        }
+    }
 
     d->ep_frame_div++;
 
@@ -494,9 +583,24 @@ static void se_frame(MCPXAPUState *d)
  * APU frame thread (background processing)
  * ============================================================ */
 
+int64_t g_apu_stall_us;          /* time the pipeline waited for the title's ISR (RECOMP_APU_PITCH_LOG) */
+unsigned g_apu_stall_n;
+/* The same for the audio report (always on), and the VP frames emitted silent
+ * because an ISR wait passed 40 ms (each one 32 samples of game audio lost). */
+int64_t g_apu_dg_stall_us;
+unsigned g_apu_dg_stall_n, g_apu_dg_silent_vp;
+unsigned long g_apu_silent_vp_total;   /* the same, never reset (RECOMP_APU_PITCH_LOG) */
+int64_t g_apu_stall_total_us;          /* ISR waits in all (the [APUSLOW] lines) */
+
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+    /* Above the game's and the renderer's threads: the pipeline is short work
+     * between waits, and a normal-priority audio thread lost 100-300 ms to busy
+     * host threads during frame hitches (VP frame deficits with no ISR wait,
+     * AUDIO-FIX-20261021 dropouts). RECOMP_APU_PRIORITY=0 leaves it normal. */
+    if (!xa2_legacy() && (!getenv("RECOMP_APU_PRIORITY") || strcmp(getenv("RECOMP_APU_PRIORITY"), "0") != 0))
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
@@ -542,6 +646,11 @@ static void *mcpx_apu_frame_thread(void *arg)
                 int64_t dur = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - stall_since;
                 st_n++;
                 st_total += dur;
+                g_apu_stall_us += dur;
+                g_apu_stall_n++;
+                g_apu_dg_stall_us += dur;
+                g_apu_stall_total_us += dur;
+                g_apu_dg_stall_n++;
                 if (dur > st_max) st_max = dur;
                 stall_since = 0;
             }
@@ -593,6 +702,9 @@ static void *mcpx_apu_frame_thread(void *arg)
                 d->set_irq = false;
             }
             /* Lightweight: just monitor frame (test tone + software mixer) */
+            if (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF &&
+                (fectl & (NV_PAPU_FECTL_FEMETHMODE_TRAPPED | NV_PAPU_FECTL_FEMETHMODE_HALTED)))
+            { g_apu_dg_silent_vp++; g_apu_silent_vp_total++; }
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
         }

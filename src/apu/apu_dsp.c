@@ -151,6 +151,46 @@ void mcpx_apu_update_dsp_preference(MCPXAPUState *d)
 /* Broadcast mix controls (xbox_AudioSetGameGain / xbox_AudioGameLevel in
  * apu_core.c): bed gain for everything but the commentary, and the smoothed
  * level of the commentary (centre bin). */
+/* Stand-in for the GP's I3DL2 reverb (the GP is not emulated): a small
+ * Schroeder reverb (4 combs + 2 all-passes per side, different lengths left
+ * and right) fed by mixbin 10, the I3DL2 send. Only the wet signal is
+ * output; the dry sound already reaches the speakers through its own bins. */
+#define RV_COMBS 4
+#define RV_APS 2
+static const int rv_comb_len[2][RV_COMBS] = { { 1557, 1617, 1491, 1422 }, { 1580, 1640, 1514, 1445 } };
+static const int rv_ap_len[2][RV_APS] = { { 556, 441 }, { 579, 464 } };
+static float rv_comb_buf[2][RV_COMBS][1700], rv_comb_lp[2][RV_COMBS];
+static int rv_comb_pos[2][RV_COMBS];
+static float rv_ap_buf[2][RV_APS][600];
+static int rv_ap_pos[2][RV_APS];
+
+static float reverb_tick(int side, float in)
+{
+    float out = 0.0f;
+    int k;
+    for (k = 0; k < RV_COMBS; k++) {
+        float *b = rv_comb_buf[side][k];
+        int p = rv_comb_pos[side][k];
+        float y = b[p];
+        rv_comb_lp[side][k] = y * 0.6f + rv_comb_lp[side][k] * 0.4f;    /* damping */
+        b[p] = in + rv_comb_lp[side][k] * 0.78f;                         /* feedback */
+        if (++p >= rv_comb_len[side][k]) p = 0;
+        rv_comb_pos[side][k] = p;
+        out += y;
+    }
+    out *= 0.25f;
+    for (k = 0; k < RV_APS; k++) {
+        float *b = rv_ap_buf[side][k];
+        int p = rv_ap_pos[side][k];
+        float y = b[p];
+        b[p] = out + y * 0.5f;
+        out = y - out * 0.5f;
+        if (++p >= rv_ap_len[side][k]) p = 0;
+        rv_ap_pos[side][k] = p;
+    }
+    return out;
+}
+
 volatile float g_apu_bed_gain = 1.0f;
 volatile float g_apu_voice_gain = 1.0f;   /* commentary (centre bin) */
 volatile float g_apu_voice_level;
@@ -251,14 +291,25 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
                  * at half, and everything but the centre is scaled by the
                  * "bed" gain so a broadcast theme can replace the game's
                  * music under the announcers (xbox_AudioSetGameGain). */
+                /* DirectSound's mixbins: 0 FL, 1 FR, 2 C, 3 LFE, 4 BL, 5 BR,
+                 * 6-9 the 3D (crosstalk) FL/FR/BL/BR feeds, 10 the I3DL2
+                 * reverb send, 11-31 effect sends. The sends are copies of
+                 * voices meant for the GP's effects, not speaker feeds: they
+                 * used to be added dry, even bins to the left ear and odd to
+                 * the right, so the reverb send doubled every 3D effect in
+                 * the left ear and effect send 0 sat in the right ear alone
+                 * (measured in a match, 2026-10-15: bins 6/7 0.17, bin 10
+                 * 0.05, bin 11 0.01 RMS). Now: speaker and 3D bins to their
+                 * sides, the reverb send through a reverb (wet only), effect
+                 * sends centred at -6 dB. */
                 float bed = g_apu_bed_gain, c = mixbins[2][i] * g_apu_voice_gain, lfe = mixbins[3][i] * 0.5f;
-                left = 0.0f;
-                right = 0.0f;
-                for (int b = 0; b < NUM_MIXBINS; ++b) {
-                    if (b == 2 || b == 3) continue;
-                    if (b & 1) right += mixbins[b][i];
-                    else       left  += mixbins[b][i];
-                }
+                float fx = 0.0f, rv = mixbins[10][i];
+                for (int b = 11; b < NUM_MIXBINS; ++b) fx += mixbins[b][i];
+                fx *= 0.5f;
+                left = mixbins[0][i] + mixbins[4][i] + mixbins[6][i] + mixbins[8][i];
+                right = mixbins[1][i] + mixbins[5][i] + mixbins[7][i] + mixbins[9][i];
+                left += reverb_tick(0, rv) * 0.7f + fx;
+                right += reverb_tick(1, rv) * 0.7f + fx;
                 left = (left + lfe) * bed + 0.7071f * c;
                 right = (right + lfe) * bed + 0.7071f * c;
             } else {
@@ -283,6 +334,56 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
             if (left < -1.0f) left = -1.0f;
             if (right > 1.0f) right = 1.0f;
             if (right < -1.0f) right = -1.0f;
+
+            /* Output low-pass at ~11 kHz. On the console nothing reaches the
+             * speakers above ~10-11 kHz: the voice sources are <=22 kHz
+             * (11 kHz Nyquist) and the VP/GP band-limit at the source rate, so
+             * xemu's output falls off a cliff by 11 kHz (11-15 kHz at -100 dBFS
+             * in a match). Ours sat 25-40 dB higher -- cubic-interpolation
+             * images (now band-limited per voice) and harmonics the soft limiter
+             * adds above the knee. A 4th-order Butterworth here matches the
+             * cliff for every voice at once, after the limiter that creates the
+             * harmonics. RECOMP_APU_NO_OUTLP=1 turns it off.
+             * docs/AUDIO-USER-REPORTS-20261022.md. */
+            {
+                static int off_lp = -1;
+                static float b0[2], b1[2], b2[2], a1[2], a2[2];
+                static float z[2][2][2];   /* [section][channel][2] */
+                if (off_lp < 0) {
+                    off_lp = getenv("RECOMP_APU_NO_OUTLP") != NULL;
+                    float fc = 11000.0f, w0 = 2.0f * 3.14159265f * fc / 48000.0f;
+                    float cw = cosf(w0), sw = sinf(w0);
+                    static const float q[2] = { 0.54119610f, 1.30656296f };   /* 4th-order Butterworth */
+                    for (int sct = 0; sct < 2; sct++) {
+                        float alpha = sw / (2.0f * q[sct]), a0 = 1.0f + alpha;
+                        b0[sct] = (1.0f - cw) * 0.5f / a0; b1[sct] = (1.0f - cw) / a0; b2[sct] = b0[sct];
+                        a1[sct] = -2.0f * cw / a0; a2[sct] = (1.0f - alpha) / a0;
+                    }
+                }
+                if (!off_lp) {
+                    float *ch[2] = { &left, &right };
+                    for (int c = 0; c < 2; c++) {
+                        float x = *ch[c];
+                        for (int sct = 0; sct < 2; sct++) {
+                            float y = b0[sct] * x + z[sct][c][0];
+                            z[sct][c][0] = b1[sct] * x - a1[sct] * y + z[sct][c][1];
+                            z[sct][c][1] = b2[sct] * x - a2[sct] * y;
+                            x = y;
+                        }
+                        *ch[c] = x;
+                    }
+                }
+            }
+            /* Master trim to xemu's level. A moderate demo play measured ~3-4 dB
+             * hotter than xemu in a matched 20 s window (mono -23.6 vs -28.0 dBFS,
+             * 2-8 kHz -32.3 vs -36.8); -2.5 dB brings the loud scenes in line while
+             * leaving the near-equal quiet scenes only slightly under. Env override
+             * RECOMP_APU_OUT_GAIN=<linear> (1.0 = none). docs/AUDIO-USER-REPORTS-20261022.md. */
+            {
+                static float g = -1.0f;
+                if (g < 0.0f) { const char *e = getenv("RECOMP_APU_OUT_GAIN"); g = e ? (float)atof(e) : 0.75f; }
+                left *= g; right *= g;
+            }
 
             /* Convert to 16-bit and write (not accumulate) into frame buffer.
              * Each of the 8 sub-frames writes its own 32-sample slice. */

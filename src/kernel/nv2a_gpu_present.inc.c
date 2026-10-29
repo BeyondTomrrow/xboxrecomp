@@ -925,6 +925,11 @@ static void menu_key(unsigned vk)
         }
         return;
     }
+    if (vk == VK_F9) {                                              /* save what I just heard */
+        extern void xbox_AudioReportRequest(void);
+        xbox_AudioReportRequest();
+        return;
+    }
     if (vk == VK_RETURN && (GetKeyState(VK_MENU) & 0x8000)) {       /* Alt+Enter */
         s_vs.mode = s_vs.mode == VM_WINDOWED ? VM_BORDERLESS : VM_WINDOWED;
         InterlockedExchange(&s_vs_dirty, 1);
