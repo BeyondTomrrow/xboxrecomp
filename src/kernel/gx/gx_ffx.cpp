@@ -44,6 +44,7 @@ static struct {
     FfxFsr3Context ctx;
     int ctx_ok;
     uint32_t rw, rh, ow, oh;
+    int fg;                              /* context made for frame generation */
     uint64_t frame;
 } F;
 
@@ -102,11 +103,27 @@ static int make_interface(FfxInterface *iface, int k)
     return ffxGetInterfaceDX12(iface, ffxGetDeviceDX12(F.dev), F.scratch[k], size, FFX_FSR3_CONTEXT_COUNT) == FFX_OK;
 }
 
-static int ensure_context(uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh)
+/* Frame generation here is dispatched by hand (gxf_upscale), not by AMD's
+ * frame-generation swap chain: the window's swap chain is SDL's, and the
+ * interpolated frame is composed like a real one. The backend's swap-chain
+ * hook is replaced by this no-op. */
+static FfxErrorCode no_swapchain_config(FfxFrameGenerationConfig const *config)
+{
+    (void)config;
+    return FFX_OK;
+}
+
+static FfxErrorCode fg_callback(const FfxFrameGenerationDispatchDescription *d, void *ctx)
+{
+    (void)ctx;
+    return ffxFsr3DispatchFrameGeneration(d);
+}
+
+static int ensure_context(uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, int fg)
 {
     FfxFsr3ContextDescription d;
     FfxErrorCode e;
-    if (F.ctx_ok && F.rw == rw && F.rh == rh && F.ow == ow && F.oh == oh)
+    if (F.ctx_ok && F.rw == rw && F.rh == rh && F.ow == ow && F.oh == oh && F.fg == fg)
         return 1;
     if (F.ctx_ok) {
         wait_idle();
@@ -114,7 +131,7 @@ static int ensure_context(uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh)
         F.ctx_ok = 0;
     }
     memset(&d, 0, sizeof d);
-    d.flags = FFX_FSR3_ENABLE_AUTO_EXPOSURE | FFX_FSR3_ENABLE_UPSCALING_ONLY;
+    d.flags = FFX_FSR3_ENABLE_AUTO_EXPOSURE | (fg ? 0u : (uint32_t)FFX_FSR3_ENABLE_UPSCALING_ONLY);
     d.maxRenderSize.width = rw; d.maxRenderSize.height = rh;
     d.maxUpscaleSize.width = ow; d.maxUpscaleSize.height = oh;
     d.displaySize.width = ow; d.displaySize.height = oh;
@@ -123,6 +140,7 @@ static int ensure_context(uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh)
     if (!make_interface(&d.backendInterfaceSharedResources, 0) || !make_interface(&d.backendInterfaceUpscaling, 1) ||
         !make_interface(&d.backendInterfaceFrameInterpolation, 2))
         return 0;
+    d.backendInterfaceFrameInterpolation.fpSwapChainConfigureFrameGeneration = no_swapchain_config;
     memset(&F.ctx, 0, sizeof F.ctx);
     e = ffxFsr3ContextCreate(&F.ctx, &d);
     if (e != FFX_OK) {
@@ -131,7 +149,17 @@ static int ensure_context(uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh)
     }
     F.ctx_ok = 1;
     F.rw = rw; F.rh = rh; F.ow = ow; F.oh = oh;
+    F.fg = fg;
     F.frame = 0;
+    if (fg) {
+        FfxFrameGenerationConfig c;
+        memset(&c, 0, sizeof c);
+        c.frameGenerationEnabled = true;
+        c.frameGenerationCallback = fg_callback;      /* unused here: gxf_upscale dispatches it */
+        c.interpolationRect.width = (int32_t)ow; c.interpolationRect.height = (int32_t)oh;
+        ffxFsr3ConfigureFrameGeneration(&F.ctx, &c);
+        fprintf(stderr, "  [FSR] frame generation on (%ux%u)\n", ow, oh);
+    }
     fprintf(stderr, "  [FSR] upscaling %ux%u -> %ux%u\n", rw, rh, ow, oh);
     return 1;
 }
@@ -159,14 +187,14 @@ static FfxResource res(SDL_GPUTexture *t, const wchar_t *name)
 }
 
 extern "C" int gxf_upscale(SDL_GPUTexture *color, SDL_GPUTexture *depth, SDL_GPUTexture *mv, SDL_GPUTexture *reactive,
-                           SDL_GPUTexture *out,
+                           SDL_GPUTexture *out, SDL_GPUTexture *interp,
                            uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, float jx, float jy,
                            float dt_ms, int reset, float sharpness)
 {
     FfxFsr3DispatchUpscaleDescription d;
     FfxErrorCode e;
     int s;
-    if (!F.ok || getenv("RECOMP_FSR_NODISPATCH") || !ensure_context(rw, rh, ow, oh))   /* diagnostics */
+    if (!F.ok || getenv("RECOMP_FSR_NODISPATCH") || !ensure_context(rw, rh, ow, oh, interp != NULL))   /* diagnostics */
         return 0;
     /* One frame in flight at most: the previous frame's upscale (and so all
      * of its SDL work, queue order) is finished before this one is recorded.
@@ -205,6 +233,36 @@ extern "C" int gxf_upscale(SDL_GPUTexture *color, SDL_GPUTexture *depth, SDL_GPU
     d.viewSpaceToMetersFactor = 1.0f;
     d.frameID = F.frame;
     e = ffxFsr3ContextDispatchUpscale(&F.ctx, &d);
+    if (e == FFX_OK && interp && F.fg) {
+        /* The frame between the previous upscaled image and this one. */
+        FfxFsr3DispatchFrameGenerationPrepareDescription p;
+        FfxFrameGenerationDispatchDescription g;
+        memset(&p, 0, sizeof p);
+        p.commandList = d.commandList;
+        p.depth = d.depth; p.motionVectors = d.motionVectors;
+        p.jitterOffset = d.jitterOffset; p.motionVectorScale = d.motionVectorScale;
+        p.frameTimeDelta = d.frameTimeDelta; p.renderSize = d.renderSize;
+        p.cameraNear = d.cameraNear; p.cameraFar = d.cameraFar;
+        p.cameraFovAngleVertical = d.cameraFovAngleVertical; p.viewSpaceToMetersFactor = d.viewSpaceToMetersFactor;
+        p.frameID = d.frameID;
+        e = ffxFsr3ContextDispatchFrameGenerationPrepare(&F.ctx, &p);
+        memset(&g, 0, sizeof g);
+        g.commandList = d.commandList;
+        g.presentColor = d.upscaleOutput;
+        g.outputs[0] = res(interp, L"NFL2K5_Interpolated");
+        g.numInterpolatedFrames = 1;
+        g.reset = d.reset;
+        g.backBufferTransferFunction = FFX_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
+        g.minMaxLuminance[0] = 0.0f; g.minMaxLuminance[1] = 1.0f;
+        g.interpolationRect.width = (int32_t)ow; g.interpolationRect.height = (int32_t)oh;
+        g.frameID = d.frameID;
+        if (e == FFX_OK)
+            e = ffxFsr3DispatchFrameGeneration(&g);
+        if (e != FFX_OK) {
+            static int told;
+            if (told++ < 5) fprintf(stderr, "  [FSR] frame generation failed (%d)\n", (int)e);
+        }
+    }
     F.list->Close();
     if (e != FFX_OK) {
         static int told;

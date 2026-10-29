@@ -66,6 +66,7 @@ typedef struct {
     int lighting;           /* 0 classic, 1 enhanced, 2 maximum */
     int renderer;           /* graphics API from the next start: 0 Direct3D 11, 1 Vulkan, 2 Direct3D 12 (gx/gx_sdl.c) */
     int upscaler;           /* 0 off, 1 FSR 3 native AA, 2 quality, 3 balanced, 4 performance, 5 ultra performance */
+    int framegen;           /* FSR 3 frame generation: a generated frame between each two (Direct3D 12) */
 } VideoSettings;
 
 /* NFL 2K5 draws several full-screen backdrops only inside the 640-pixel
@@ -106,6 +107,7 @@ static void vs_load(void)
         else if (!strcmp(key, "lighting")) s_vs.lighting = v;
         else if (!strcmp(key, "renderer")) s_vs.renderer = v;
         else if (!strcmp(key, "upscaler")) s_vs.upscaler = v;
+        else if (!strcmp(key, "framegen")) s_vs.framegen = v != 0;
     }
     fclose(f);
     if (s_vs.scale < 1) s_vs.scale = 1;
@@ -145,9 +147,11 @@ static void vs_save(void)
                "; renderer: graphics API, used from the next start: 0 Direct3D 11, 1 Vulkan, 2 Direct3D 12\n"
                "renderer = %d\n"
                "; upscaler (Direct3D 12): 0 off, 1 FSR 3 native AA, 2 quality, 3 balanced, 4 performance, 5 ultra performance\n"
-               "upscaler = %d\n",
+               "upscaler = %d\n"
+               "; framegen (Direct3D 12): 1 FSR 3 frame generation, a generated frame between each two\n"
+               "framegen = %d\n",
             s_vs.mode, s_vs.res_w, s_vs.res_h, s_vs.aspect, s_vs.scale, s_vs.filter, s_vs.vsync,
-            s_vs.brightness, s_vs.gamma, s_vs.crop, s_vs.show_fps, s_vs.aniso, s_vs.fps_limit, s_vs.widescreen, s_vs.lighting, s_vs.renderer, s_vs.upscaler);
+            s_vs.brightness, s_vs.gamma, s_vs.crop, s_vs.show_fps, s_vs.aniso, s_vs.fps_limit, s_vs.widescreen, s_vs.lighting, s_vs.renderer, s_vs.upscaler, s_vs.framegen);
     fclose(f);
 }
 
@@ -329,6 +333,8 @@ static int pr_init(void)
         if (e && atoi(e) >= 1 && atoi(e) <= 16) s_vs.scale = atoi(e);
         e = getenv("NFL2K5_UPSCALER");       /* likewise for the upscaler (0-5) */
         if (e && atoi(e) >= 0 && atoi(e) <= 5) s_vs.upscaler = atoi(e);
+        e = getenv("NFL2K5_FRAMEGEN");       /* and frame generation (0/1) */
+        if (e) s_vs.framegen = atoi(e) != 0;
     }
     g_render_scale = (uint32_t)s_vs.scale;
     g_aniso = (uint32_t)s_vs.aniso;
@@ -708,7 +714,7 @@ static void pr_draw_hud(float gx, float gy, float gw, float gh)
 /* ---- the settings page -------------------------------------------------- */
 
 enum { MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_LIGHTING, MI_FILTER, MI_VSYNC, MI_BRIGHT, MI_GAMMA, MI_CROP,
-       MI_ANISO, MI_FPS, MI_LIMIT, MI_API, MI_UPSCALE, MI_RESET, MI_CLOSE, MI_COUNT };
+       MI_ANISO, MI_FPS, MI_LIMIT, MI_API, MI_UPSCALE, MI_FRAMEGEN, MI_RESET, MI_CLOSE, MI_COUNT };
 static const char *const k_upscaler_names[] = { "Off", "FSR 3 Native AA", "FSR 3 Quality", "FSR 3 Balanced",
                                                  "FSR 3 Performance", "FSR 3 Ultra Performance" };
 static const float k_upscaler_ratio[] = { 1.0f, 1.0f, 1.5f, 1.7f, 2.0f, 3.0f };
@@ -757,6 +763,9 @@ static void menu_label(int item, char *name, char *val, size_t n)
     case MI_UPSCALE: strcpy(name, "Upscaling");
                     snprintf(val, n, "%s%s", k_upscaler_names[s_vs.upscaler % 6],
                              s_vs.upscaler && !gxs_fsr_available() ? "  (Direct3D 12 only)" : ""); break;
+    case MI_FRAMEGEN: strcpy(name, "Frame generation");
+                    snprintf(val, n, "%s%s", s_vs.framegen ? "FSR 3 (2x frames)" : "Off",
+                             s_vs.framegen && !gxs_fsr_available() ? "  (Direct3D 12 only)" : ""); break;
     case MI_RESET:  strcpy(name, "Reset to defaults"); break;
     case MI_CLOSE:  strcpy(name, "Close  (F1 / Esc)"); break;
     default:        name[0] = 0; break;
@@ -795,6 +804,7 @@ static void menu_change(int item, int dir)
                       fps_limit_changed(); } break;
     case MI_API:    s_vs.renderer = (s_vs.renderer + 3 + dir) % 3; break;
     case MI_UPSCALE: s_vs.upscaler = (s_vs.upscaler + 6 + dir) % 6; break;
+    case MI_FRAMEGEN: s_vs.framegen = !s_vs.framegen; break;
     default: return;
     }
     s_pr.ovl_valid = 0;
@@ -807,6 +817,7 @@ static void menu_activate(int item)
         VideoSettings d = { VM_BORDERLESS, 1920, 1080, AR_ORIGINAL, 3, SF_ENHANCED, 1, 100, 100, 0, 0, 8, 0, 1 };
         d.renderer = s_vs.renderer;          /* the API is not a picture setting */
         d.upscaler = s_vs.upscaler;
+        d.framegen = s_vs.framegen;
         s_vs = d;
         InterlockedExchange(&s_vs_dirty, 1);
         vs_save();
@@ -851,7 +862,7 @@ static int menu_rows(void) { int n = menu_page()->count(); return n > 0 ? n : 1;
  * game thread: changes mark the swap chain for re-applying on the next flip
  * and are saved at once. */
 static const int k_vm_items[] = { MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_LIGHTING, MI_FILTER, MI_VSYNC,
-                                  MI_BRIGHT, MI_GAMMA, MI_CROP, MI_ANISO, MI_FPS, MI_LIMIT, MI_API, MI_UPSCALE };
+                                  MI_BRIGHT, MI_GAMMA, MI_CROP, MI_ANISO, MI_FPS, MI_LIMIT, MI_API, MI_UPSCALE, MI_FRAMEGEN };
 #define VM_COUNT ((int)(sizeof k_vm_items / sizeof k_vm_items[0]))
 static const int k_vm_aniso[] = { 1, 2, 4, 8, 16 };
 
@@ -861,13 +872,14 @@ const char *xbox_VideoSettingName(int i)
 {
     static const char *names[] = { "Display Mode", "Resolution", "Widescreen", "Aspect Ratio", "Render Scale", "Lighting & Materials",
                                    "Upscaling Filter", "VSync", "Brightness", "Gamma",
-                                   "Overscan Crop", "Texture Filtering", "Show FPS", "Frame Rate Cap", "Graphics API", "Upscaling" };
+                                   "Overscan Crop", "Texture Filtering", "Show FPS", "Frame Rate Cap", "Graphics API", "Upscaling", "Frame Generation" };
     return (i >= 0 && i < VM_COUNT) ? names[i] : "";
 }
 
 int xbox_VideoSettingIsToggle(int i)
 {
-    return i >= 0 && i < VM_COUNT && (k_vm_items[i] == MI_VSYNC || k_vm_items[i] == MI_FPS || k_vm_items[i] == MI_WIDE);
+    return i >= 0 && i < VM_COUNT && (k_vm_items[i] == MI_VSYNC || k_vm_items[i] == MI_FPS || k_vm_items[i] == MI_WIDE ||
+                                          k_vm_items[i] == MI_FRAMEGEN);
 }
 
 int xbox_VideoSettingValues(int i)
@@ -886,6 +898,7 @@ int xbox_VideoSettingValues(int i)
     case MI_LIMIT:  return FPS_LIMITS;
     case MI_API:    return 3;
     case MI_UPSCALE: return 6;
+    case MI_FRAMEGEN: return 2;
     }
     return 1;
 }
@@ -920,6 +933,7 @@ static int vm_get(const VideoSettings *vs, int item)
         return 3;
     case MI_API:    return vs->renderer;
     case MI_UPSCALE: return vs->upscaler;
+    case MI_FRAMEGEN: return vs->framegen;
     }
     return 0;
 }
@@ -943,6 +957,7 @@ static void vm_set(VideoSettings *vs, int item, int idx)
     case MI_LIMIT:  vs->fps_limit = k_fps_limits[idx % FPS_LIMITS]; break;
     case MI_API:    vs->renderer = idx % 3; break;
     case MI_UPSCALE: vs->upscaler = idx % 6; break;
+    case MI_FRAMEGEN: vs->framegen = idx != 0; break;
     }
 }
 
@@ -978,6 +993,7 @@ void xbox_VideoSettingValueName(int i, int idx, char *buf, size_t n)
     case MI_API:    snprintf(buf, n, "%s%s", k_api_names[v.renderer % 3],
                              strcmp(k_api_names[v.renderer % 3], gx_backend_name()) ? " (restart)" : ""); break;
     case MI_UPSCALE: snprintf(buf, n, "%s", k_upscaler_names[v.upscaler % 6]); break;
+    case MI_FRAMEGEN: snprintf(buf, n, "%s", v.framegen ? "FSR 3 (2x)" : "Off"); break;
     }
 }
 
@@ -1479,11 +1495,11 @@ static int pr_present(uint32_t guest)
     if (InterlockedExchange(&s_vs_dirty, 0))
         pr_apply_mode();
     g_render_scale = (uint32_t)s_vs.scale;     /* surfaces follow on their next use */
-    if (s_vs.upscaler && gxs_fsr_available() && s_fsr_out_h) {
+    if ((s_vs.upscaler || s_vs.framegen) && gxs_fsr_available() && s_fsr_out_h) {
         /* FSR 3: render at the on-screen size over the quality ratio (the
          * internal-resolution setting does not apply), rounded to a whole
          * multiple of the guest's 480 lines */
-        float want = (float)s_fsr_out_h / k_upscaler_ratio[s_vs.upscaler % 6] / (float)s->h;
+        float want = (float)s_fsr_out_h / k_upscaler_ratio[(s_vs.upscaler ? s_vs.upscaler : 1) % 6] / (float)s->h;
         uint32_t r = (uint32_t)(want + 0.5f);
         g_render_scale = r < 1 ? 1 : r > 16 ? 16 : r;
     }
@@ -1493,7 +1509,7 @@ static int pr_present(uint32_t guest)
     g_wide_ar = s_ana_ar > 0.0f ? 0.0f : pr_wanted_wide_ar();
     menu_pad();
 
-    ID3D11Texture2D *shown = s->tex;
+    ID3D11Texture2D *shown = s->tex, *generated = NULL;
     {
         /* A widescreen surface is wider than the guest's: it is shown whole,
          * and its proportions follow from its width. */
@@ -1524,7 +1540,7 @@ static int pr_present(uint32_t guest)
          * straight to the size the picture has on screen (render size: that
          * over the quality ratio, see g_render_scale above). */
         {
-            static ID3D11Texture2D *fsr_out;
+            static ID3D11Texture2D *fsr_out, *fsr_gen;
             static UINT fsr_w, fsr_h, fsr_rw;
             static float jx, jy;                 /* jitter this frame was rendered with (pixels) */
             static LARGE_INTEGER last;
@@ -1532,7 +1548,8 @@ static int pr_present(uint32_t guest)
             D3D11_TEXTURE2D_DESC td;
             ID3D11Texture2D_GetDesc(s->tex, &td);
             QueryPerformanceCounter(&t);
-            if (s_vs.upscaler && s->mv && s->dz && gxs_fsr_available() && pc.src[2] > 0.0f && pc.src[3] > 0.0f) {
+            if ((s_vs.upscaler || s_vs.framegen) && s->mv && s->dz && gxs_fsr_available() && pc.src[2] > 0.0f &&
+                pc.src[3] > 0.0f) {
                 UINT ow = (UINT)(dw / pc.src[2] + 0.5f), oh = (UINT)(dh / pc.src[3] + 0.5f);
                 float dt = last.QuadPart ? (float)((t.QuadPart - last.QuadPart) * 1000.0 / s_pr.freq.QuadPart) : 16.7f;
                 if (ow > 16384u) ow = 16384u;
@@ -1547,11 +1564,18 @@ static int pr_present(uint32_t guest)
                     od.Format = DXGI_FORMAT_R8G8B8A8_UNORM; od.SampleDesc.Count = 1;
                     od.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
                     ID3D11Device_CreateTexture2D(s_gpu11.dev, &od, NULL, &fsr_out);
+                    if (fsr_gen) ID3D11Texture2D_Release(fsr_gen);
+                    fsr_gen = NULL;
+                    ID3D11Device_CreateTexture2D(s_gpu11.dev, &od, NULL, &fsr_gen);
                     fsr_w = ow; fsr_h = oh;
                 }
-                if (fsr_out && ow >= td.Width / 2u && gxs_fsr_upscale(s->tex, s->dz, s->mv, s->rx, fsr_out, td.Width,
-                                                                     td.Height, ow, oh, jx, jy, dt, fsr_rw != td.Width, 0.25f))
+                if (fsr_out && ow >= td.Width / 2u &&
+                    gxs_fsr_upscale(s->tex, s->dz, s->mv, s->rx, fsr_out, s_vs.framegen ? fsr_gen : NULL, td.Width,
+                                    td.Height, ow, oh, jx, jy, dt, fsr_rw != td.Width, 0.25f)) {
                     shown = fsr_out;
+                    if (s_vs.framegen && fsr_gen && fsr_rw == td.Width)
+                        generated = fsr_gen;          /* not on the first frame after a change */
+                }
                 fsr_rw = td.Width;
                 gxs_fsr_jitter(td.Width, ow, &jx, &jy);  /* the next frame's offset */
                 gxs_set_jitter(2.0f * jx / (float)td.Width, -2.0f * jy / (float)td.Height);
@@ -1577,12 +1601,30 @@ static int pr_present(uint32_t guest)
             return 0;
         pc.sz[2] = dw; pc.sz[3] = dh;
     }
+    /* Frame generation: the generated frame is composed exactly like the
+     * real one (picture, HUD, overlays) into a second back buffer, presented
+     * first; the real frame follows half an interval later (gx_sdl.c). */
+    ID3D11ShaderResourceView *gen_srv = NULL;
+    ID3D11RenderTargetView *gen_rtv = NULL;
+    if (generated) {
+        ID3D11Texture2D *bb2 = NULL;
+        if (FAILED(ID3D11Device_CreateShaderResourceView(s_gpu11.dev, (ID3D11Resource *)generated, NULL, &gen_srv)) ||
+            FAILED(gxs_swapchain_bb2(s_pr.sc, &bb2)) ||
+            FAILED(ID3D11Device_CreateRenderTargetView(s_gpu11.dev, (ID3D11Resource *)bb2, NULL, &gen_rtv))) {
+            if (gen_srv) ID3D11ShaderResourceView_Release(gen_srv);
+            gen_srv = NULL;
+        }
+        if (bb2) ID3D11Texture2D_Release(bb2);
+    }
+    for (int pass = gen_srv && gen_rtv ? 0 : 1; pass < 2; pass++) {
+    ID3D11RenderTargetView *target = pass ? s_pr.bb_rtv : gen_rtv;
+    ID3D11ShaderResourceView *pic = pass ? srv : gen_srv;
     if (SUCCEEDED(ID3D11DeviceContext_Map(s_gpu11.ctx, (ID3D11Resource *)s_pr.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
         memcpy(m.pData, &pc, sizeof pc);
         ID3D11DeviceContext_Unmap(s_gpu11.ctx, (ID3D11Resource *)s_pr.cb, 0);
     }
-    ID3D11DeviceContext_OMSetRenderTargets(s_gpu11.ctx, 1, &s_pr.bb_rtv, NULL);
-    ID3D11DeviceContext_ClearRenderTargetView(s_gpu11.ctx, s_pr.bb_rtv, clear);
+    ID3D11DeviceContext_OMSetRenderTargets(s_gpu11.ctx, 1, &target, NULL);
+    ID3D11DeviceContext_ClearRenderTargetView(s_gpu11.ctx, target, clear);
     vp.TopLeftX = dx; vp.TopLeftY = dy; vp.Width = dw; vp.Height = dh; vp.MinDepth = 0; vp.MaxDepth = 1;
     ID3D11DeviceContext_RSSetViewports(s_gpu11.ctx, 1, &vp);
     {
@@ -1598,7 +1640,7 @@ static int pr_present(uint32_t guest)
     ID3D11DeviceContext_GSSetShader(s_gpu11.ctx, NULL, NULL, 0);
     ID3D11DeviceContext_PSSetShader(s_gpu11.ctx, s_pr.ps, NULL, 0);
     ID3D11DeviceContext_PSSetConstantBuffers(s_gpu11.ctx, 0, 1, &s_pr.cb);
-    ID3D11DeviceContext_PSSetShaderResources(s_gpu11.ctx, 0, 1, &srv);
+    ID3D11DeviceContext_PSSetShaderResources(s_gpu11.ctx, 0, 1, &pic);
     {
         ID3D11SamplerState *smp[2] = { s_pr.lin, s_pr.pt };
         ID3D11DeviceContext_PSSetSamplers(s_gpu11.ctx, 0, 2, smp);
@@ -1653,7 +1695,10 @@ static int pr_present(uint32_t guest)
         ID3D11ShaderResourceView *none = NULL;
         ID3D11DeviceContext_PSSetShaderResources(s_gpu11.ctx, 0, 1, &none);
     }
+    }   /* the two compositions */
     ID3D11ShaderResourceView_Release(srv);
+    if (gen_srv) ID3D11ShaderResourceView_Release(gen_srv);
+    if (gen_rtv) ID3D11RenderTargetView_Release(gen_rtv);
     pr_present_shot();
     pr_record();
     pr_frame_limit();
@@ -1664,7 +1709,8 @@ static int pr_present(uint32_t guest)
         /* Tearing is only allowed with VSync off and not in exclusive
          * fullscreen (DXGI rejects the flag there). */
         IDXGISwapChain1_Present(s_pr.sc, s_vs.vsync ? 1u : 0u,
-                                (!s_vs.vsync && s_pr.tearing && s_vs.mode != VM_FULLSCREEN) ? DXGI_PRESENT_ALLOW_TEARING : 0);
+                                ((!s_vs.vsync && s_pr.tearing && s_vs.mode != VM_FULLSCREEN) ? DXGI_PRESENT_ALLOW_TEARING : 0) |
+                                (gen_srv ? GX_PRESENT_PAIR : 0));
         QueryPerformanceCounter(&b);
         perf_on_present(s_vs.scale, (float)((double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)s_perf.freq.QuadPart));
         QueryPerformanceFrequency(&fq);

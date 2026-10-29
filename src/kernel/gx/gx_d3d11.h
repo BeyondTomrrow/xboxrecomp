@@ -54,6 +54,11 @@ void gxs_buffer_written(ID3D11Buffer *buf, UINT lo, UINT hi);
 /* 1 when the next vertex-program draws have last frame's constants bound at
  * b3 (motion vectors); 0 makes them report no motion. */
 void gxs_set_pull_mv(UINT on);
+/* Frame generation: the swap chain's second back buffer (the generated
+ * frame is composed into it), and the Present flag that shows it first and
+ * the real back buffer half a frame interval later. */
+HRESULT gxs_swapchain_bb2(IDXGISwapChain1 *sc, ID3D11Texture2D **out);
+#define GX_PRESENT_PAIR 0x40000000u
 /* FSR 3 upscaling (Direct3D 12, gx_ffx.cpp). gxs_set_jitter: the camera's
  * sub-pixel offset for the next 3D draws, in clip units. gxs_fsr_upscale
  * submits the frame so far, then upscales colour into out (an R8G8B8A8
@@ -62,7 +67,7 @@ void gxs_set_jitter(float x, float y);
 int gxs_fsr_available(void);
 void gxs_fsr_jitter(UINT rw, UINT ow, float *jx, float *jy);
 int gxs_fsr_upscale(ID3D11Texture2D *color, ID3D11Texture2D *depth, ID3D11Texture2D *mv, ID3D11Texture2D *reactive,
-                    ID3D11Texture2D *out,
+                    ID3D11Texture2D *out, ID3D11Texture2D *generated,
                     UINT rw, UINT rh, UINT ow, UINT oh, float jx, float jy, float dt_ms, int reset, float sharpness);
 /* The swap chain on the framebuffer window (claimed from its thread). NULL
  * until the window is claimed. */

@@ -101,7 +101,7 @@ typedef struct { GxObj o; D3D11_DEPTH_STENCIL_DESC d; } GxDss;
 typedef struct { GxObj o; D3D11_RASTERIZER_DESC d; } GxRs;
 typedef struct { GxObj o; SDL_GPUSampler *s; } GxSmp;
 typedef struct { GxObj o; void *p; size_t n; } GxBlob;
-typedef struct { GxObj o; GxTex *bb; } GxSwap;
+typedef struct { GxObj o; GxTex *bb, *bb2; } GxSwap;
 
 /* The compiled-shader blob gx_D3DCompile hands out (and the pixel-shader
  * cache stores): this header, then the SPIR-V or DXIL. */
@@ -188,6 +188,7 @@ static struct {
     volatile LONG claimed;                /* 1 claimed, -1 failed */
     SDL_GPUTextureFormat depth_fmt;
     CRITICAL_SECTION create_lock;         /* object creation from worker threads */
+    CRITICAL_SECTION submit_lock;         /* recording/submitting: game thread vs the frame pacer (recursive) */
     volatile LONG shader_ids;
     SDL_GPUTexture *white;                /* bound where a slot has no texture */
     SDL_GPUTexture *white_cube;
@@ -276,6 +277,7 @@ static int gx_sdl_init(int backend)
         return 0;
     }
     InitializeCriticalSection(&G.create_lock);
+    InitializeCriticalSection(&G.submit_lock);
     G.depth_fmt = SDL_GPUTextureSupportsFormat(G.dev, SDL_GPU_TEXTUREFORMAT_D32_FLOAT_S8_UINT, SDL_GPU_TEXTURETYPE_2D,
                                                SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET)
                       ? SDL_GPU_TEXTUREFORMAT_D32_FLOAT_S8_UINT : SDL_GPU_TEXTUREFORMAT_D24_UNORM_S8_UINT;
@@ -1246,14 +1248,15 @@ void gxs_fsr_jitter(UINT rw, UINT ow, float *jx, float *jy)
 }
 
 int gxs_fsr_upscale(ID3D11Texture2D *color, ID3D11Texture2D *depth, ID3D11Texture2D *mv, ID3D11Texture2D *reactive,
-                    ID3D11Texture2D *out,
+                    ID3D11Texture2D *out, ID3D11Texture2D *generated,
                     UINT rw, UINT rh, UINT ow, UINT oh, float jx, float jy, float dt_ms, int reset, float sharpness)
 {
     GxTex *c = (GxTex *)color, *d = (GxTex *)depth, *m = (GxTex *)mv, *o = (GxTex *)out, *r = (GxTex *)reactive;
     if (!gxs_fsr_available() || !c || !d || !m || !o || !c->t || !d->t || !m->t || !o->t)
         return 0;
     flush(1);           /* the frame's rendering goes first on the queue; FSR follows it */
-    return gxf_upscale(c->t, d->t, m->t, r ? r->t : NULL, o->t, rw, rh, ow, oh, jx, jy, dt_ms, reset, sharpness);
+    return gxf_upscale(c->t, d->t, m->t, r ? r->t : NULL, o->t, generated ? ((GxTex *)generated)->t : NULL,
+                       rw, rh, ow, oh, jx, jy, dt_ms, reset, sharpness);
 }
 
 void gxs_set_pull(ID3D11Buffer *vb, UINT first, UINT tri_mode, float w_buffer)
@@ -1561,7 +1564,9 @@ HRESULT gxs_ID3D11DeviceContext_Map(void *c, ID3D11Resource *r, UINT sub, D3D11_
             if (t->dl_flush) flush(1);                      /* its download is still in the list */
             if (t->dl_fence) {
                 double w0 = qpc_ms();
+                EnterCriticalSection(&G.submit_lock);
                 SDL_WaitForGPUFences(G.dev, true, &t->dl_fence->f, 1);
+                LeaveCriticalSection(&G.submit_lock);
                 s_st.waits++;
                 s_st.wait_ms += qpc_ms() - w0;
                 fence_release(t->dl_fence);
@@ -1820,7 +1825,19 @@ static void replay(SDL_GPUCommandBuffer *cb, uint32_t up_base)
 
 /* Record everything listed into the command buffer; with submit, also send it
  * (and keep its fence for the read-backs it carries). */
+static void flush_locked(int submit);
+
+/* SDL_GPU is not safe for one thread to acquire a swap-chain texture while
+ * another submits (crashed in D3D12_WaitForFences with the frame pacer,
+ * 2026-10-29): every recording and submission takes this lock. */
 static void flush(int submit)
+{
+    EnterCriticalSection(&G.submit_lock);
+    flush_locked(submit);
+    LeaveCriticalSection(&G.submit_lock);
+}
+
+static void flush_locked(int submit)
 {
     uint32_t total, vb_off[16], i, up_base = 0;
     double t0 = qpc_ms();
@@ -1950,7 +1967,12 @@ static int gx_presenter(void *window, int letterbox)
     return 1;
 }
 
-static void swap_destroy(GxObj *o) { gxs_obj_Release(((GxSwap *)o)->bb); s_swap = NULL; }
+static void swap_destroy(GxObj *o)
+{
+    gxs_obj_Release(((GxSwap *)o)->bb);
+    gxs_obj_Release(((GxSwap *)o)->bb2);
+    s_swap = NULL;
+}
 
 static GxTex *make_bb(int w, int h)
 {
@@ -1984,9 +2006,88 @@ IDXGISwapChain1 *gxs_swapchain(void *sdl_window, int *out_w, int *out_h)
     return (IDXGISwapChain1 *)s_swap;
 }
 
+/* ---- frame pacing for frame generation ----------------------------------
+ * The generated frame is presented at once; the real one waits on this
+ * thread until half a frame interval later, so the game thread goes on with
+ * the next frame. The game thread waits for it (pacer_wait) before it uses
+ * the swap chain or the back buffer again. */
+static struct {
+    HANDLE thread, go, done, timer;
+    volatile LONG busy;
+    GxTex *bb;
+    LONGLONG due;
+    LARGE_INTEGER fq;
+} PC;
+
+static DWORD WINAPI pacer_main(LPVOID arg)
+{
+    (void)arg;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    for (;;) {
+        LARGE_INTEGER now;
+        SDL_GPUCommandBuffer *cb;
+        SDL_GPUTexture *sct = NULL;
+        Uint32 w = 0, h = 0;
+        WaitForSingleObject(PC.go, INFINITE);
+        for (;;) {                                 /* high-resolution sleep, then spin the last bit */
+            LONGLONG left;
+            QueryPerformanceCounter(&now);
+            left = PC.due - now.QuadPart;
+            if (left <= 0) break;
+            if (left * 1000 / PC.fq.QuadPart >= 2 && PC.timer) {
+                LARGE_INTEGER rel;
+                rel.QuadPart = -((left - PC.fq.QuadPart / 1000) * 10000000 / PC.fq.QuadPart);
+                SetWaitableTimer(PC.timer, &rel, 0, NULL, NULL, FALSE);
+                WaitForSingleObject(PC.timer, 50);
+            } else
+                YieldProcessor();
+        }
+        EnterCriticalSection(&G.submit_lock);
+        cb = SDL_AcquireGPUCommandBuffer(G.dev);
+        if (cb) {
+            if (SDL_WaitAndAcquireGPUSwapchainTexture(cb, G.win, &sct, &w, &h) && sct && PC.bb && PC.bb->t) {
+                SDL_GPUBlitInfo bi;
+                memset(&bi, 0, sizeof bi);
+                bi.source.texture = PC.bb->t; bi.source.w = PC.bb->d.Width; bi.source.h = PC.bb->d.Height;
+                bi.destination.texture = sct; bi.destination.w = w; bi.destination.h = h;
+                bi.load_op = SDL_GPU_LOADOP_DONT_CARE;
+                bi.filter = SDL_GPU_FILTER_LINEAR;
+                SDL_BlitGPUTexture(cb, &bi);
+            }
+            SDL_SubmitGPUCommandBuffer(cb);
+        }
+        LeaveCriticalSection(&G.submit_lock);
+        InterlockedExchange(&PC.busy, 0);
+        SetEvent(PC.done);
+    }
+}
+
+static void pacer_wait(void)
+{
+    if (PC.busy)
+        WaitForSingleObject(PC.done, 200);
+}
+
+HRESULT gxs_swapchain_bb2(IDXGISwapChain1 *sc, ID3D11Texture2D **out)
+{
+    GxSwap *sw = (GxSwap *)sc;
+    *out = NULL;
+    if (!sw || !sw->bb) return E_FAIL;
+    if (!sw->bb2 || sw->bb2->d.Width != sw->bb->d.Width || sw->bb2->d.Height != sw->bb->d.Height) {
+        pacer_wait();
+        if (sw->bb2) gxs_obj_Release(sw->bb2);
+        sw->bb2 = make_bb((int)sw->bb->d.Width, (int)sw->bb->d.Height);
+        if (!sw->bb2) return E_OUTOFMEMORY;
+    }
+    gxs_obj_AddRef(sw->bb2);
+    *out = (ID3D11Texture2D *)sw->bb2;
+    return S_OK;
+}
+
 HRESULT gxs_IDXGISwapChain1_ResizeBuffers(void *s, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT flags)
 {
     GxSwap *sw = (GxSwap *)s;
+    pacer_wait();
     (void)n; (void)f; (void)flags;
     if (!w || !h) return E_INVALIDARG;
     if (sw->bb && sw->bb->d.Width == w && sw->bb->d.Height == h) return S_OK;
@@ -2018,9 +2119,12 @@ HRESULT gxs_IDXGISwapChain1_Present(void *s, UINT sync, UINT flags)
     GxSwap *sw = (GxSwap *)s;
     SDL_GPUTexture *sct = NULL;
     Uint32 w = 0, h = 0;
-    int mode = sync ? 0 : 1;
-    (void)flags;
+    int mode = sync ? 0 : 1, pair = (flags & GX_PRESENT_PAIR) && sw->bb2;
+    static LARGE_INTEGER last_pair;
+    static double interval;                     /* real frames, ms (smoothed) */
+    pacer_wait();
     if (!G.win || !sw->bb) { flush(1); return S_OK; }
+    EnterCriticalSection(&G.submit_lock);
     if (mode != G.present_mode) {
         SDL_GPUPresentMode pm = SDL_GPU_PRESENTMODE_VSYNC;
         if (mode == 1) {
@@ -2033,14 +2137,54 @@ HRESULT gxs_IDXGISwapChain1_Present(void *s, UINT sync, UINT flags)
     flush(0);
     if (s_cb && SDL_WaitAndAcquireGPUSwapchainTexture(s_cb, G.win, &sct, &w, &h) && sct) {
         SDL_GPUBlitInfo bi;
+        GxTex *first = pair ? sw->bb2 : sw->bb;
         memset(&bi, 0, sizeof bi);
-        bi.source.texture = sw->bb->t; bi.source.w = sw->bb->d.Width; bi.source.h = sw->bb->d.Height;
+        bi.source.texture = first->t; bi.source.w = first->d.Width; bi.source.h = first->d.Height;
         bi.destination.texture = sct; bi.destination.w = w; bi.destination.h = h;
         bi.load_op = SDL_GPU_LOADOP_DONT_CARE;
         bi.filter = SDL_GPU_FILTER_LINEAR;
         SDL_BlitGPUTexture(s_cb, &bi);
     }
     flush(1);
+    if (pair) {
+        LARGE_INTEGER now;
+        if (!PC.thread) {
+            QueryPerformanceFrequency(&PC.fq);
+            PC.go = CreateEventA(NULL, FALSE, FALSE, NULL);
+            PC.done = CreateEventA(NULL, FALSE, FALSE, NULL);
+            PC.timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+            PC.thread = CreateThread(NULL, 0, pacer_main, NULL, 0, NULL);
+        }
+        QueryPerformanceCounter(&now);
+        if (last_pair.QuadPart) {
+            double ms = (double)(now.QuadPart - last_pair.QuadPart) * 1000.0 / (double)PC.fq.QuadPart;
+            if (ms > 4.0 && ms < 100.0) interval = interval > 0.0 ? interval * 0.9 + ms * 0.1 : ms;
+        }
+        last_pair = now;
+        if (getenv("RECOMP_FG_NOPACER") && interval > 0.0) {      /* diagnostics: no pacing thread */
+            SDL_GPUCommandBuffer *cb = SDL_AcquireGPUCommandBuffer(G.dev);
+            SDL_GPUTexture *t2 = NULL;
+            Uint32 w2 = 0, h2 = 0;
+            if (cb && SDL_WaitAndAcquireGPUSwapchainTexture(cb, G.win, &t2, &w2, &h2) && t2) {
+                SDL_GPUBlitInfo bi;
+                memset(&bi, 0, sizeof bi);
+                bi.source.texture = sw->bb->t; bi.source.w = sw->bb->d.Width; bi.source.h = sw->bb->d.Height;
+                bi.destination.texture = t2; bi.destination.w = w2; bi.destination.h = h2;
+                bi.load_op = SDL_GPU_LOADOP_DONT_CARE;
+                bi.filter = SDL_GPU_FILTER_LINEAR;
+                SDL_BlitGPUTexture(cb, &bi);
+            }
+            if (cb) SDL_SubmitGPUCommandBuffer(cb);
+        } else
+        if (PC.thread && interval > 0.0) {
+            PC.bb = getenv("RECOMP_FG_ONLY") ? sw->bb2 : sw->bb;     /* diagnostics: generated frames only */
+            PC.due = now.QuadPart + (LONGLONG)(interval * 0.5 * (double)PC.fq.QuadPart / 1000.0);
+            InterlockedExchange(&PC.busy, 1);
+            SetEvent(PC.go);
+        }
+    } else
+        last_pair.QuadPart = 0;
+    LeaveCriticalSection(&G.submit_lock);
     if (++s_st.frames == 300) {
         fprintf(stderr, "  [GX] per frame: %.0f draws, %.1f render passes, %.1f copy passes, %.1f copies, %.1f uploads, "
                 "%.2f downloads, %.2f submits, %.2f GPU waits (%.2f ms), flush %.2f ms, new pipelines %.2f ms, "
