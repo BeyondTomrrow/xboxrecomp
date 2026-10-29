@@ -18,6 +18,7 @@
 #include "kernel.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #if !defined(_WIN32)
 #include <fcntl.h>
@@ -193,8 +194,20 @@ NTSTATUS __stdcall xbox_NtCreateFile(
             xbox_share_to_win32(ShareAccess), NULL, OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS, NULL);
     } else {
-        if ((CreateOptions & XBOX_FILE_NO_INTERMEDIATE_BUFFERING) && !xbox_overlay_wants(win_path))
-            flags_and_attrs |= FILE_FLAG_NO_BUFFERING;
+        /* The title opens its data unbuffered, as an Xbox streams from DVD.
+         * Passed on to Windows that bypassed the file cache: every read of the
+         * packed data went to the disk, ~0.5 s each from a USB hard disk, with
+         * the game waiting (2026-10-29). The cache is used now; opens that can
+         * write (saves, the utility-drive cache) write through to the disk so
+         * what the title wrote is still on disk if the process dies.
+         * RECOMP_NO_BUFFERING=1 restores the old flag. */
+        if ((CreateOptions & XBOX_FILE_NO_INTERMEDIATE_BUFFERING) && !xbox_overlay_wants(win_path)) {
+            if (getenv("RECOMP_NO_BUFFERING"))
+                flags_and_attrs |= FILE_FLAG_NO_BUFFERING;
+            else if (xbox_access_to_win32(DesiredAccess) &
+                     (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA | FILE_APPEND_DATA))
+                flags_and_attrs |= FILE_FLAG_WRITE_THROUGH;
+        }
         if (FileAttributes & XBOX_FILE_ATTRIBUTE_READONLY)
             flags_and_attrs |= FILE_ATTRIBUTE_READONLY;
         h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
@@ -239,6 +252,100 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     return STATUS_SUCCESS;
 }
 
+/* ---- warming the file cache (2026-10-29) ----------------------------------
+ * The title reads its packed data (vc_53450030\0..G, ~6 GB) in small pieces
+ * at random places during play. From a USB hard disk one 20 KB read took up
+ * to 0.76 s, and the game thread waited for it: a frozen frame mid-play.
+ * This thread reads those files once, front to back, at background I/O
+ * priority, so Windows keeps them in its file cache and play reads come from
+ * RAM. Only when free memory is ample (twice the data plus 4 GB); on an SSD
+ * it finishes in seconds. NFL2K5_NO_PREFETCH=1 turns it off. */
+static wchar_t s_prefetch_root[MAX_PATH];
+
+static ULONGLONG prefetch_dir(const wchar_t *dir, int read, void *buf, size_t cap)
+{
+    wchar_t pat[MAX_PATH + 4];
+    WIN32_FIND_DATAW fd;
+    HANDLE f;
+    ULONGLONG total = 0;
+    _snwprintf(pat, MAX_PATH + 3, L"%s\\*", dir);
+    f = FindFirstFileW(pat, &fd);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    do {
+        wchar_t path[MAX_PATH];
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        total += ((ULONGLONG)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+        if (!read) continue;
+        _snwprintf(path, MAX_PATH - 1, L"%s\\%s", dir, fd.cFileName);
+        path[MAX_PATH - 1] = 0;
+        {
+            /* No FILE_FLAG_SEQUENTIAL_SCAN: it tells the cache the data will not
+             * be read again, and the pages were the first to be reused. */
+            HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+            FILE_IO_PRIORITY_HINT_INFO hint;
+            DWORD got;
+            if (h == INVALID_HANDLE_VALUE) continue;
+            hint.PriorityHint = IoPriorityHintLow;      /* the game's own reads go first */
+            SetFileInformationByHandle(h, FileIoPriorityHintInfo, &hint, sizeof hint);
+            while (ReadFile(h, buf, (DWORD)cap, &got, NULL) && got) {}
+            CloseHandle(h);
+        }
+    } while (FindNextFileW(f, &fd));
+    FindClose(f);
+    return total;
+}
+
+static DWORD WINAPI prefetch_thread(LPVOID arg)
+{
+    static const wchar_t *const dirs[] = { L"vc_53450030", L"CACHE", L"" };
+    MEMORYSTATUSEX ms;
+    ULONGLONG need = 0;
+    size_t i, cap = 4u << 20;
+    void *buf;
+    DWORD t0 = GetTickCount();
+    (void)arg;
+    for (i = 0; i < sizeof dirs / sizeof dirs[0]; i++) {
+        wchar_t d[MAX_PATH];
+        _snwprintf(d, MAX_PATH - 1, dirs[i][0] ? L"%s\\%s" : L"%s%s", s_prefetch_root, dirs[i]);
+        d[MAX_PATH - 1] = 0;
+        need += prefetch_dir(d, 0, NULL, 0);
+    }
+    memset(&ms, 0, sizeof ms);
+    ms.dwLength = sizeof ms;
+    if (!GlobalMemoryStatusEx(&ms) || ms.ullAvailPhys < need * 2 + (4ull << 30)) {
+        fprintf(stderr, "  [PREFETCH] skipped: %llu MB of data, %llu MB free\n",
+                need >> 20, ms.ullAvailPhys >> 20);
+        return 0;
+    }
+    buf = VirtualAlloc(NULL, cap, MEM_COMMIT, PAGE_READWRITE);
+    if (!buf) return 0;
+    /* Not THREAD_MODE_BACKGROUND_BEGIN: besides low I/O priority it gives the
+     * pages read the lowest memory priority, and Windows dropped them from its
+     * cache first (0.5 s misses after the warm-up, 2026-10-29). Low I/O
+     * priority is set per handle above instead. */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    for (i = 0; i < sizeof dirs / sizeof dirs[0]; i++) {
+        wchar_t d[MAX_PATH];
+        _snwprintf(d, MAX_PATH - 1, dirs[i][0] ? L"%s\\%s" : L"%s%s", s_prefetch_root, dirs[i]);
+        d[MAX_PATH - 1] = 0;
+        prefetch_dir(d, 1, buf, cap);
+    }
+    VirtualFree(buf, 0, MEM_RELEASE);
+    fprintf(stderr, "  [PREFETCH] %llu MB of game data cached in %lu s\n", need >> 20, (GetTickCount() - t0) / 1000);
+    return 0;
+}
+
+void xbox_PrefetchGameData(const char *root)
+{
+    const char *off = getenv("NFL2K5_NO_PREFETCH");
+    HANDLE t;
+    if (!root || (off && *off == '1')) return;
+    MultiByteToWideChar(CP_UTF8, 0, root, -1, s_prefetch_root, MAX_PATH);
+    t = CreateThread(NULL, 0, prefetch_thread, NULL, 0, NULL);
+    if (t) CloseHandle(t);
+}
+
 /* Time and bytes spent in guest file reads (frame statistics: the hitch log
  * in nv2a_gpu_perf.inc.c reports them per slow frame). */
 volatile LONG64 g_xbox_read_qpc, g_xbox_read_bytes, g_xbox_read_count;
@@ -261,6 +368,18 @@ NTSTATUS __stdcall xbox_NtReadFile(
     InterlockedAdd64(&g_xbox_read_qpc, b.QuadPart - a.QuadPart);
     InterlockedAdd64(&g_xbox_read_bytes, Length);
     InterlockedIncrement64(&g_xbox_read_count);
+    {   /* name the reads that stall a frame (first 40 over 30 ms) */
+        static LARGE_INTEGER fq;
+        static volatile LONG told;
+        if (!fq.QuadPart) QueryPerformanceFrequency(&fq);
+        if ((b.QuadPart - a.QuadPart) * 1000 / fq.QuadPart > 30 && InterlockedIncrement(&told) <= 40) {
+            wchar_t name[MAX_PATH];
+            DWORD n = GetFinalPathNameByHandleW(FileHandle, name, MAX_PATH, 0);
+            fprintf(stderr, "  [SLOWREAD] %lld ms, %lu bytes at %lld: %ls\n",
+                    (long long)((b.QuadPart - a.QuadPart) * 1000 / fq.QuadPart), (unsigned long)Length,
+                    ByteOffset ? (long long)ByteOffset->QuadPart : -1LL, n && n < MAX_PATH ? name : L"?");
+        }
+    }
     return st;
 }
 
