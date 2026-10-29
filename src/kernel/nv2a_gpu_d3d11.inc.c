@@ -64,6 +64,8 @@ typedef struct {
     uint32_t ox;                         /* widescreen: extra guest columns on each side of tex */
     ID3D11Texture2D *ctr;                /* ox > 0: the original-width centre, scaled (RT + SRV) */
     ID3D11RenderTargetView *ctr_rtv;
+    ID3D11Texture2D *mv;                 /* SDL_GPU: motion vectors (R16G16 float, target 1) */
+    ID3D11RenderTargetView *mv_rtv;
 } GpuSurface;
 
 /* Internal resolution (video settings): every render target is this many
@@ -479,6 +481,8 @@ static void gpu_release_surface(GpuSurface *s)
     if (s->ctr) ID3D11Texture2D_Release(s->ctr);
     if (s->copy_srv) ID3D11ShaderResourceView_Release(s->copy_srv);
     if (s->copy) ID3D11Texture2D_Release(s->copy);
+    if (s->mv_rtv) ID3D11RenderTargetView_Release(s->mv_rtv);
+    if (s->mv) ID3D11Texture2D_Release(s->mv);
     memset(s, 0, sizeof *s);
 }
 
@@ -629,6 +633,16 @@ retry_surface_create:
                 FAILED(ID3D11Device_CreateDepthStencilView(s_gpu11.dev, (ID3D11Resource *)s->ds, NULL, &s->dsv)) || !s->dsv)
             goto surface_create_failed;
         ID3D11DeviceContext_ClearDepthStencilView(s_gpu11.ctx, s->dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+        if (g_gx_sg && w >= 640 && h >= 448) {
+            /* Screen-sized targets get motion vectors (upscaling and frame
+             * generation read them); off-screen ones do not need them. */
+            static const float zero[4] = { 0, 0, 0, 0 };
+            td.Format = DXGI_FORMAT_R16G16_FLOAT;
+            td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+            if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, NULL, &s->mv)) &&
+                SUCCEEDED(ID3D11Device_CreateRenderTargetView(s_gpu11.dev, (ID3D11Resource *)s->mv, NULL, &s->mv_rtv)))
+                ID3D11DeviceContext_ClearRenderTargetView(s_gpu11.ctx, s->mv_rtv, zero);
+        }
         s->dirty = 0;
         if (sc != requested_sc)
             fprintf(stderr, "  [GPU11] render target requested %ux, allocated %ux after memory fallback\n", requested_sc, sc);
@@ -2250,7 +2264,8 @@ static int gpu_draw_batch_unlocked_body(int flat2d)
             ID3D11DepthStencilState *dss = flat2d ? gpu_no_depth() : gpu_depth_state();
             int all = !s_bound.valid;
             if (all || s_bound.rtv != surf->rtv || s_bound.dsv != surf->dsv) {
-                ID3D11DeviceContext_OMSetRenderTargets(s_gpu11.ctx, 1, &surf->rtv, surf->dsv);
+                ID3D11RenderTargetView *rts[2] = { surf->rtv, surf->mv_rtv };
+                ID3D11DeviceContext_OMSetRenderTargets(s_gpu11.ctx, surf->mv_rtv ? 2 : 1, rts, surf->dsv);
                 s_bound.rtv = surf->rtv; s_bound.dsv = surf->dsv;
                 memset(s_bound.srv, 0, sizeof s_bound.srv);       /* resend textures */
                 s_bound.srv[0] = (ID3D11ShaderResourceView *)(uintptr_t)1;
@@ -2483,6 +2498,10 @@ static int gpu_clear_unlocked(uint32_t param)
         comb_unpack(s_gpu.clear_color, col);
         if ((param & 0xF0u) == 0xF0u && x0 == 0 && y0 == 0 && x1 >= s->w && y1 >= s->h) {
             ID3D11DeviceContext_ClearRenderTargetView(s_gpu11.ctx, s->rtv, col);
+            if (s->mv_rtv) {
+                static const float zero[4] = { 0, 0, 0, 0 };
+                ID3D11DeviceContext_ClearRenderTargetView(s_gpu11.ctx, s->mv_rtv, zero);
+            }
         } else {
             /* Partial rectangle or channel subset: a solid quad with the
              * channel write mask (it went through guest RAM before, a

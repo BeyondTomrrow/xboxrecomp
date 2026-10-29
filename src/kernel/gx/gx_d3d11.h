@@ -51,6 +51,9 @@ void gxs_set_pull2(ID3D11Buffer *b0, ID3D11Buffer *b1, UINT first, UINT tri_mode
 /* Bytes [lo, hi) of a dynamic buffer were written through Map since the last
  * draw that reads them: uploaded with the next flush. */
 void gxs_buffer_written(ID3D11Buffer *buf, UINT lo, UINT hi);
+/* 1 when the next vertex-program draws have last frame's constants bound at
+ * b3 (motion vectors); 0 makes them report no motion. */
+void gxs_set_pull_mv(UINT on);
 /* The swap chain on the framebuffer window (claimed from its thread). NULL
  * until the window is claimed. */
 IDXGISwapChain1 *gxs_swapchain(void *sdl_window, int *out_w, int *out_h);

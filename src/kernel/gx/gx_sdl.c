@@ -118,7 +118,7 @@ static GxObj s_ctx_obj = { GX_MAGIC, K_CONTEXT, 1, NULL };
 
 /* Per-frame counters, logged every 300 presents (where the time goes). */
 static struct {
-    unsigned draws, rpasses, cpasses, copies, uploads, downloads, submits, waits, flushes;
+    unsigned mvt_draws, mv_draws, draws, rpasses, cpasses, copies, uploads, downloads, submits, waits, flushes;
     double wait_ms, flush_ms, pipe_ms;
     unsigned frames;
 } s_st;
@@ -541,6 +541,7 @@ static SDL_GPUTextureFormat map_format(DXGI_FORMAT f, uint32_t *block, uint32_t 
     switch (f) {
     case DXGI_FORMAT_B8G8R8A8_UNORM: return SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
     case DXGI_FORMAT_R8G8B8A8_UNORM: return SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_R16G16_FLOAT:   return SDL_GPU_TEXTUREFORMAT_R16G16_FLOAT;
     case DXGI_FORMAT_BC1_UNORM: *block = 4; *unit = 8;  return SDL_GPU_TEXTUREFORMAT_BC1_RGBA_UNORM;
     case DXGI_FORMAT_BC2_UNORM: *block = 4; *unit = 16; return SDL_GPU_TEXTUREFORMAT_BC2_RGBA_UNORM;
     case DXGI_FORMAT_BC3_UNORM: *block = 4; *unit = 16; return SDL_GPU_TEXTUREFORMAT_BC3_RGBA_UNORM;
@@ -808,7 +809,7 @@ typedef struct {
 
 typedef struct {
     SDL_GPUGraphicsPipeline *pipe;
-    SDL_GPUTexture *rt, *ds;
+    SDL_GPUTexture *rt, *ds, *rt2;
     SDL_GPUTextureSamplerBinding fs[8];
     uint8_t nfs, nsc, sref;
     SDL_GPUBuffer *vsbuf[2];
@@ -882,7 +883,7 @@ typedef struct {
     D3D11_RENDER_TARGET_BLEND_DESC b;
     D3D11_DEPTH_STENCIL_DESC ds;
     D3D11_RASTERIZER_DESC rs;
-    uint32_t cfmt, dfmt, has_rt, has_ds;
+    uint32_t cfmt, dfmt, has_rt, has_ds, cfmt2, mask2;
 } GxPipeKey;
 
 #define PIPE_CACHE 4096
@@ -967,12 +968,12 @@ static void stencil_face(const D3D11_DEPTH_STENCILOP_DESC *s, SDL_GPUStencilOpSt
 
 static SDL_GPUGraphicsPipeline *pipe_get(GxShader *vs, GxShader *ps, D3D11_PRIMITIVE_TOPOLOGY topo,
                                          const GxBlend *bl, const GxDss *dss, const GxRs *rs,
-                                         const GxTex *rt, const GxTex *ds)
+                                         const GxTex *rt, const GxTex *ds, const GxTex *rt2)
 {
     GxPipeKey k;
     uint32_t h, i;
     SDL_GPUGraphicsPipelineCreateInfo ci;
-    SDL_GPUColorTargetDescription ct;
+    SDL_GPUColorTargetDescription ct[2];
     memset(&k, 0, sizeof k);
     k.vs = vs->id; k.ps = ps->id; k.topo = (uint32_t)topo;
     if (bl) k.b = bl->d.RenderTarget[0];
@@ -986,6 +987,11 @@ static SDL_GPUGraphicsPipeline *pipe_get(GxShader *vs, GxShader *ps, D3D11_PRIMI
     else { k.rs.FillMode = D3D11_FILL_SOLID; k.rs.CullMode = D3D11_CULL_BACK; k.rs.DepthClipEnable = TRUE; }
     k.has_rt = rt != NULL; k.cfmt = rt ? (uint32_t)rt->fmt : 0;
     k.has_ds = ds != NULL; k.dfmt = ds ? (uint32_t)ds->fmt : 0;
+    /* Target 1 holds motion vectors: never blended. A blended or colour-
+     * masked draw (glass, shadows, overlays) leaves the motion of what lies
+     * under it. */
+    k.cfmt2 = rt2 ? (uint32_t)rt2->fmt : 0;
+    k.mask2 = rt2 && !k.b.BlendEnable && (k.b.RenderTargetWriteMask & 7) ? 3u : 0u;
     h = key_hash(&k, sizeof k);
     for (i = 0; i < PIPE_CACHE; i++) {
         uint32_t s = (h + i) & (PIPE_CACHE - 1);
@@ -993,7 +999,7 @@ static SDL_GPUGraphicsPipeline *pipe_get(GxShader *vs, GxShader *ps, D3D11_PRIMI
         if (s_pipes[s].h == h && !memcmp(&s_pipes[s].k, &k, sizeof k)) return s_pipes[s].p;
     }
     memset(&ci, 0, sizeof ci);
-    memset(&ct, 0, sizeof ct);
+    memset(ct, 0, sizeof ct);
     ci.vertex_shader = vs->sh;
     ci.fragment_shader = ps->sh;
     ci.primitive_type = topo == D3D11_PRIMITIVE_TOPOLOGY_LINELIST ? SDL_GPU_PRIMITIVETYPE_LINELIST
@@ -1021,18 +1027,27 @@ static SDL_GPUGraphicsPipeline *pipe_get(GxShader *vs, GxShader *ps, D3D11_PRIMI
         ci.target_info.depth_stencil_format = ds->fmt;
     }
     if (rt) {
-        ct.format = rt->fmt;
-        ct.blend_state.enable_blend = k.b.BlendEnable ? true : false;
-        ct.blend_state.src_color_blendfactor = map_blend(k.b.SrcBlend);
-        ct.blend_state.dst_color_blendfactor = map_blend(k.b.DestBlend);
-        ct.blend_state.color_blend_op = map_blendop(k.b.BlendOp);
-        ct.blend_state.src_alpha_blendfactor = map_blend(k.b.SrcBlendAlpha);
-        ct.blend_state.dst_alpha_blendfactor = map_blend(k.b.DestBlendAlpha);
-        ct.blend_state.alpha_blend_op = map_blendop(k.b.BlendOpAlpha);
-        ct.blend_state.color_write_mask = (SDL_GPUColorComponentFlags)(k.b.RenderTargetWriteMask & 15);
-        ct.blend_state.enable_color_write_mask = true;
-        ci.target_info.color_target_descriptions = &ct;
+        ct[0].format = rt->fmt;
+        ct[0].blend_state.enable_blend = k.b.BlendEnable ? true : false;
+        ct[0].blend_state.src_color_blendfactor = map_blend(k.b.SrcBlend);
+        ct[0].blend_state.dst_color_blendfactor = map_blend(k.b.DestBlend);
+        ct[0].blend_state.color_blend_op = map_blendop(k.b.BlendOp);
+        ct[0].blend_state.src_alpha_blendfactor = map_blend(k.b.SrcBlendAlpha);
+        ct[0].blend_state.dst_alpha_blendfactor = map_blend(k.b.DestBlendAlpha);
+        ct[0].blend_state.alpha_blend_op = map_blendop(k.b.BlendOpAlpha);
+        ct[0].blend_state.color_write_mask = (SDL_GPUColorComponentFlags)(k.b.RenderTargetWriteMask & 15);
+        ct[0].blend_state.enable_color_write_mask = true;
+        ci.target_info.color_target_descriptions = ct;
         ci.target_info.num_color_targets = 1;
+        if (rt2) {
+            ct[1].format = rt2->fmt;
+            ct[1].blend_state.src_color_blendfactor = ct[1].blend_state.src_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
+            ct[1].blend_state.dst_color_blendfactor = ct[1].blend_state.dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ZERO;
+            ct[1].blend_state.color_blend_op = ct[1].blend_state.alpha_blend_op = SDL_GPU_BLENDOP_ADD;
+            ct[1].blend_state.color_write_mask = (SDL_GPUColorComponentFlags)k.mask2;
+            ct[1].blend_state.enable_color_write_mask = true;
+            ci.target_info.num_color_targets = 2;
+        }
     }
     {
         static unsigned created;
@@ -1069,7 +1084,7 @@ static SDL_GPUGraphicsPipeline *pipe_get(GxShader *vs, GxShader *ps, D3D11_PRIMI
 /* ---- context state ------------------------------------------------------ */
 
 static struct {
-    GxView *rtv, *dsv;
+    GxView *rtv, *dsv, *rtv2;
     GxShader *vs, *ps;
     GxBlend *blend; float bf[4];
     GxDss *dss; UINT sref;
@@ -1080,7 +1095,7 @@ static struct {
     GxView *srv[16];
     GxSmp *smp[16];
     GxBuf *pscb[4], *vscb[4];
-    GxBuf *pull_buf[2]; UINT pull_first, pull_tri, pull_stride; float pull_w;
+    GxBuf *pull_buf[2]; UINT pull_first, pull_tri, pull_stride, pull_mv; float pull_w;
     GxBuf *last_vs_buf[4]; uint32_t last_vs_ver[4]; int32_t last_vs_off[4];
     /* uniform dedupe: the last data recorded per stage */
     GxBuf *last_fs_buf; uint32_t last_fs_ver; int32_t last_fs_off;
@@ -1090,6 +1105,7 @@ void gxs_ID3D11DeviceContext_OMSetRenderTargets(void *c, UINT n, ID3D11RenderTar
 {
     (void)c;
     ref_set((void **)&C.rtv, n && rtv ? (void *)rtv[0] : NULL);
+    ref_set((void **)&C.rtv2, n > 1 && rtv ? (void *)rtv[1] : NULL);
     ref_set((void **)&C.dsv, (void *)dsv);
 }
 
@@ -1185,9 +1201,12 @@ void gxs_set_pull2(ID3D11Buffer *b0, ID3D11Buffer *b1, UINT first, UINT tri_mode
     C.pull_first = first; C.pull_tri = tri_mode; C.pull_w = w_buffer; C.pull_stride = stride;
 }
 
+void gxs_set_pull_mv(UINT on) { C.pull_mv = on; }
+
 void gxs_set_pull(ID3D11Buffer *vb, UINT first, UINT tri_mode, float w_buffer)
 {
     gxs_set_pull2(vb, NULL, first, tri_mode, w_buffer, 144);
+    C.pull_mv = 0;                            /* CPU-built vertices: no history */
 }
 
 static void note_vbuf(GxBuf *b, uint32_t lo, uint32_t hi);
@@ -1218,7 +1237,7 @@ static void note_vbuf(GxBuf *b, uint32_t lo, uint32_t hi)
 void gxs_ID3D11DeviceContext_Draw(void *c, UINT n, UINT start)
 {
     GxDraw *d;
-    GxTex *rt = C.rtv ? C.rtv->tex : NULL, *ds = C.dsv ? C.dsv->tex : NULL;
+    GxTex *rt = C.rtv ? C.rtv->tex : NULL, *ds = C.dsv ? C.dsv->tex : NULL, *rt2 = C.rtv2 ? C.rtv2->tex : NULL;
     SDL_GPUGraphicsPipeline *pipe;
     uint32_t i, tw, th;
     int pull;
@@ -1229,7 +1248,8 @@ void gxs_ID3D11DeviceContext_Draw(void *c, UINT n, UINT start)
     for (i = 0; pull && i < C.vs->r.nstorage && i < 2; i++)
         if (!C.pull_buf[i] || !C.pull_buf[i]->b)
             return;
-    pipe = pipe_get(C.vs, C.ps, C.topo, C.blend, C.dss, C.rs, rt, ds);
+    if (!rt) rt2 = NULL;
+    pipe = pipe_get(C.vs, C.ps, C.topo, C.blend, C.dss, C.rs, rt, ds, rt2);
     if (!pipe)
         return;
     if (s_ndraw == s_capdraw) {
@@ -1241,6 +1261,8 @@ void gxs_ID3D11DeviceContext_Draw(void *c, UINT n, UINT start)
     d->pipe = pipe;
     d->rt = rt ? rt->t : NULL;
     d->ds = ds ? ds->t : NULL;
+    d->rt2 = rt2 ? rt2->t : NULL;
+    if (rt2) { s_st.mvt_draws++; if (C.pull_mv && C.vs->r.nstorage > 1) s_st.mv_draws++; }
     tw = rt ? rt->d.Width : ds->d.Width;
     th = rt ? rt->d.Height : ds->d.Height;
     d->nfs = (uint8_t)(C.ps->r.nsamplers > 8 ? 8 : C.ps->r.nsamplers);
@@ -1259,7 +1281,7 @@ void gxs_ID3D11DeviceContext_Draw(void *c, UINT n, UINT start)
             d->vsbuf[i] = C.pull_buf[i]->b;
         /* Vertex uniform slot 0: where this draw's vertices are, and how to
          * treat them; slots 1-3: the vertex constant buffers bound there. */
-        u[0] = C.pull_first; u[1] = C.pull_tri; memcpy(&u[2], &w, 4); u[3] = 0;
+        u[0] = C.pull_first; u[1] = C.pull_tri; memcpy(&u[2], &w, 4); u[3] = C.pull_mv;
         d->vsu[0] = (int32_t)arena_add(&s_uni, &s_nuni, &s_capuni, u, sizeof u, 16);
         d->vsu_len[0] = sizeof u;
         if (C.pull_stride)
@@ -1550,11 +1572,13 @@ static void replay_clear_alone(SDL_GPUCommandBuffer *cb, const GxClear *k)
     if (rp) SDL_EndGPURenderPass(rp);
 }
 
-static void clears_flush(SDL_GPUCommandBuffer *cb, SDL_GPUTexture *keep_rt, SDL_GPUTexture *keep_ds)
+static void clears_flush(SDL_GPUCommandBuffer *cb, SDL_GPUTexture *keep_rt, SDL_GPUTexture *keep_ds,
+                         SDL_GPUTexture *keep_rt2)
 {
     int i, n = 0;
     for (i = 0; i < s_nclears; i++) {
-        if ((!s_clears[i].ds && s_clears[i].t == keep_rt) || (s_clears[i].ds && s_clears[i].t == keep_ds))
+        if ((!s_clears[i].ds && (s_clears[i].t == keep_rt || (keep_rt2 && s_clears[i].t == keep_rt2))) ||
+            (s_clears[i].ds && s_clears[i].t == keep_ds))
             s_clears[n++] = s_clears[i];               /* merged into the pass about to begin */
         else
             replay_clear_alone(cb, &s_clears[i]);
@@ -1577,15 +1601,18 @@ static void clear_add(const GxClear *k)
     if (s_nclears < 16) s_clears[s_nclears++] = *k;
 }
 
-static SDL_GPURenderPass *begin_pass(SDL_GPUCommandBuffer *cb, SDL_GPUTexture *rt, SDL_GPUTexture *ds)
+static SDL_GPURenderPass *begin_pass(SDL_GPUCommandBuffer *cb, SDL_GPUTexture *rt, SDL_GPUTexture *ds,
+                                     SDL_GPUTexture *rt2)
 {
-    SDL_GPUColorTargetInfo ct;
+    SDL_GPUColorTargetInfo ct, ct2[2];
     SDL_GPUDepthStencilTargetInfo dt;
     int i;
-    clears_flush(cb, rt, ds);
+    clears_flush(cb, rt, ds, rt2);
     memset(&ct, 0, sizeof ct);
+    memset(ct2, 0, sizeof ct2);
     memset(&dt, 0, sizeof dt);
     ct.texture = rt; ct.load_op = SDL_GPU_LOADOP_LOAD; ct.store_op = SDL_GPU_STOREOP_STORE;
+    ct2[1].texture = rt2; ct2[1].load_op = SDL_GPU_LOADOP_LOAD; ct2[1].store_op = SDL_GPU_STOREOP_STORE;
     dt.texture = ds; dt.load_op = dt.stencil_load_op = SDL_GPU_LOADOP_LOAD;
     dt.store_op = dt.stencil_store_op = SDL_GPU_STOREOP_STORE;
     for (i = 0; i < s_nclears; i++) {
@@ -1593,12 +1620,20 @@ static SDL_GPURenderPass *begin_pass(SDL_GPUCommandBuffer *cb, SDL_GPUTexture *r
         if (!k->ds && k->t == rt) {
             ct.load_op = SDL_GPU_LOADOP_CLEAR;
             ct.clear_color.r = k->c[0]; ct.clear_color.g = k->c[1]; ct.clear_color.b = k->c[2]; ct.clear_color.a = k->c[3];
+        } else if (!k->ds && rt2 && k->t == rt2) {
+            ct2[1].load_op = SDL_GPU_LOADOP_CLEAR;
+            ct2[1].clear_color.r = k->c[0]; ct2[1].clear_color.g = k->c[1];
+            ct2[1].clear_color.b = k->c[2]; ct2[1].clear_color.a = k->c[3];
         } else if (k->ds && k->t == ds) {
             if (k->flags & D3D11_CLEAR_DEPTH) { dt.load_op = SDL_GPU_LOADOP_CLEAR; dt.clear_depth = k->z; }
             if (k->flags & D3D11_CLEAR_STENCIL) { dt.stencil_load_op = SDL_GPU_LOADOP_CLEAR; dt.clear_stencil = k->s; }
         }
     }
     s_nclears = 0;
+    if (rt && rt2) {
+        ct2[0] = ct;
+        return SDL_BeginGPURenderPass(cb, ct2, 2, ds ? &dt : NULL);
+    }
     return SDL_BeginGPURenderPass(cb, rt ? &ct : NULL, rt ? 1 : 0, ds ? &dt : NULL);
 }
 
@@ -1606,7 +1641,7 @@ static void replay(SDL_GPUCommandBuffer *cb, uint32_t up_base)
 {
     SDL_GPURenderPass *rp = NULL;
     SDL_GPUCopyPass *cp = NULL;
-    SDL_GPUTexture *cur_rt = NULL, *cur_ds = NULL;
+    SDL_GPUTexture *cur_rt = NULL, *cur_ds = NULL, *cur_rt2 = NULL;
     SDL_GPUGraphicsPipeline *bound = NULL;
     int32_t last_vsu[4] = { -2, -2, -2, -2 }, last_fsu = -2;
     uint32_t i, k;
@@ -1617,9 +1652,10 @@ static void replay(SDL_GPUCommandBuffer *cb, uint32_t up_base)
         switch (c->type) {
         case C_DRAW: {
             const GxDraw *d = &s_draws[c->u.draw];
-            if (!rp || d->rt != cur_rt || d->ds != cur_ds) {
+            if (!rp || d->rt != cur_rt || d->ds != cur_ds || d->rt2 != cur_rt2) {
                 END_RP(); END_CP();
-                rp = begin_pass(cb, d->rt, d->ds);
+                rp = begin_pass(cb, d->rt, d->ds, d->rt2);
+                cur_rt2 = d->rt2;
                 s_st.rpasses++;
                 cur_rt = d->rt; cur_ds = d->ds;
                 bound = NULL;
@@ -1665,12 +1701,12 @@ static void replay(SDL_GPUCommandBuffer *cb, uint32_t up_base)
         }
         case C_MIPS:
             END_RP(); END_CP();
-            clears_flush(cb, NULL, NULL);
+            clears_flush(cb, NULL, NULL, NULL);
             SDL_GenerateMipmapsForGPUTexture(cb, c->u.mips.t);
             break;
         default:
             END_RP();
-            if (s_nclears) { END_CP(); clears_flush(cb, NULL, NULL); }
+            if (s_nclears) { END_CP(); clears_flush(cb, NULL, NULL, NULL); }
             if (!cp) { cp = SDL_BeginGPUCopyPass(cb); s_st.cpasses++; }
             if (!cp) break;
             if (c->type == C_COPY) {
@@ -1703,7 +1739,7 @@ static void replay(SDL_GPUCommandBuffer *cb, uint32_t up_base)
         }
     }
     END_RP(); END_CP();
-    clears_flush(cb, NULL, NULL);
+    clears_flush(cb, NULL, NULL, NULL);
 #undef END_RP
 #undef END_CP
 }
@@ -1917,10 +1953,11 @@ HRESULT gxs_IDXGISwapChain1_Present(void *s, UINT sync, UINT flags)
     flush(1);
     if (++s_st.frames == 300) {
         fprintf(stderr, "  [GX] per frame: %.0f draws, %.1f render passes, %.1f copy passes, %.1f copies, %.1f uploads, "
-                "%.2f downloads, %.2f submits, %.2f GPU waits (%.2f ms), flush %.2f ms, new pipelines %.2f ms\n",
+                "%.2f downloads, %.2f submits, %.2f GPU waits (%.2f ms), flush %.2f ms, new pipelines %.2f ms, "
+                "motion target draws %.0f (with history %.0f)\n",
                 s_st.draws / 300.0, s_st.rpasses / 300.0, s_st.cpasses / 300.0, s_st.copies / 300.0, s_st.uploads / 300.0,
                 s_st.downloads / 300.0, s_st.submits / 300.0, s_st.waits / 300.0, s_st.wait_ms / 300.0,
-                s_st.flush_ms / 300.0, s_st.pipe_ms / 300.0);
+                s_st.flush_ms / 300.0, s_st.pipe_ms / 300.0, s_st.mvt_draws / 300.0, s_st.mv_draws / 300.0);
         memset(&s_st, 0, sizeof s_st);
     }
     return S_OK;

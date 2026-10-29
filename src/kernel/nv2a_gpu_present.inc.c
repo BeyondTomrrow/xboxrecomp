@@ -261,6 +261,7 @@ static const char k_present_hlsl[] =
     "    float3 detail = cc.rgb * 4.0 - n.rgb - s.rgb - e.rgb - w.rgb;\n"
     "    c = float4(clamp(cc.rgb + detail * 0.16, lo, hi), cc.a);\n"
     "  } else c = Src.Sample(Lin, uv);\n"
+    "  if (prm.w == 1.0) return float4(saturate(abs(c.rg) * 40.0), c.r < 0 || c.g < 0 ? 0.6 : 0.0, 1.0);\n"
     "  c.rgb = pow(saturate(c.rgb * prm.x), prm.y); c.a = 1.0; return c; }\n"
     "float4 ps_ovl(V i) : SV_Target { return Src.Sample(Lin, i.uv); }\n"
     "float4 ps_fill(V i) : SV_Target { return src; }\n";
@@ -1464,7 +1465,9 @@ static int pr_present(uint32_t guest)
     g_wide_ar = s_ana_ar > 0.0f ? 0.0f : pr_wanted_wide_ar();
     menu_pad();
 
-    if (FAILED(ID3D11Device_CreateShaderResourceView(s_gpu11.dev, (ID3D11Resource *)s->tex, NULL, &srv)))
+    /* RECOMP_MV_SHOW=1 (SDL_GPU): the motion vectors, |x| red, |y| green. */
+    if (FAILED(ID3D11Device_CreateShaderResourceView(s_gpu11.dev,
+                   (ID3D11Resource *)(s->mv && env_cached("RECOMP_MV_SHOW") ? s->mv : s->tex), NULL, &srv)))
         return 0;
     {
         /* A widescreen surface is wider than the guest's: it is shown whole,
@@ -1478,7 +1481,7 @@ static int pr_present(uint32_t guest)
         pc.prm[1] = 100.0f / (float)s_vs.gamma;
         pc.prm[2] = (float)(s_vs.filter == SF_NEAREST ? 1 : s_vs.filter == SF_SHARP ? 2
                                : s_vs.filter == SF_ENHANCED ? 3 : 0);
-        pc.prm[3] = 0.0f;
+        pc.prm[3] = s->mv && env_cached("RECOMP_MV_SHOW") ? 1.0f : 0.0f;
         pr_dest_rect(frac, &dx, &dy, &dw, &dh);
         if (s_ana_ar > 0.0f && !s->ox) {
             /* Built-in widescreen: the action area fills the window -- no bars. */

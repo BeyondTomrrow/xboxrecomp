@@ -23,9 +23,19 @@ struct PIn {
     nointerpolation float4 tri1 : TEXCOORD7;
     nointerpolation float4 tri2 : TEXCOORD8;
     nointerpolation float2 depthmeta : TEXCOORD9;
+#ifdef GX_SDL
+    // Motion vectors (Vulkan / Direct3D 12): this frame's and last frame's
+    // clip position of the same vertex (gpu_vp_translate runs the program
+    // with last frame's constants too); equal where nothing is known.
+    float4 mvc : TEXCOORD10;
+    float4 mvp : TEXCOORD11;
+#endif
 };
 struct POut {
     float4 c : SV_Target;
+#ifdef GX_SDL
+    float2 mv : SV_Target1;     // UV offset from this pixel to where it was last frame
+#endif
     float  d : SV_Depth;
 };
 
@@ -38,6 +48,9 @@ PIn vs_main(VIn v)
     o.rawscreen = v.rawscreen;
     o.tri0 = o.tri1 = o.tri2 = 0;
     o.depthmeta = 0;
+#ifdef GX_SDL
+    o.mvc = o.mvp = v.pos;
+#endif
     return o;
 }
 
@@ -152,6 +165,7 @@ PIn vs_pull(uint id : SV_VertexID)
     o.wz = v.wz; o.rawscreen = v.rawscreen;
     o.tri0 = o.tri1 = o.tri2 = 0;
     o.depthmeta = 0;
+    o.mvc = o.mvp = v.pos;                  // built on the CPU: no history, no motion
     if (pull.y != 0u) {
         uint b = pull.x + (id / 3u) * 3u;
         float4 p0 = VB[b].rawscreen, p1 = VB[b + 1u].rawscreen, p2 = VB[b + 2u].rawscreen;
@@ -349,6 +363,13 @@ POut ps_main(PIn i)
     // Floating Xbox depth keeps its fractional value.
     if (depthfmt.x != 0u) zd = floor(zd);
     r.d = zd / depthp.y;
+#ifdef GX_SDL
+    {
+        float2 cur = i.mvc.xy / i.mvc.w, prv = i.mvp.xy / i.mvp.w;
+        r.mv = (prv - cur) * float2(0.5, -0.5);
+        if (any(isnan(r.mv)) || any(isinf(r.mv)) || i.mvc.w <= 0.0 || i.mvp.w <= 0.0) r.mv = 0;
+    }
+#endif
     return r;
 }
 
