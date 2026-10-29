@@ -257,7 +257,7 @@ static void perf_on_present(int scale, float present_ms)
 
 static int perf_overlay_text(char *l1, size_t n1, char *l2, size_t n2, int fps)
 {
-    snprintf(l1, n1, "%d FPS  %.1f ms", fps, s_perf.ft_avg);
+    snprintf(l1, n1, "%d FPS  %.1f ms  %s", fps, s_perf.ft_avg, gx_backend_name());
     if (s_perf.gpu_ms >= 0)
         snprintf(l2, n2, "1%% low %.0f   GPU %.1f ms   CPU %.1f ms   VRAM %u MB",
                  s_perf.low1, s_perf.gpu_ms, s_perf.cpu_ms, s_perf.vram_mb);
