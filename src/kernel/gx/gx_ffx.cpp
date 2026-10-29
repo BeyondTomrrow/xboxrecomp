@@ -186,8 +186,72 @@ static FfxResource res(SDL_GPUTexture *t, const wchar_t *name)
     return ffxGetResourceDX12(r, ffxGetResourceDescriptionDX12(r), name, st);
 }
 
+static int record(FfxFsr3DispatchUpscaleDescription *dd, ID3D12GraphicsCommandList *cl,
+                  SDL_GPUTexture *color, SDL_GPUTexture *depth, SDL_GPUTexture *mv, SDL_GPUTexture *reactive,
+                  SDL_GPUTexture *out, SDL_GPUTexture *interp, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh,
+                  float jx, float jy, float dt_ms, int reset, float sharpness)
+{
+    FfxErrorCode e;
+    dd->commandList = ffxGetCommandListDX12(cl);
+    dd->color = res(color, L"NFL2K5_Color");
+    dd->depth = res(depth, L"NFL2K5_Depth");
+    dd->motionVectors = res(mv, L"NFL2K5_MotionVectors");
+    if (reactive) dd->reactive = res(reactive, L"NFL2K5_Reactive");   /* HUD and text: no history */
+    dd->upscaleOutput = res(out, L"NFL2K5_Upscaled");
+    dd->jitterOffset.x = jx; dd->jitterOffset.y = jy;
+    dd->motionVectorScale.x = (float)rw; dd->motionVectorScale.y = (float)rh;   /* ours are in UV units */
+    dd->renderSize.width = rw; dd->renderSize.height = rh;
+    dd->upscaleSize.width = ow; dd->upscaleSize.height = oh;
+    dd->enableSharpening = sharpness > 0.0f;
+    dd->sharpness = sharpness;
+    dd->frameTimeDelta = dt_ms > 0.0f && dt_ms < 200.0f ? dt_ms : 16.7f;
+    dd->preExposure = 1.0f;
+    dd->reset = reset != 0 || F.frame == 0;
+    dd->cameraNear = 0.1f; dd->cameraFar = 1000.0f;            /* the game's camera is not known here */
+    dd->cameraFovAngleVertical = 0.785f;
+    dd->viewSpaceToMetersFactor = 1.0f;
+    dd->frameID = F.frame;
+    e = ffxFsr3ContextDispatchUpscale(&F.ctx, dd);
+    if (e == FFX_OK && interp && F.fg) {
+        /* The frame between the previous upscaled image and this one. */
+        FfxFsr3DispatchFrameGenerationPrepareDescription p;
+        FfxFrameGenerationDispatchDescription g;
+        memset(&p, 0, sizeof p);
+        p.commandList = dd->commandList;
+        p.depth = dd->depth; p.motionVectors = dd->motionVectors;
+        p.jitterOffset = dd->jitterOffset; p.motionVectorScale = dd->motionVectorScale;
+        p.frameTimeDelta = dd->frameTimeDelta; p.renderSize = dd->renderSize;
+        p.cameraNear = dd->cameraNear; p.cameraFar = dd->cameraFar;
+        p.cameraFovAngleVertical = dd->cameraFovAngleVertical; p.viewSpaceToMetersFactor = dd->viewSpaceToMetersFactor;
+        p.frameID = dd->frameID;
+        e = ffxFsr3ContextDispatchFrameGenerationPrepare(&F.ctx, &p);
+        memset(&g, 0, sizeof g);
+        g.commandList = dd->commandList;
+        g.presentColor = dd->upscaleOutput;
+        g.outputs[0] = res(interp, L"NFL2K5_Interpolated");
+        g.numInterpolatedFrames = 1;
+        g.reset = dd->reset;
+        g.backBufferTransferFunction = FFX_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
+        g.minMaxLuminance[0] = 0.0f; g.minMaxLuminance[1] = 1.0f;
+        g.interpolationRect.width = (int32_t)ow; g.interpolationRect.height = (int32_t)oh;
+        g.frameID = dd->frameID;
+        if (e == FFX_OK)
+            e = ffxFsr3DispatchFrameGeneration(&g);
+        if (e != FFX_OK) {
+            static int told;
+            if (told++ < 5) fprintf(stderr, "  [FSR] frame generation failed (%d)\n", (int)e);
+        }
+    }
+    if (e != FFX_OK) {
+        static int told;
+        if (told++ < 5) fprintf(stderr, "  [FSR] dispatch failed (%d)\n", (int)e);
+        return 0;
+    }
+    return 1;
+}
+
 extern "C" int gxf_upscale(SDL_GPUTexture *color, SDL_GPUTexture *depth, SDL_GPUTexture *mv, SDL_GPUTexture *reactive,
-                           SDL_GPUTexture *out, SDL_GPUTexture *interp,
+                           SDL_GPUTexture *out, SDL_GPUTexture *interp, void *native_list,
                            uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, float jx, float jy,
                            float dt_ms, int reset, float sharpness)
 {
@@ -196,6 +260,16 @@ extern "C" int gxf_upscale(SDL_GPUTexture *color, SDL_GPUTexture *depth, SDL_GPU
     int s;
     if (!F.ok || getenv("RECOMP_FSR_NODISPATCH") || !ensure_context(rw, rh, ow, oh, interp != NULL))   /* diagnostics */
         return 0;
+    /* SDL's own command list (SDL_GetGPUCommandBufferNativeD3D12): FSR goes
+     * into the frame's command buffer, no submission or wait of its own. */
+    if (native_list) {
+        ID3D12GraphicsCommandList *cl = (ID3D12GraphicsCommandList *)native_list;
+        memset(&d, 0, sizeof d);
+        if (!record(&d, cl, color, depth, mv, reactive, out, interp, rw, rh, ow, oh, jx, jy, dt_ms, reset, sharpness))
+            return 0;
+        F.frame++;
+        return 1;
+    }
     /* One frame in flight at most: the previous frame's upscale (and so all
      * of its SDL work, queue order) is finished before this one is recorded.
      * Running further ahead let SDL's per-submission upload copies pile up
@@ -213,56 +287,8 @@ extern "C" int gxf_upscale(SDL_GPUTexture *color, SDL_GPUTexture *depth, SDL_GPU
     F.alloc[s]->Reset();
     F.list->Reset(F.alloc[s], NULL);
     memset(&d, 0, sizeof d);
-    d.commandList = ffxGetCommandListDX12(F.list);
-    d.color = res(color, L"NFL2K5_Color");
-    d.depth = res(depth, L"NFL2K5_Depth");
-    d.motionVectors = res(mv, L"NFL2K5_MotionVectors");
-    if (reactive) d.reactive = res(reactive, L"NFL2K5_Reactive");   /* HUD and text: no history */
-    d.upscaleOutput = res(out, L"NFL2K5_Upscaled");
-    d.jitterOffset.x = jx; d.jitterOffset.y = jy;
-    d.motionVectorScale.x = (float)rw; d.motionVectorScale.y = (float)rh;   /* ours are in UV units */
-    d.renderSize.width = rw; d.renderSize.height = rh;
-    d.upscaleSize.width = ow; d.upscaleSize.height = oh;
-    d.enableSharpening = sharpness > 0.0f;
-    d.sharpness = sharpness;
-    d.frameTimeDelta = dt_ms > 0.0f && dt_ms < 200.0f ? dt_ms : 16.7f;
-    d.preExposure = 1.0f;
-    d.reset = reset != 0 || F.frame == 0;
-    d.cameraNear = 0.1f; d.cameraFar = 1000.0f;            /* the game's camera is not known here */
-    d.cameraFovAngleVertical = 0.785f;
-    d.viewSpaceToMetersFactor = 1.0f;
-    d.frameID = F.frame;
-    e = ffxFsr3ContextDispatchUpscale(&F.ctx, &d);
-    if (e == FFX_OK && interp && F.fg) {
-        /* The frame between the previous upscaled image and this one. */
-        FfxFsr3DispatchFrameGenerationPrepareDescription p;
-        FfxFrameGenerationDispatchDescription g;
-        memset(&p, 0, sizeof p);
-        p.commandList = d.commandList;
-        p.depth = d.depth; p.motionVectors = d.motionVectors;
-        p.jitterOffset = d.jitterOffset; p.motionVectorScale = d.motionVectorScale;
-        p.frameTimeDelta = d.frameTimeDelta; p.renderSize = d.renderSize;
-        p.cameraNear = d.cameraNear; p.cameraFar = d.cameraFar;
-        p.cameraFovAngleVertical = d.cameraFovAngleVertical; p.viewSpaceToMetersFactor = d.viewSpaceToMetersFactor;
-        p.frameID = d.frameID;
-        e = ffxFsr3ContextDispatchFrameGenerationPrepare(&F.ctx, &p);
-        memset(&g, 0, sizeof g);
-        g.commandList = d.commandList;
-        g.presentColor = d.upscaleOutput;
-        g.outputs[0] = res(interp, L"NFL2K5_Interpolated");
-        g.numInterpolatedFrames = 1;
-        g.reset = d.reset;
-        g.backBufferTransferFunction = FFX_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
-        g.minMaxLuminance[0] = 0.0f; g.minMaxLuminance[1] = 1.0f;
-        g.interpolationRect.width = (int32_t)ow; g.interpolationRect.height = (int32_t)oh;
-        g.frameID = d.frameID;
-        if (e == FFX_OK)
-            e = ffxFsr3DispatchFrameGeneration(&g);
-        if (e != FFX_OK) {
-            static int told;
-            if (told++ < 5) fprintf(stderr, "  [FSR] frame generation failed (%d)\n", (int)e);
-        }
-    }
+    e = record(&d, F.list, color, depth, mv, reactive, out, interp, rw, rh, ow, oh, jx, jy, dt_ms, reset, sharpness)
+        ? FFX_OK : FFX_ERROR_BACKEND_API_ERROR;
     F.list->Close();
     if (e != FFX_OK) {
         static int told;

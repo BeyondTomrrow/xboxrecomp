@@ -33,6 +33,10 @@
 #include "gx_dxc.h"
 #include "gx_ffx.h"
 
+/* Local SDL additions (H:\2K5Remade-local\sdl-src, SDL_gpu_d3d12.c). */
+extern void *SDL_GetGPUCommandBufferNativeD3D12(SDL_GPUCommandBuffer *commandBuffer);
+extern void SDL_RestoreGPUCommandBufferD3D12(SDL_GPUCommandBuffer *commandBuffer);
+
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 
@@ -1254,9 +1258,19 @@ int gxs_fsr_upscale(ID3D11Texture2D *color, ID3D11Texture2D *depth, ID3D11Textur
     GxTex *c = (GxTex *)color, *d = (GxTex *)depth, *m = (GxTex *)mv, *o = (GxTex *)out, *r = (GxTex *)reactive;
     if (!gxs_fsr_available() || !c || !d || !m || !o || !c->t || !d->t || !m->t || !o->t)
         return 0;
-    flush(1);           /* the frame's rendering goes first on the queue; FSR follows it */
-    return gxf_upscale(c->t, d->t, m->t, r ? r->t : NULL, o->t, generated ? ((GxTex *)generated)->t : NULL,
-                       rw, rh, ow, oh, jx, jy, dt_ms, reset, sharpness);
+    {
+        int ok;
+        void *list;
+        EnterCriticalSection(&G.submit_lock);
+        flush(0);       /* the frame's rendering is recorded first; FSR follows it in the same list */
+        list = s_cb && !getenv("RECOMP_FSR_OWNLIST") ? SDL_GetGPUCommandBufferNativeD3D12(s_cb) : NULL;
+        if (!list) flush(1);                     /* fallback: its own submission */
+        ok = gxf_upscale(c->t, d->t, m->t, r ? r->t : NULL, o->t, generated ? ((GxTex *)generated)->t : NULL, list,
+                         rw, rh, ow, oh, jx, jy, dt_ms, reset, sharpness);
+        if (list) SDL_RestoreGPUCommandBufferD3D12(s_cb);
+        LeaveCriticalSection(&G.submit_lock);
+        return ok;
+    }
 }
 
 void gxs_set_pull(ID3D11Buffer *vb, UINT first, UINT tri_mode, float w_buffer)
