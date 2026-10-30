@@ -3828,6 +3828,20 @@ static void bridge_NtQueryDirectoryFile(void)
         fn.Buffer        = fn_buf ? (PCHAR)XBOX_TO_NATIVE(fn_buf) : NULL;
         if (fn.Buffer) pfn = &fn;
     }
+    {   /* NFL2K5_DIRTRACE=1 (study): who lists directories -- code addresses on the guest stack */
+        static int on = -1, n;
+        if (on < 0) on = getenv("NFL2K5_DIRTRACE") != NULL;
+        if (on && n < 40) {
+            int k, shown = 0;
+            n++;
+            fprintf(stderr, "[DIRTRACE] query len=%u class=%u restart=%u callers:", length, info_class, restart);
+            for (k = 0; k < 96 && shown < 12; k++) {
+                uint32_t w = BRIDGE_MEM32(g_esp + 4u * (uint32_t)k);
+                if (w >= 0x00011000u && w < 0x004E0000u) { fprintf(stderr, " %08X", w); shown++; }
+            }
+            fprintf(stderr, "\n");
+        }
+    }
     g_eax = (uint32_t)xbox_NtQueryDirectoryFile(handle, NULL, NULL, NULL, &ios,
                 XBOX_TO_NATIVE(info_va), length, (XBOX_FILE_INFORMATION_CLASS)info_class,
                 pfn, (BOOLEAN)restart);

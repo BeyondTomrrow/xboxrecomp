@@ -256,8 +256,35 @@ static void ggl_acquire_raw(void)
         g_wait[me].tid = tid; g_wait[me].prio = t_prio; g_wait[me].seq = seq;
         ggl_update_best();
         InterlockedIncrement(&g_waiters);
-        while (g_owner != 0 || !ggl_is_next(seq, t_prio))
-            SleepConditionVariableSRW(&g_turn, &g_lock, INFINITE, 0);
+        {
+            /* RECOMP_GGL_ISR_SAMPLE=1: when the interrupt thread (top
+             * priority) has waited 30 ms, name where the owner is running --
+             * the guest code that keeps an ISR (the APU's, so the audio)
+             * waiting (AUDIO-REPORT-HOTKEY-20261022). */
+            static int sample = -1;
+            static volatile LONG reports;
+            int sampled = 0;
+            if (sample < 0) sample = getenv("RECOMP_GGL_ISR_SAMPLE") != NULL;
+            while (g_owner != 0 || !ggl_is_next(seq, t_prio)) {
+                if (sample && t_prio >= 100 && !sampled) {
+                    if (!SleepConditionVariableSRW(&g_turn, &g_lock, 30, 0) &&
+                        (qpc_now() - asked) * 1000 / g_qpc_freq >= 30 && g_owner) {
+                        DWORD o = g_owner;
+                        unsigned site = g_owner_last_site;
+                        sampled = 1;
+                        if (InterlockedIncrement(&reports) <= 300) {
+                            ReleaseSRWLockExclusive(&g_lock);
+                            fprintf(stderr, "  [GGL] ISR thread waiting 30 ms for thread %lu (last kernel call returned to 0x%08X):\n",
+                                    (unsigned long)o, site);
+                            ggl_report_owner_pc(o);
+                            AcquireSRWLockExclusive(&g_lock);
+                        }
+                    }
+                    continue;
+                }
+                SleepConditionVariableSRW(&g_turn, &g_lock, INFINITE, 0);
+            }
+        }
         InterlockedDecrement(&g_waiters);
         for (int i = 0; i < g_nwait; i++)
             if (g_wait[i].tid == tid) { g_wait[i] = g_wait[--g_nwait]; break; }

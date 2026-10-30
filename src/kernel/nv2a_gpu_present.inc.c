@@ -1859,11 +1859,15 @@ static void pr_frame_limit(void)
  * (default 5) save the frame as presented -- game picture, HUD (HTML
  * presentations) and overlays -- as <prefix>-<n>.bmp at half size. Unlike
  * RECOMP_SHOT_PREFIX (the guest surface) it shows what the player sees, and
- * unlike a screen grab it works with another window in front. */
+ * unlike a screen grab it works with another window in front.
+ * NFL2K5_PRESENT_SHOT_LIMIT defaults to 120 frames (0 explicitly unlimited).
+ * Bounded unattended captures must not fill the game's install drive. */
 static void pr_present_shot(void)
 {
     static DWORD next;
     static unsigned n;
+    static int limit_read;
+    static unsigned limit = 120;
     static ID3D11Texture2D *staging;
     static UINT sw, sh;
     const char *prefix = getenv("NFL2K5_PRESENT_SHOT");
@@ -1871,9 +1875,24 @@ static void pr_present_shot(void)
     D3D11_TEXTURE2D_DESC td;
     D3D11_MAPPED_SUBRESOURCE m;
     DWORD now = GetTickCount();
+    if (!limit_read) {
+        const char *v = getenv("NFL2K5_PRESENT_SHOT_LIMIT");
+        limit_read = 1;
+        if (v && *v) {
+            char *end; unsigned long parsed = strtoul(v, &end, 10);
+            if (*v != '-' && !*end && parsed <= 10000) limit = (unsigned)parsed;
+        }
+    }
+    if (limit && n >= limit) return;
     if (!prefix || !*prefix || (next && now < next))
         return;
-    next = now + 1000u * (getenv("NFL2K5_PRESENT_SHOT_SECONDS") ? (unsigned)atoi(getenv("NFL2K5_PRESENT_SHOT_SECONDS")) : 5u);
+    {
+        const char *v = getenv("NFL2K5_PRESENT_SHOT_SECONDS");
+        int seconds = v ? atoi(v) : 5;
+        if (seconds < 1) seconds = 1;
+        if (seconds > 3600) seconds = 3600;
+        next = now + 1000u * (unsigned)seconds;
+    }
     if (FAILED(IDXGISwapChain1_GetBuffer(s_pr.sc, 0, &IID_ID3D11Texture2D, (void **)&bb)))
         return;
     ID3D11Texture2D_GetDesc(bb, &td);

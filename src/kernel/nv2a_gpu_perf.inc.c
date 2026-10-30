@@ -198,6 +198,7 @@ static void perf_hitch(float ms, float present_ms)
 volatile LONG g_xbox_perf_frames;
 volatile LONG g_xbox_perf_worst_us;
 
+/* Called once per present, after the swap chain's Present returned. */
 static void perf_on_present(int scale, float present_ms)
 {
     LARGE_INTEGER now;
@@ -212,6 +213,24 @@ static void perf_on_present(int scale, float present_ms)
     QueryPerformanceCounter(&now);
     ms = (float)((double)(now.QuadPart - s_perf.last.QuadPart) * 1000.0 / (double)s_perf.freq.QuadPart);
     s_perf.last = now;
+    {
+        /* RECOMP_TEST_SLOW_FRAMES=<every s>:<for s>:<ms>: a test knob that makes
+         * frame-rate dips on purpose (every N s, for M s, each frame takes K ms
+         * longer), to see what the game and its audio do in a slowdown. */
+        static int every = -1, len, add;
+        if (every < 0) {
+            const char *e = getenv("RECOMP_TEST_SLOW_FRAMES");
+            every = 0;
+            if (e && sscanf(e, "%d:%d:%d", &every, &len, &add) != 3) every = 0;
+        }
+        if (every > 0 && add > 0 &&
+            (GetTickCount() / 1000u) % (unsigned)every >= (unsigned)(every - len)) {
+            /* as a slow GPU would: the guest CPU is not held meanwhile */
+            int depth = xbox_ggl_release_all();
+            Sleep((DWORD)add);
+            xbox_ggl_reacquire(depth);
+        }
+    }
     InterlockedIncrement(&g_xbox_perf_frames);
     if ((LONG)(ms * 1000.0f) > g_xbox_perf_worst_us) InterlockedExchange(&g_xbox_perf_worst_us, (LONG)(ms * 1000.0f));
     s_perf.ft[s_perf.head] = ms;
