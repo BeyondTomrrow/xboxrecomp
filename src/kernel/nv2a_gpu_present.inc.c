@@ -71,14 +71,17 @@ typedef struct {
     int post;               /* post-processing preset (nv2a_gpu_post.inc.c): 0 off, 1 Broadcast, 2 Cinematic, 3 Vivid, 4 Night Game */
     int sharpen;            /* 0 off, 1 low, 2 medium, 3 high */
     int ao;                 /* ambient occlusion (Direct3D 12 / Vulkan): 0 off, 1 on, 2 strong */
+    int hdr;                /* HDR10 output (Direct3D 12 / Vulkan, an HDR display): 0 off, 1 on */
 } VideoSettings;
 
 /* NFL 2K5 draws several full-screen backdrops only inside the 640-pixel
  * title-safe area of its 720-pixel scanout.  A CRT hid the remaining edge;
  * showing the full scanout exposes hard black strips beside the sky. */
-static VideoSettings s_vs = { VM_BORDERLESS, 1920, 1080, AR_ORIGINAL, 3, SF_ENHANCED, 1, 100, 100, 0, 0, 8, 0, 1, 0, 0, 0, 0, 1, 1, 1, 0 };
+static VideoSettings s_vs = { VM_BORDERLESS, 1920, 1080, AR_ORIGINAL, 3, SF_ENHANCED, 1, 100, 100, 0, 0, 8, 0, 1, 0, 0, 0, 0, 1, 1, 1, 0, 0 };
 static volatile LONG s_vs_dirty = 1;
 static uint32_t pr_dynres_scale(void);
+extern volatile LONG g_gx_hdr_wanted;         /* gx/gx_sdl.c: HDR10 output */
+int gxs_hdr_supported(void);
 static float s_last_present_ms;                     /* how long the last Present waited */
 static void preset_apply(VideoSettings *v, int p);
 void xbox_VideoSettingsLoad(void);           /* window/swap chain need (re)applying */
@@ -128,6 +131,7 @@ static void vs_load(void)
         else if (!strcmp(key, "post")) s_vs.post = v;
         else if (!strcmp(key, "sharpen")) s_vs.sharpen = v;
         else if (!strcmp(key, "ao")) s_vs.ao = v;
+        else if (!strcmp(key, "hdr")) s_vs.hdr = v != 0;
     }
     fclose(f);
     if (s_vs.scale < 1) s_vs.scale = 1;
@@ -181,10 +185,12 @@ static void vs_save(void)
                "; sharpen: 0 off, 1 low, 2 medium, 3 high (contrast-adaptive)\n"
                "sharpen = %d\n"
                "; ao: ambient occlusion, Direct3D 12 / Vulkan: 0 off, 1 on, 2 strong\n"
-               "ao = %d\n",
+               "ao = %d\n"
+               "; hdr: 1 HDR10 output (Direct3D 12 / Vulkan and an HDR display with Windows HDR on)\n"
+               "hdr = %d\n",
             s_vs.mode, s_vs.res_w, s_vs.res_h, s_vs.aspect, s_vs.scale, s_vs.filter, s_vs.vsync,
             s_vs.brightness, s_vs.gamma, s_vs.crop, s_vs.show_fps, s_vs.aniso, s_vs.fps_limit, s_vs.widescreen, s_vs.lighting, s_vs.renderer, s_vs.upscaler, s_vs.framegen,
-            s_vs.dynres, s_vs.post, s_vs.sharpen, s_vs.ao);
+            s_vs.dynres, s_vs.post, s_vs.sharpen, s_vs.ao, s_vs.hdr);
     fclose(f);
 }
 
@@ -387,6 +393,8 @@ static int pr_init(void)
         if (e && atoi(e) >= 0 && atoi(e) <= 3) s_vs.sharpen = atoi(e);
         e = getenv("NFL2K5_AO");
         if (e && atoi(e) >= 0 && atoi(e) <= 2) s_vs.ao = atoi(e);
+        e = getenv("NFL2K5_HDR");
+        if (e) s_vs.hdr = atoi(e) != 0;
     }
     g_render_scale = (uint32_t)s_vs.scale;
     g_aniso = (uint32_t)s_vs.aniso;
@@ -769,7 +777,7 @@ static void pr_draw_hud(float gx, float gy, float gw, float gh)
 
 /* ---- the settings page -------------------------------------------------- */
 
-enum { MI_PRESET, MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_AO, MI_FILTER, MI_VSYNC, MI_BRIGHT, MI_GAMMA, MI_CROP,
+enum { MI_PRESET, MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_AO, MI_HDR, MI_FILTER, MI_VSYNC, MI_BRIGHT, MI_GAMMA, MI_CROP,
        MI_ANISO, MI_FPS, MI_LIMIT, MI_API, MI_UPSCALE, MI_FRAMEGEN, MI_RESET, MI_CLOSE, MI_COUNT };
 static const char *const k_upscaler_names[] = { "Off", "FSR 3 Native AA", "FSR 3 Quality", "FSR 3 Balanced",
                                                  "FSR 3 Performance", "FSR 3 Ultra Performance" };
@@ -839,6 +847,9 @@ static void menu_label(int item, char *name, char *val, size_t n)
     case MI_SHARPEN: strcpy(name, "Sharpening"); snprintf(val, n, "%s", k_sharpen_names[s_vs.sharpen & 3]); break;
     case MI_AO:     strcpy(name, "Ambient occlusion");
                     snprintf(val, n, "%s%s", k_ao_names[s_vs.ao % 3], s_vs.ao && !g_gx_sg ? "  (Direct3D 12 only)" : ""); break;
+    case MI_HDR:    strcpy(name, "HDR output");
+                    snprintf(val, n, "%s%s", s_vs.hdr ? "On (HDR10)" : "Off",
+                             !s_vs.hdr ? "" : !g_gx_sg ? "  (Direct3D 12 only)" : !gxs_hdr_supported() ? "  (display does not support it)" : ""); break;
     case MI_FILTER: strcpy(name, "Upscaling filter"); snprintf(val, n, "%s", filters[s_vs.filter % 4]); break;
     case MI_VSYNC:  strcpy(name, "VSync"); snprintf(val, n, "%s", s_vs.vsync ? "On" : "Off"); break;
     case MI_BRIGHT: strcpy(name, "Brightness"); snprintf(val, n, "%d%%", s_vs.brightness); break;
@@ -889,6 +900,7 @@ static void menu_change(int item, int dir)
     case MI_POST:   s_vs.post = (s_vs.post + POST_PRESETS + dir) % POST_PRESETS; break;
     case MI_SHARPEN: s_vs.sharpen = (s_vs.sharpen + 4 + dir) % 4; break;
     case MI_AO:     s_vs.ao = (s_vs.ao + 3 + dir) % 3; break;
+    case MI_HDR:    s_vs.hdr = !s_vs.hdr; break;
     case MI_FILTER: s_vs.filter = (s_vs.filter + 4 + dir) % 4; break;
     case MI_VSYNC:  s_vs.vsync = !s_vs.vsync; break;
     case MI_BRIGHT: s_vs.brightness += 5 * dir; if (s_vs.brightness < 50) s_vs.brightness = 50;
@@ -917,7 +929,7 @@ static void menu_change(int item, int dir)
 static void menu_activate(int item)
 {
     if (item == MI_RESET) {
-        VideoSettings d = { VM_BORDERLESS, 1920, 1080, AR_ORIGINAL, 3, SF_ENHANCED, 1, 100, 100, 0, 0, 8, 0, 1, 0, 0, 0, 0, 1, 1, 1, 0 };
+        VideoSettings d = { VM_BORDERLESS, 1920, 1080, AR_ORIGINAL, 3, SF_ENHANCED, 1, 100, 100, 0, 0, 8, 0, 1, 0, 0, 0, 0, 1, 1, 1, 0, 0 };
         d.renderer = s_vs.renderer;          /* the API is not a picture setting */
         d.upscaler = s_vs.upscaler;
         d.framegen = s_vs.framegen;
@@ -964,7 +976,7 @@ static int menu_rows(void) { int n = menu_page()->count(); return n > 0 ? n : 1;
  * menu; its rows are these settings as indexed value lists. Called from the
  * game thread: changes mark the swap chain for re-applying on the next flip
  * and are saved at once. */
-static const int k_vm_items[] = { MI_PRESET, MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_AO, MI_FILTER, MI_VSYNC,
+static const int k_vm_items[] = { MI_PRESET, MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_AO, MI_HDR, MI_FILTER, MI_VSYNC,
                                   MI_BRIGHT, MI_GAMMA, MI_CROP, MI_ANISO, MI_FPS, MI_LIMIT, MI_API, MI_UPSCALE, MI_FRAMEGEN };
 #define VM_COUNT ((int)(sizeof k_vm_items / sizeof k_vm_items[0]))
 static const int k_vm_aniso[] = { 1, 2, 4, 8, 16 };
@@ -974,7 +986,7 @@ int xbox_VideoSettingCount(void) { return VM_COUNT; }
 const char *xbox_VideoSettingName(int i)
 {
     static const char *names[] = { "Graphics Preset", "Display Mode", "Resolution", "Widescreen", "Aspect Ratio", "Render Scale", "Dynamic Resolution",
-                                   "Lighting & Materials", "Post-Processing", "Sharpening", "Ambient Occlusion",
+                                   "Lighting & Materials", "Post-Processing", "Sharpening", "Ambient Occlusion", "HDR Output",
                                    "Upscaling Filter", "VSync", "Brightness", "Gamma",
                                    "Overscan Crop", "Texture Filtering", "Show FPS", "Frame Rate Cap", "Graphics API", "Upscaling", "Frame Generation" };
     return (i >= 0 && i < VM_COUNT) ? names[i] : "";
@@ -1000,6 +1012,7 @@ int xbox_VideoSettingValues(int i)
     case MI_POST:   return POST_PRESETS;
     case MI_SHARPEN: return 4;
     case MI_AO:     return 3;
+    case MI_HDR:    return 2;
     case MI_VSYNC: case MI_FPS: case MI_WIDE: return 2;
     case MI_BRIGHT: case MI_GAMMA: return 21;
     case MI_CROP: case MI_ANISO: return 5;
@@ -1029,6 +1042,7 @@ static int vm_get(const VideoSettings *vs, int item)
     case MI_POST:   return vs->post;
     case MI_SHARPEN: return vs->sharpen;
     case MI_AO:     return vs->ao;
+    case MI_HDR:    return vs->hdr;
     case MI_FILTER: return vs->filter;
     case MI_VSYNC:  return vs->vsync ? 1 : 0;
     case MI_BRIGHT: return (vs->brightness - 50) / 5;
@@ -1064,6 +1078,7 @@ static void vm_set(VideoSettings *vs, int item, int idx)
     case MI_POST:   vs->post = idx % POST_PRESETS; break;
     case MI_SHARPEN: vs->sharpen = idx & 3; break;
     case MI_AO:     vs->ao = idx % 3; break;
+    case MI_HDR:    vs->hdr = idx != 0; break;
     case MI_FILTER: vs->filter = idx; break;
     case MI_VSYNC:  vs->vsync = idx; break;
     case MI_BRIGHT: vs->brightness = 50 + 5 * idx; break;
@@ -1103,6 +1118,7 @@ void xbox_VideoSettingValueName(int i, int idx, char *buf, size_t n)
     case MI_POST:   snprintf(buf, n, "%s", k_post_presets[v.post % POST_PRESETS].name); break;
     case MI_SHARPEN: snprintf(buf, n, "%s", k_sharpen_names[v.sharpen & 3]); break;
     case MI_AO:     snprintf(buf, n, "%s", k_ao_names[v.ao % 3]); break;
+    case MI_HDR:    snprintf(buf, n, "%s", v.hdr ? "On (HDR10)" : "Off"); break;
     case MI_FILTER: snprintf(buf, n, "%s", filters[v.filter % 4]); break;
     case MI_VSYNC:  snprintf(buf, n, "%s", v.vsync ? "On" : "Off"); break;
     case MI_BRIGHT: snprintf(buf, n, "%d%%", v.brightness); break;
@@ -1623,6 +1639,7 @@ static int pr_present(uint32_t guest)
     g_want_mv = g_want_motion || s_vs.ao > 0;   /* the depth copy also feeds ambient occlusion */
     if (s_vs.dynres)
         g_render_scale = pr_dynres_scale();
+    g_gx_hdr_wanted = s_vs.hdr;                /* gx/gx_sdl.c switches the swap chain */
     if (env_cached("RECOMP_SCALE_CYCLE")) {
         /* test only: switch between 9x and 12x every N seconds (leak hunting) */
         static DWORD t0;

@@ -324,6 +324,8 @@ D3D_FEATURE_LEVEL gxs_ID3D11Device_GetFeatureLevel(void *d)
     return D3D_FEATURE_LEVEL_11_0;
 }
 
+static void present_blit(SDL_GPUCommandBuffer *cb, SDL_GPUTexture *src, Uint32 sw, Uint32 sh, SDL_GPUTexture *dst, Uint32 w, Uint32 h);
+
 /* Running totals for the hitch log (nv2a_gpu_perf.inc.c). */
 volatile LONG64 g_gx_compile_qpc, g_gx_pipe_qpc;
 volatile LONG g_gx_compiles, g_gx_pipes;
@@ -1985,7 +1987,9 @@ static int gx_presenter(void *window, int letterbox)
         if (SDL_ClaimWindowForGPUDevice(G.dev, (SDL_Window *)window)) {
             G.win = (SDL_Window *)window;
             InterlockedExchange(&G.claimed, 1);
-            fprintf(stderr, "  [GX] window claimed for %s\n", gx_backend_name());
+            fprintf(stderr, "  [GX] window claimed for %s (HDR10 %s, extended linear %s)\n", gx_backend_name(),
+                    SDL_WindowSupportsGPUSwapchainComposition(G.dev, G.win, SDL_GPU_SWAPCHAINCOMPOSITION_HDR10_ST2084) ? "yes" : "no",
+                    SDL_WindowSupportsGPUSwapchainComposition(G.dev, G.win, SDL_GPU_SWAPCHAINCOMPOSITION_HDR_EXTENDED_LINEAR) ? "yes" : "no");
         } else {
             fprintf(stderr, "  [GX] could not claim the window: %s\n", SDL_GetError());
             InterlockedExchange(&G.claimed, -1);
@@ -2074,15 +2078,8 @@ static DWORD WINAPI pacer_main(LPVOID arg)
         EnterCriticalSection(&G.submit_lock);
         cb = SDL_AcquireGPUCommandBuffer(G.dev);
         if (cb) {
-            if (SDL_WaitAndAcquireGPUSwapchainTexture(cb, G.win, &sct, &w, &h) && sct && PC.bb && PC.bb->t) {
-                SDL_GPUBlitInfo bi;
-                memset(&bi, 0, sizeof bi);
-                bi.source.texture = PC.bb->t; bi.source.w = PC.bb->d.Width; bi.source.h = PC.bb->d.Height;
-                bi.destination.texture = sct; bi.destination.w = w; bi.destination.h = h;
-                bi.load_op = SDL_GPU_LOADOP_DONT_CARE;
-                bi.filter = SDL_GPU_FILTER_LINEAR;
-                SDL_BlitGPUTexture(cb, &bi);
-            }
+            if (SDL_WaitAndAcquireGPUSwapchainTexture(cb, G.win, &sct, &w, &h) && sct && PC.bb && PC.bb->t)
+                present_blit(cb, PC.bb->t, PC.bb->d.Width, PC.bb->d.Height, sct, w, h);
             SDL_SubmitGPUCommandBuffer(cb);
         }
         LeaveCriticalSection(&G.submit_lock);
@@ -2095,6 +2092,133 @@ static void pacer_wait(void)
 {
     if (PC.busy)
         WaitForSingleObject(PC.done, 200);
+}
+
+
+/* ---- HDR10 output (2026-10-30) ---------------------------------------------
+ * With the HDR output setting on and a display that takes it, the swap chain
+ * is HDR10 (PQ, BT.2020) and the final copy of the back buffer becomes an
+ * encode: the picture as composed (sRGB, HUD and menus included) is turned
+ * to light, white is put at a paper white (200 nits) and only the brightest
+ * parts are lifted toward the peak (800 nits) -- stadium lights and the
+ * bloom around them gain real brightness, the rest looks as before. */
+volatile LONG g_gx_hdr_wanted;
+float g_gx_hdr_paper = 200.0f, g_gx_hdr_peak = 800.0f;
+static struct { int on, failed; SDL_GPUTextureFormat fmt; SDL_GPUGraphicsPipeline *pipe; SDL_GPUSampler *lin; } HDR;
+
+static const char k_hdr_hlsl[] =
+    "[[vk::combinedImageSampler]][[vk::binding(0, 2)]] Texture2D Src : register(t0, space2);\n"
+    "[[vk::combinedImageSampler]][[vk::binding(0, 2)]] SamplerState Smp : register(s0, space2);\n"
+    "[[vk::binding(0, 3)]] cbuffer U : register(b0, space3) { float4 k; };\n"
+    "struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
+    "V vs_main(uint id : SV_VertexID) {\n"
+    "  V o; float2 p = float2((id << 1) & 2, id & 2);\n"
+    "  o.pos = float4(p * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = p; return o; }\n"
+    "float4 ps_main(V i) : SV_Target {\n"
+    "  float3 c = Src.SampleLevel(Smp, i.uv, 0).rgb;\n"
+    "  float3 lin = lerp(c / 12.92, pow((c + 0.055) / 1.055, 2.4), step(0.04045, c));\n"
+    "  float l = dot(lin, float3(0.2126, 0.7152, 0.0722));\n"
+    "  float lift = 1.0 + (k.y / k.x - 1.0) * pow(saturate((l - 0.55) / 0.45), 2.0);\n"
+    "  float3 nits = lin * lift * k.x;\n"
+    "  float3 b = float3(dot(nits, float3(0.6274, 0.3293, 0.0433)), dot(nits, float3(0.0691, 0.9195, 0.0114)),\n"
+    "                    dot(nits, float3(0.0164, 0.0880, 0.8956))) / 10000.0;\n"
+    "  float3 p = pow(saturate(b), 0.1593017578125);\n"
+    "  return float4(pow((0.8359375 + 18.8515625 * p) / (1.0 + 18.6875 * p), 78.84375), 1.0); }\n";
+
+static int hdr_pipeline(SDL_GPUTextureFormat fmt)
+{
+    ID3DBlob *code = NULL, *err = NULL;
+    GxShader *vs = NULL, *ps = NULL;
+    SDL_GPUGraphicsPipelineCreateInfo pci;
+    SDL_GPUColorTargetDescription ctd;
+    if (HDR.pipe && HDR.fmt == fmt) return 1;
+    if (HDR.failed) return 0;
+    if (HDR.pipe) { SDL_ReleaseGPUGraphicsPipeline(G.dev, HDR.pipe); HDR.pipe = NULL; }
+    if (FAILED(gx_D3DCompile(k_hdr_hlsl, sizeof k_hdr_hlsl - 1, "hdr", NULL, NULL, "vs_main", "vs_5_0", 0, 0, &code, &err)) ||
+            FAILED(make_shader(gxs_ID3D10Blob_GetBufferPointer(code), gxs_ID3D10Blob_GetBufferSize(code), 0, (void **)&vs))) {
+        fprintf(stderr, "  [GX] HDR vertex shader: %s\n", err ? (const char *)gxs_ID3D10Blob_GetBufferPointer(err) : "?");
+        HDR.failed = 1;
+        return 0;
+    }
+    gxs_obj_Release(code); code = NULL;
+    if (FAILED(gx_D3DCompile(k_hdr_hlsl, sizeof k_hdr_hlsl - 1, "hdr", NULL, NULL, "ps_main", "ps_5_0", 0, 0, &code, &err)) ||
+            FAILED(make_shader(gxs_ID3D10Blob_GetBufferPointer(code), gxs_ID3D10Blob_GetBufferSize(code), 1, (void **)&ps))) {
+        fprintf(stderr, "  [GX] HDR pixel shader: %s\n", err ? (const char *)gxs_ID3D10Blob_GetBufferPointer(err) : "?");
+        gxs_obj_Release(vs);
+        HDR.failed = 1;
+        return 0;
+    }
+    gxs_obj_Release(code);
+    memset(&pci, 0, sizeof pci);
+    memset(&ctd, 0, sizeof ctd);
+    ctd.format = fmt;
+    pci.vertex_shader = vs->sh; pci.fragment_shader = ps->sh;
+    pci.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+    pci.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL;
+    pci.rasterizer_state.cull_mode = SDL_GPU_CULLMODE_NONE;
+    pci.target_info.num_color_targets = 1;
+    pci.target_info.color_target_descriptions = &ctd;
+    EnterCriticalSection(&G.create_lock);
+    HDR.pipe = SDL_CreateGPUGraphicsPipeline(G.dev, &pci);
+    if (!HDR.lin) {
+        SDL_GPUSamplerCreateInfo si;
+        memset(&si, 0, sizeof si);
+        si.min_filter = si.mag_filter = SDL_GPU_FILTER_LINEAR;
+        si.address_mode_u = si.address_mode_v = si.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+        HDR.lin = SDL_CreateGPUSampler(G.dev, &si);
+    }
+    LeaveCriticalSection(&G.create_lock);
+    gxs_obj_Release(vs); gxs_obj_Release(ps);
+    if (!HDR.pipe || !HDR.lin) {
+        fprintf(stderr, "  [GX] HDR pipeline: %s\n", SDL_GetError());
+        HDR.failed = 1;
+        return 0;
+    }
+    HDR.fmt = fmt;
+    fprintf(stderr, "  [GX] HDR10 output ready (paper white %.0f nits, peak %.0f)\n", g_gx_hdr_paper, g_gx_hdr_peak);
+    return 1;
+}
+
+/* The back buffer onto the swap chain image: a plain copy, or the HDR10 encode. */
+static void present_blit(SDL_GPUCommandBuffer *cb, SDL_GPUTexture *src, Uint32 sw, Uint32 sh, SDL_GPUTexture *dst, Uint32 w, Uint32 h)
+{
+    if (HDR.on && hdr_pipeline(SDL_GetGPUSwapchainTextureFormat(G.dev, G.win))) {
+        SDL_GPUColorTargetInfo ct;
+        SDL_GPURenderPass *rp;
+        SDL_GPUViewport vp;
+        SDL_GPUTextureSamplerBinding b;
+        float u[4];
+        memset(&ct, 0, sizeof ct);
+        ct.texture = dst; ct.load_op = SDL_GPU_LOADOP_DONT_CARE; ct.store_op = SDL_GPU_STOREOP_STORE;
+        u[0] = g_gx_hdr_paper; u[1] = g_gx_hdr_peak; u[2] = u[3] = 0.0f;
+        SDL_PushGPUFragmentUniformData(cb, 0, u, sizeof u);
+        rp = SDL_BeginGPURenderPass(cb, &ct, 1, NULL);
+        if (rp) {
+            memset(&vp, 0, sizeof vp);
+            vp.w = (float)w; vp.h = (float)h; vp.max_depth = 1.0f;
+            SDL_SetGPUViewport(rp, &vp);
+            SDL_BindGPUGraphicsPipeline(rp, HDR.pipe);
+            b.texture = src; b.sampler = HDR.lin;
+            SDL_BindGPUFragmentSamplers(rp, 0, &b, 1);
+            SDL_DrawGPUPrimitives(rp, 3, 1, 0, 0);
+            SDL_EndGPURenderPass(rp);
+        }
+        return;
+    }
+    {
+        SDL_GPUBlitInfo bi;
+        memset(&bi, 0, sizeof bi);
+        bi.source.texture = src; bi.source.w = sw; bi.source.h = sh;
+        bi.destination.texture = dst; bi.destination.w = w; bi.destination.h = h;
+        bi.load_op = SDL_GPU_LOADOP_DONT_CARE;
+        bi.filter = SDL_GPU_FILTER_LINEAR;
+        SDL_BlitGPUTexture(cb, &bi);
+    }
+}
+
+int gxs_hdr_supported(void)
+{
+    return G.dev && G.win && SDL_WindowSupportsGPUSwapchainComposition(G.dev, G.win, SDL_GPU_SWAPCHAINCOMPOSITION_HDR10_ST2084);
 }
 
 HRESULT gxs_swapchain_bb2(IDXGISwapChain1 *sc, ID3D11Texture2D **out)
@@ -2154,25 +2278,29 @@ HRESULT gxs_IDXGISwapChain1_Present(void *s, UINT sync, UINT flags)
     pacer_wait();
     if (!G.win || !sw->bb) { flush(1); return S_OK; }
     EnterCriticalSection(&G.submit_lock);
-    if (mode != G.present_mode) {
-        SDL_GPUPresentMode pm = SDL_GPU_PRESENTMODE_VSYNC;
-        if (mode == 1) {
-            if (SDL_WindowSupportsGPUPresentMode(G.dev, G.win, SDL_GPU_PRESENTMODE_IMMEDIATE)) pm = SDL_GPU_PRESENTMODE_IMMEDIATE;
-            else if (SDL_WindowSupportsGPUPresentMode(G.dev, G.win, SDL_GPU_PRESENTMODE_MAILBOX)) pm = SDL_GPU_PRESENTMODE_MAILBOX;
+    {
+        int hdr = g_gx_hdr_wanted && gxs_hdr_supported();
+        if (mode != G.present_mode || hdr != HDR.on) {
+            SDL_GPUPresentMode pm = SDL_GPU_PRESENTMODE_VSYNC;
+            if (mode == 1) {
+                if (SDL_WindowSupportsGPUPresentMode(G.dev, G.win, SDL_GPU_PRESENTMODE_IMMEDIATE)) pm = SDL_GPU_PRESENTMODE_IMMEDIATE;
+                else if (SDL_WindowSupportsGPUPresentMode(G.dev, G.win, SDL_GPU_PRESENTMODE_MAILBOX)) pm = SDL_GPU_PRESENTMODE_MAILBOX;
+            }
+            if (SDL_SetGPUSwapchainParameters(G.dev, G.win, hdr ? SDL_GPU_SWAPCHAINCOMPOSITION_HDR10_ST2084
+                                                                 : SDL_GPU_SWAPCHAINCOMPOSITION_SDR, pm)) {
+                if (hdr != HDR.on) fprintf(stderr, "  [GX] output %s\n", hdr ? "HDR10" : "SDR");
+                HDR.on = hdr;
+            } else if (hdr) {
+                fprintf(stderr, "  [GX] HDR10 swap chain refused: %s\n", SDL_GetError());
+                g_gx_hdr_wanted = 0;
+            }
+            G.present_mode = mode;
         }
-        SDL_SetGPUSwapchainParameters(G.dev, G.win, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, pm);
-        G.present_mode = mode;
     }
     flush(0);
     if (s_cb && SDL_WaitAndAcquireGPUSwapchainTexture(s_cb, G.win, &sct, &w, &h) && sct) {
-        SDL_GPUBlitInfo bi;
         GxTex *first = pair ? sw->bb2 : sw->bb;
-        memset(&bi, 0, sizeof bi);
-        bi.source.texture = first->t; bi.source.w = first->d.Width; bi.source.h = first->d.Height;
-        bi.destination.texture = sct; bi.destination.w = w; bi.destination.h = h;
-        bi.load_op = SDL_GPU_LOADOP_DONT_CARE;
-        bi.filter = SDL_GPU_FILTER_LINEAR;
-        SDL_BlitGPUTexture(s_cb, &bi);
+        present_blit(s_cb, first->t, first->d.Width, first->d.Height, sct, w, h);
     }
     flush(1);
     if (pair) {
