@@ -94,6 +94,25 @@ static void *g_mirror_views[XBOX_NUM_MIRRORS] = {0};
  * question. */
 static void *g_span_base = NULL;
 static size_t g_span_size = 0;
+
+/* POSIX: the whole 4 GB guest range is reserved with the RAM view (see
+ * MemoryLayoutInit), so the apertures at fixed offsets above it (contiguous
+ * window 0x80000000, tiled 0xF0000000, NV2A 0xFD000000, MCPX 0xFE800000,
+ * flash 0xFF000000) are ours to place. Before one is mapped, its slice of the
+ * reservation is handed back. Without this they raced the rest of the
+ * process for those addresses: on Android, where libraries crowd the space
+ * next to ours, every one failed (error 8) and the first NV2A access
+ * crashed (2026-10-30). */
+static void span_take(uintptr_t addr, size_t size)
+{
+#ifndef _WIN32
+    uintptr_t s = (uintptr_t)g_span_base;
+    if (g_span_base && addr >= s && addr + size <= s + g_span_size)
+        VirtualFree((LPVOID)addr, size, MEM_RELEASE);
+#else
+    (void)addr; (void)size;
+#endif
+}
 static void *g_tiled_view = NULL;
 
 /* Contiguous / physical memory window (see MemoryLayoutInit).
@@ -1893,8 +1912,12 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         /* The POSIX shim can release individual slices of a reservation.
          * Windows MEM_RELEASE requires size zero and releases the whole
          * reservation; use the fixed-base views below on Windows. */
-        g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
+        g_span_size = 0x100000000ull;   /* all 32-bit guest addresses: RAM, mirrors and apertures */
         g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
+        if (!g_span_base) {             /* the old, smaller reservation: RAM and mirrors only */
+            g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
+            g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
+        }
         if (g_span_base) {
             VirtualFree(g_span_base, g_memory_size, MEM_RELEASE);
             g_memory_base = MapViewOfFileEx(g_mapping_handle,
@@ -2389,6 +2412,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      */
     {
         uintptr_t contig_native = XBOX_CONTIG_BASE + g_memory_offset;
+        span_take(contig_native, XBOX_CONTIG_SIZE);
         g_contig_mapping = CreateFileMappingW(
             INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
             0, (DWORD)XBOX_CONTIG_SIZE, NULL);
@@ -2434,6 +2458,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      */
     {
         uintptr_t nv2a_native = XBOX_NV2A_BASE + g_memory_offset;
+        span_take(nv2a_native, XBOX_NV2A_SIZE);
         g_nv2a_memory = VirtualAlloc(
             (LPVOID)nv2a_native,
             XBOX_NV2A_SIZE,
@@ -2480,6 +2505,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      */
     {
         uintptr_t mcpx_native = XBOX_MCPX_BASE + g_memory_offset;
+        span_take(mcpx_native, XBOX_MCPX_SIZE);
         g_mcpx_memory = VirtualAlloc(
             (LPVOID)mcpx_native,
             XBOX_MCPX_SIZE,
@@ -2577,6 +2603,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     /* Flash ROM aperture -- see XBOX_FLASH_BASE for why. */
     {
         uintptr_t flash_native = XBOX_FLASH_BASE + g_memory_offset;
+        span_take(flash_native, XBOX_FLASH_SIZE);
 
         g_flash_memory = VirtualAlloc(
             (LPVOID)flash_native,
@@ -2617,8 +2644,9 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * 0x80010000 sits inside it - so just use that storage. */
         g_kernel_memory = g_contig_memory
             ? (void *)kernel_native
-            : VirtualAlloc((LPVOID)kernel_native, KERNEL_PAGE_SIZE,
-                           MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            : (span_take(kernel_native, KERNEL_PAGE_SIZE),
+               VirtualAlloc((LPVOID)kernel_native, KERNEL_PAGE_SIZE,
+                            MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
         if (g_kernel_memory) {
             /* Zero-fill then set e_lfanew = 0x80 (offset to PE header).
              * With the rest zeroed, NumberOfSections = 0 and the INIT
@@ -2743,6 +2771,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          */
         if (tiled_size > XBOX_CONTIG_SIZE)
             tiled_size = XBOX_CONTIG_SIZE;
+        span_take(tiled_native, tiled_size);
         g_tiled_view = g_contig_mapping
             ? MapViewOfFileEx(
                 g_contig_mapping,
