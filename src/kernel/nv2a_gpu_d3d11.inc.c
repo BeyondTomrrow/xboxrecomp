@@ -75,6 +75,11 @@ typedef struct {
 /* Internal resolution (video settings): every render target is this many
  * times its guest size. Set by the presenter; surfaces follow on next use. */
 static uint32_t g_render_scale = 1;
+/* Motion vectors, depth copy and reactive mask (extra render targets for
+ * FSR 3) are only made while upscaling or frame generation is on: at a
+ * high scale they were most of the bandwidth of every draw (2026-10-29). */
+static int g_want_mv = 1;
+#define GPU_SURF_WANTS_MV(w, h) (g_gx_sg && g_want_mv && (w) >= 640 && (h) >= 448)
 static uint32_t g_aniso = 1;
 /* 0 preserves the original Xbox combiner output. Optional profiles are
  * applied after the emulated material/lighting pipeline. */
@@ -565,7 +570,8 @@ static int gpu_bind_surface(void)
                     /* Retain a prior lower allocation after an OOM step-down,
                      * but rebuild if the player changes the requested scale. */
                     && s->requested_scale == gpu_fit_scale(w + 2 * gpu_wide_ox(w, h), h)
-                    && s->ox == gpu_wide_ox(w, h)) {
+                    && s->ox == gpu_wide_ox(w, h)
+                    && (s->mv_rtv != NULL) == (GPU_SURF_WANTS_MV(w, h) != 0)) {
                 if (s->stale) {             /* the CPU drew into it since */
                     gpu_surface_upload(s);
                     s->stale = 0;
@@ -641,7 +647,7 @@ retry_surface_create:
                 FAILED(ID3D11Device_CreateDepthStencilView(s_gpu11.dev, (ID3D11Resource *)s->ds, NULL, &s->dsv)) || !s->dsv)
             goto surface_create_failed;
         ID3D11DeviceContext_ClearDepthStencilView(s_gpu11.ctx, s->dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
-        if (g_gx_sg && w >= 640 && h >= 448) {
+        if (GPU_SURF_WANTS_MV(w, h)) {
             /* Screen-sized targets get motion vectors (upscaling and frame
              * generation read them); off-screen ones do not need them. */
             static const float zero[4] = { 0, 0, 0, 0 };

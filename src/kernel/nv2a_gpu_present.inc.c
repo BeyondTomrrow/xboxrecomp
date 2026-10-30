@@ -258,7 +258,18 @@ static const char k_present_hlsl[] =
     "  o.pos = float4(p * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = p; return o; }\n"
     "float4 ps_main(V i) : SV_Target {\n"
     "  float2 uv = src.xy + i.uv * src.zw; float4 c;\n"
-    "  if (prm.z == 1.0) c = SrcP.Sample(Pt, uv);\n"
+    /* Shrinking a raised internal resolution to the screen: average every
+     * rendered pixel under the screen pixel (bilinear taps two texels apart).
+     * The 5-tap filters below read one texel apart, so at 16x on a 1440-line
+     * screen they used ~4 of the ~28 pixels drawn for each one shown, and
+     * the picture shimmered like a far lower scale (2026-10-29). */
+    "  float2 ssr = sz.xy * src.zw / max(sz.zw, 1.0);\n"
+    "  if ((prm.z == 0.0 || prm.z == 3.0) && max(ssr.x, ssr.y) > 1.5) {\n"
+    "    int2 n = (int2)clamp(ceil(ssr * 0.5), 1.0, 8.0);\n"
+    "    float2 st = ssr / (float2)n / sz.xy, o = uv - st * ((float2)n - 1.0) * 0.5; float4 a = 0;\n"
+    "    [loop] for (int y = 0; y < n.y; y++) [loop] for (int x = 0; x < n.x; x++) a += Src.SampleLevel(Lin, o + st * float2(x, y), 0);\n"
+    "    c = a / (float)(n.x * n.y);\n"
+    "  } else if (prm.z == 1.0) c = SrcP.Sample(Pt, uv);\n"
     "  else if (prm.z == 2.0) {\n"
     "    float2 tex = uv * sz.xy, fl = floor(tex), s = frac(tex);\n"
     "    float2 sc = max(floor(sz.zw / (sz.xy * src.zw)), 1.0);\n"
@@ -1513,6 +1524,7 @@ static int pr_present(uint32_t guest)
     if (InterlockedExchange(&s_vs_dirty, 0))
         pr_apply_mode();
     g_render_scale = (uint32_t)s_vs.scale;     /* surfaces follow on their next use */
+    g_want_mv = ((s_vs.upscaler || s_vs.framegen) && gxs_fsr_available()) || env_cached("RECOMP_FORCE_MV");
     if (s_vs.dynres)
         g_render_scale = pr_dynres_scale();
     if ((s_vs.upscaler || s_vs.framegen) && gxs_fsr_available() && s_fsr_out_h) {
@@ -1624,6 +1636,9 @@ static int pr_present(uint32_t guest)
                        (ID3D11Resource *)(s->mv && env_cached("RECOMP_MV_SHOW") ? s->mv : shown), NULL, &srv)))
             return 0;
         pc.sz[2] = dw; pc.sz[3] = dh;
+        if (pc.prm[2] == 3.0f && env_cached("RECOMP_NO_SSDOWN")) {   /* A/B: the old 5-tap filter only */
+            pc.sz[2] = pc.sz[0] * pc.src[2]; pc.sz[3] = pc.sz[1] * pc.src[3];
+        }
     }
     /* Frame generation: the generated frame is composed exactly like the
      * real one (picture, HUD, overlays) into a second back buffer, presented
