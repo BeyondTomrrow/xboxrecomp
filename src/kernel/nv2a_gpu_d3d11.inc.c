@@ -993,6 +993,55 @@ static void tex_pool_put(ID3D11Texture2D *tex, ID3D11ShaderResourceView *srv)
 }
 
 /* Create (or take from the pool and refill) a shader-resource texture. */
+/* Keep the pool stocked with the texture shapes the game makes most
+ * (RECOMP_TEX_SHAPES, a demo run 2026-10-30: 128x128, 64x64, 256x256,
+ * 256x128, 128x64, 32x32 BGRA and 256x256 BC1 were 9 in 10). A scene change
+ * creates 35-120 at once, ~0.6 ms each on Direct3D 12, and the pool -- filled
+ * only by evictions -- had none of them; now a few are made between frames
+ * (1.5 ms a frame at most), ~20 MB of video memory in all.
+ * RECOMP_NO_TEX_WARM=1 turns it off. */
+static void tex_pool_topup(void)
+{
+    static const struct { UINT w, h; DXGI_FORMAT fmt; int want; } k_shapes[] = {
+        { 128, 128, DXGI_FORMAT_B8G8R8A8_UNORM, 48 }, { 64, 64, DXGI_FORMAT_B8G8R8A8_UNORM, 40 },
+        { 256, 256, DXGI_FORMAT_B8G8R8A8_UNORM, 24 }, { 256, 128, DXGI_FORMAT_B8G8R8A8_UNORM, 24 },
+        { 128, 64, DXGI_FORMAT_B8G8R8A8_UNORM, 16 },  { 32, 32, DXGI_FORMAT_B8G8R8A8_UNORM, 16 },
+        { 256, 256, DXGI_FORMAT_BC1_UNORM, 10 },      { 256, 32, DXGI_FORMAT_B8G8R8A8_UNORM, 10 },
+        { 512, 256, DXGI_FORMAT_B8G8R8A8_UNORM, 6 },
+    };
+    LARGE_INTEGER t0, t1, fq;
+    size_t s;
+    if (!tex_pool_on() || env_cached("RECOMP_NO_TEX_WARM") || s_tpool_n > TEX_POOL - 48)
+        return;
+    QueryPerformanceCounter(&t0);
+    QueryPerformanceFrequency(&fq);
+    for (s = 0; s < sizeof k_shapes / sizeof k_shapes[0]; s++) {
+        int have = 0, i;
+        for (i = 0; i < s_tpool_n; i++)
+            if (s_tpool[i].d.Width == k_shapes[s].w && s_tpool[i].d.Height == k_shapes[s].h &&
+                    s_tpool[i].d.Format == k_shapes[s].fmt && s_tpool[i].d.MipLevels == 1 &&
+                    s_tpool[i].d.ArraySize == 1 && !s_tpool[i].d.MiscFlags) have++;
+        while (have < k_shapes[s].want) {
+            D3D11_TEXTURE2D_DESC td;
+            ID3D11Texture2D *tex = NULL;
+            ID3D11ShaderResourceView *srv = NULL;
+            memset(&td, 0, sizeof td);
+            td.Width = k_shapes[s].w; td.Height = k_shapes[s].h; td.MipLevels = td.ArraySize = 1;
+            td.Format = k_shapes[s].fmt; td.SampleDesc.Count = 1;
+            td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            if (FAILED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, NULL, &tex)) ||
+                    FAILED(ID3D11Device_CreateShaderResourceView(s_gpu11.dev, (ID3D11Resource *)tex, NULL, &srv))) {
+                if (tex) ID3D11Texture2D_Release(tex);
+                return;
+            }
+            tex_pool_put(tex, srv);
+            have++;
+            QueryPerformanceCounter(&t1);
+            if ((t1.QuadPart - t0.QuadPart) * 1000 > fq.QuadPart * 3 / 2) return;   /* 1.5 ms this frame */
+        }
+    }
+}
+
 static int tex_make(D3D11_TEXTURE2D_DESC *td, const D3D11_SUBRESOURCE_DATA *sd,
                     ID3D11Texture2D **tex, ID3D11ShaderResourceView **srv)
 {
@@ -1018,6 +1067,35 @@ static int tex_make(D3D11_TEXTURE2D_DESC *td, const D3D11_SUBRESOURCE_DATA *sd,
     }
     if (++s_tpool_misses % 2000 == 0)
         fprintf(stderr, "  [TEXPOOL] %u reused, %u created (pool holds %d)\n", s_tpool_hits, s_tpool_misses, s_tpool_n);
+    if (env_cached("RECOMP_TEX_SHAPES")) {
+        /* test only: which texture shapes are created, most common first, every 200 */
+        static struct { UINT w, h, mips, arr, fmt, misc, n; } sh[256];
+        static int nsh;
+        static unsigned total;
+        int k;
+        for (k = 0; k < nsh; k++)
+            if (sh[k].w == td->Width && sh[k].h == td->Height && sh[k].mips == td->MipLevels && sh[k].arr == td->ArraySize &&
+                    sh[k].fmt == (UINT)td->Format && sh[k].misc == td->MiscFlags) break;
+        if (k == nsh && nsh < 256) {
+            sh[k].w = td->Width; sh[k].h = td->Height; sh[k].mips = td->MipLevels; sh[k].arr = td->ArraySize;
+            sh[k].fmt = (UINT)td->Format; sh[k].misc = td->MiscFlags; sh[k].n = 0; nsh++;
+        }
+        if (k < nsh) sh[k].n++;
+        if (++total % 200 == 0) {
+            int j, shown;
+            fprintf(stderr, "  [TEXSHAPES] %u created, %d shapes:", total, nsh);
+            for (shown = 0; shown < 24; shown++) {
+                int best = -1;
+                for (j = 0; j < nsh; j++) if (sh[j].n && (int)sh[j].n > 0 && (best < 0 || sh[j].n > sh[best].n)) best = j;
+                if (best < 0) break;
+                fprintf(stderr, " %ux%u/m%u/a%u/f%u/x%X=%u", sh[best].w, sh[best].h, sh[best].mips, sh[best].arr, sh[best].fmt,
+                        sh[best].misc, sh[best].n);
+                sh[best].n = ~sh[best].n;        /* mark printed (restored below) */
+            }
+            for (j = 0; j < nsh; j++) if ((int)sh[j].n < 0) sh[j].n = ~sh[j].n;
+            fprintf(stderr, "\n");
+        }
+    }
     if (FAILED(ID3D11Device_CreateTexture2D(s_gpu11.dev, td, sd, tex)))
         return 0;
     if (FAILED(ID3D11Device_CreateShaderResourceView(s_gpu11.dev, (ID3D11Resource *)*tex, NULL, srv))) {
@@ -2656,6 +2734,7 @@ static void gpu_flip_unlocked(void)
     if (env_cached("RECOMP_GPU_TRACE") && (s_gpu11.frame % 300) == 0)
         fprintf(stderr, "  [GPUTRACE] f%u flip shows %08X\n", s_gpu11.frame, dma_resolve(s_gpu.color_offset));
     s_gpu11.frame++;
+    tex_pool_topup();
     if ((s_gpu11.frame % 600) == 0)
         fprintf(stderr, "  [GPU11] frames %u draws %u tris %u texture uploads %u readbacks %u\n",
                 s_gpu11.frame, s_gpu11.draws, s_gpu11.tris, s_gpu11.tex_uploads, s_gpu11.readbacks);

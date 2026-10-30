@@ -1572,6 +1572,13 @@ static int pr_present(uint32_t guest)
     g_want_mv = g_want_motion || s_vs.ao > 0;   /* the depth copy also feeds ambient occlusion */
     if (s_vs.dynres)
         g_render_scale = pr_dynres_scale();
+    if (env_cached("RECOMP_SCALE_CYCLE")) {
+        /* test only: switch between 9x and 12x every N seconds (leak hunting) */
+        static DWORD t0;
+        DWORD per = (DWORD)atoi(env_cached("RECOMP_SCALE_CYCLE")) * 1000u;
+        if (!t0) t0 = GetTickCount();
+        g_render_scale = per && ((GetTickCount() - t0) / per) % 2 ? 12u : 9u;
+    }
     if ((s_vs.upscaler || s_vs.framegen) && gxs_fsr_available() && s_fsr_out_h) {
         /* FSR 3: render at the on-screen size over the quality ratio (the
          * internal-resolution setting does not apply), rounded to a whole

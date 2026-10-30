@@ -176,6 +176,7 @@ static void perf_hitch(float ms, float present_ms)
     LONG64 tq = g_tex_upload_qpc, tc = g_tex_create_qpc;
     LONG64 lw = g_xbox_game_tid ? xbox_ggl_waited_qpc(g_xbox_game_tid) : 0;
     static uint32_t draws, texup, surfs;
+    static unsigned phit, pmiss;
     static LONG ps;
     static unsigned logged;
     LONG64 q = g_xbox_read_qpc, b = g_xbox_read_bytes, c = g_xbox_read_count;
@@ -183,6 +184,7 @@ static void perf_hitch(float ms, float present_ms)
     double f = 1000.0 / (double)s_perf.freq.QuadPart;
     if (ms > 25.0f && s_perf.n > 1800 && logged < 400) {
         logged++;
+        fprintf(stderr, "  [HITCH]   texture pool: %u reused, %u created\n", s_tpool_hits - phit, s_tpool_misses - pmiss);
         fprintf(stderr, "  [HITCH] %.1f ms: present %.1f ms, reads %lld (%lld KB, %.1f ms), tex uploads %u (%.1f ms, create %.1f), new targets %u, "
                         "ps ready %ld, draws %u; render thread %.1f ms, queue wait %.1f ms, capture %.1f ms, game thread lock wait %.1f ms\n",
                 ms, present_ms, (long long)(c - rc), (long long)((b - rb) >> 10), (double)(q - rq) * f,
@@ -191,6 +193,7 @@ static void perf_hitch(float ms, float present_ms)
     }
     rq = q; rb = b; rc = c; ex = e; qw = w; cp = k; gw = lw; tx = tq; tcx = tc;
     draws = s_gpu11.draws; texup = s_gpu11.tex_uploads; surfs = s_gpu11.surf_creates; ps = s_ps_ready;
+    phit = s_tpool_hits; pmiss = s_tpool_misses;
 }
 
 /* Frames presented and the longest frame (us) since the APU's audio report
