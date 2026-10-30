@@ -124,6 +124,26 @@ static int ggl_stat_slot(void)
  * title's input layer) and how long a thread has waited for the lock in all,
  * in QPC ticks -- the frame-statistics hitch log reports the game thread's. */
 volatile DWORD g_xbox_game_tid;
+/* The thread that holds the lock most (the title's main thread): how long it
+ * has waited for the lock in all. The input poll's thread id was used before,
+ * but more than one thread polls, so the hitch log's figure jumped between
+ * threads' totals. */
+DWORD xbox_ggl_main_tid(void)
+{
+    int best = -1;
+    for (int i = 0; i < GGL_STAT_SLOTS; i++)
+        if (g_stat[i].tid && (best < 0 || g_stat[i].held > g_stat[best].held)) best = i;
+    return best < 0 ? 0 : g_stat[best].tid;
+}
+
+LONGLONG xbox_ggl_main_waited_qpc(void)
+{
+    int best = -1;
+    for (int i = 0; i < GGL_STAT_SLOTS; i++)
+        if (g_stat[i].tid && (best < 0 || g_stat[i].held > g_stat[best].held)) best = i;
+    return best < 0 ? 0 : g_stat[best].waited;
+}
+
 LONGLONG xbox_ggl_waited_qpc(DWORD tid)
 {
     for (int i = 0; i < GGL_STAT_SLOTS; i++)

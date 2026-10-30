@@ -379,6 +379,9 @@ typedef struct {
 
 static PbUnhandled s_unhandled[PB_EXEC_MAX_UNHANDLED];
 static int s_unhandled_count;
+/* slot + 1 of each method in s_unhandled: a scan of ~200 entries on every
+ * unhandled method was ~1% of the render thread (2026-10-30) */
+static uint16_t s_unhandled_slot[0x4000];
 
 /* Every texture-stage register, as the title last set it.
  * Texturing is not implemented yet; knowing which formats and sizes a title
@@ -468,10 +471,17 @@ static void note_unhandled(uint32_t method, uint32_t param) {
     int i;
 
     s_gpu.unhandled_total++;
+    i = s_unhandled_slot[(method >> 2) & 0x3FFF] - 1;
+    if (i >= 0 && s_unhandled[i].method == method) {
+        s_unhandled[i].count++;
+        s_unhandled[i].last_param = param;
+        return;
+    }
     for (i = 0; i < s_unhandled_count; i++) {
         if (s_unhandled[i].method == method) {
             s_unhandled[i].count++;
             s_unhandled[i].last_param = param;
+            s_unhandled_slot[(method >> 2) & 0x3FFF] = (uint16_t)(i + 1);
             return;
         }
     }
@@ -485,6 +495,7 @@ static void note_unhandled(uint32_t method, uint32_t param) {
         s_unhandled[s_unhandled_count].count = 1;
         s_unhandled[s_unhandled_count].last_param = param;
         s_unhandled_count++;
+        s_unhandled_slot[(method >> 2) & 0x3FFF] = (uint16_t)s_unhandled_count;
     }
 }
 

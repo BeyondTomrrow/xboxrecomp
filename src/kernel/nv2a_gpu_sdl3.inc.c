@@ -59,7 +59,7 @@ int (*xbox_present_in_match_fn)(void) = NULL;
 int xbox_hud_shared_failed = 1;
 
 typedef struct { int bb_w, bb_h; float game_x, game_y, game_w, game_h; } XboxHudFrame;
-typedef struct { const void *pixels; int w, h, stride, x, y, changed, dw, dh; void *shared; } XboxHudImage;
+typedef struct { const void *pixels; int w, h, stride, x, y, changed, dw, dh; void *shared; int dirty_y0, dirty_y1; const unsigned char *dirty_rows; } XboxHudImage;
 typedef int (*XboxHudCallback)(const XboxHudFrame *f, XboxHudImage *img);
 static XboxHudCallback s_hud_cb = NULL;
 

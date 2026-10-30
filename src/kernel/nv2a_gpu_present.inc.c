@@ -646,7 +646,7 @@ static void pr_apply_mode(void)
  * callback runs on this thread once per presented frame, is told where the
  * game picture sits, and returns its image (uploaded only when changed). */
 typedef struct { int bb_w, bb_h; float game_x, game_y, game_w, game_h; } XboxHudFrame;
-typedef struct { const void *pixels; int w, h, stride, x, y, changed, dw, dh; void *shared; } XboxHudImage;   /* dw/dh: drawn size (0 = w/h); shared: NT handle of a keyed-mutex texture, or NULL */
+typedef struct { const void *pixels; int w, h, stride, x, y, changed, dw, dh; void *shared; int dirty_y0, dirty_y1; const unsigned char *dirty_rows; } XboxHudImage;   /* dw/dh: drawn size (0 = w/h); shared: NT handle of a keyed-mutex texture, or NULL */
 int xbox_hud_shared_failed;
 typedef int (*XboxHudCallback)(const XboxHudFrame *f, XboxHudImage *img);
 static void pr_present_shot(void);
@@ -739,22 +739,42 @@ static void pr_draw_hud(float gx, float gy, float gw, float gh)
         memset(&td, 0, sizeof td);
         td.Width = (UINT)img.w; td.Height = (UINT)img.h; td.MipLevels = 1; td.ArraySize = 1;
         td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
-        td.Usage = D3D11_USAGE_DYNAMIC; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         if (FAILED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, NULL, &s_hud.tex)) ||
             FAILED(ID3D11Device_CreateShaderResourceView(s_gpu11.dev, (ID3D11Resource *)s_hud.tex, NULL, &s_hud.srv)))
             return;
         s_hud.w = img.w; s_hud.h = img.h;
         img.changed = 1;
+        img.dirty_y0 = img.dirty_y1 = 0;           /* a new texture: all of it */
     }
     if (img.changed) {
-        D3D11_MAPPED_SUBRESOURCE m;
-        if (SUCCEEDED(ID3D11DeviceContext_Map(s_gpu11.ctx, (ID3D11Resource *)s_hud.tex, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-            int row;
-            for (row = 0; row < img.h; row++)
-                memcpy((uint8_t *)m.pData + (size_t)row * m.RowPitch,
-                       (const uint8_t *)img.pixels + (size_t)row * (size_t)img.stride, (size_t)img.w * 4u);
-            ID3D11DeviceContext_Unmap(s_gpu11.ctx, (ID3D11Resource *)s_hud.tex, 0);
+        /* Only the rows the page changed, when it says (a full frame was
+         * 20 MB a frame at 3440x1440) */
+        int y0 = 0, y1 = img.h;
+        if (img.dirty_y1 > img.dirty_y0) {
+            y0 = img.dirty_y0 < 0 ? 0 : img.dirty_y0;
+            y1 = img.dirty_y1 > img.h ? img.h : img.dirty_y1;
+        }
+        while (y0 < y1) {
+            /* each band of changed rows (a scorebug, a ticker), gaps under
+             * 16 rows bridged */
+            int end = y1;
+            if (img.dirty_rows) {
+                int gap = 0, y;
+                while (y0 < y1 && !img.dirty_rows[y0]) y0++;
+                for (y = y0, end = y0; y < y1; y++) {
+                    if (img.dirty_rows[y]) { end = y + 1; gap = 0; }
+                    else if (++gap >= 16) break;
+                }
+                if (y0 >= y1) break;
+            }
+            {
+                D3D11_BOX box = { 0, (UINT)y0, 0, (UINT)img.w, (UINT)end, 1 };
+                ID3D11DeviceContext_UpdateSubresource(s_gpu11.ctx, (ID3D11Resource *)s_hud.tex, 0, &box,
+                                                      (const uint8_t *)img.pixels + (size_t)y0 * (size_t)img.stride,
+                                                      (UINT)img.stride, 0);
+            }
+            y0 = end;
         }
     }
     view = s_hud.srv;
@@ -1942,9 +1962,11 @@ static uint32_t pr_dynres_scale(void)
 {
     static uint32_t cur;
     static LONGLONG last_step, last_down, last_up, seen;
-    static float hold = 10.0f;                      /* seconds after a step down before going up */
+    static float hold = 20.0f;                      /* seconds after a step down before going up */
     static int quiet, slow, waits;
-    uint32_t top = 16;                              /* auto: as high as holds the cap */
+    static float wait_sum;
+    static uint32_t learned = 16;                   /* the most a heavy scene has held */
+    uint32_t top = learned;                         /* auto: as high as holds the cap */
     LARGE_INTEGER now;
     float util = s_gpuctr.util, f = s_perf.freq.QuadPart ? (float)s_perf.freq.QuadPart : 1.0f;
     if (!cur) cur = (uint32_t)s_vs.scale;           /* start from the chosen scale */
@@ -1954,15 +1976,45 @@ static uint32_t pr_dynres_scale(void)
      * came down (the demo's commonest hitch, 2026-10-30). 20 such frames in
      * a row -- a third of a second -- step down at once. With VSync on,
      * Present waits for the display anyway: only long waits count there. */
-    waits = s_last_present_ms > (s_vs.vsync ? 14.0f : 6.0f) ? waits + 1 : 0;
-    if (waits >= 20 && cur > 1) {
-        uint32_t to = cur * 4 / 5;
+    if (s_last_present_ms > (s_vs.vsync ? 14.0f : 6.0f)) {
+        waits++;
+        wait_sum += s_last_present_ms - (s_vs.vsync ? 8.0f : 0.0f);
+    } else {
+        waits = 0;
+        wait_sum = 0.0f;
+    }
+    /* a frame or more behind (an 8x scene at 16x) shows within a few frames:
+     * 6 of those are enough; small waits take 20 to be sure */
+    /* Loading screens make Present wait too, with the GPU idle (one start
+     * fell from 9x to 3x that way): the GPU must also read busy, and this
+     * path goes no lower than half the chosen scale. */
+    if ((waits >= 20 || (waits >= 6 && wait_sum / (float)waits > 12.0f)) && cur > 1
+            && s_gpuctr.state == 1 && util >= 40.0f && cur > (uint32_t)(s_vs.scale + 1) / 2) {
+        /* Each change rebuilds the render targets (a 20-60 ms hitch): one
+         * step to the size the wait says fits -- cost goes with the pixel
+         * count -- not 4/5 at a time (16x went 12x then 9x, two hitches). */
+        float budget = 1000.0f / (s_vs.fps_limit == 30 ? 30.0f : 60.0f);
+        uint32_t to = (uint32_t)((float)cur * sqrtf(budget / (budget + wait_sum / (float)waits)) * 0.95f);
+        if (to < cur / 2) to = cur / 2;
+        if (to < (uint32_t)(s_vs.scale + 1) / 2) to = (uint32_t)(s_vs.scale + 1) / 2;
+        /* Menus and replays are light enough for 16x, play is not: climbing
+         * back there between plays meant the next snap began a frame or more
+         * behind (2026-10-30). Two steps above what fits is as high as it
+         * goes again this session. */
+        {
+            uint32_t was = cur;
+            if (to + 2 < learned) learned = to + 2;
+            if (learned >= was) learned = was > 1 ? was - 1 : 1;
+        }
         QueryPerformanceCounter(&now);
         cur = to < cur ? (to ? to : 1) : cur - 1;
         last_step = last_down = now.QuadPart;
+        if (last_up && (float)(now.QuadPart - last_up) < 30.0f * f)
+            hold = hold * 2.0f > 120.0f ? 120.0f : hold * 2.0f;   /* it went up too far: wait longer next time */
         quiet = 0;
+        fprintf(stderr, "  [DYNRES] Present waiting %.0f ms a frame: internal resolution %ux\n", wait_sum / (float)waits, cur);
         waits = 0;
-        fprintf(stderr, "  [DYNRES] Present waiting %.0f ms a frame: internal resolution %ux\n", s_last_present_ms, cur);
+        wait_sum = 0.0f;
         return cur;
     }
     if (s_gpuctr.state != 1 || !s_perf.freq.QuadPart || s_perf.pub_t0.QuadPart == seen) return cur;
@@ -1995,10 +2047,14 @@ static uint32_t pr_dynres_scale(void)
         fprintf(stderr, "  [DYNRES] GPU %.0f%% busy: internal resolution %ux\n", util, cur);
     } else if (cur < top) {
         float r = (float)(cur + 1) / (float)cur;
-        quiet = util * r * r < 75.0f ? quiet + 1 : 0;
-        if (quiet >= 4 && (float)(now.QuadPart - last_down) >= hold * f) {
-            /* lots of headroom: toward the size the load says fits, up to 4 steps */
-            uint32_t fit = (uint32_t)((float)cur * sqrtf(70.0f / (util > 1.0f ? util : 1.0f)));
+        quiet = util * r * r < 65.0f ? quiet + 1 : 0;
+        if (quiet >= 6 && (float)(now.QuadPart - last_down) >= hold * f
+                && (float)(now.QuadPart - last_up) >= 20.0f * f) {
+            /* lots of headroom: toward the size the load says fits, up to 4
+             * steps. Kept well under the budget, and at most every 20 s:
+             * play is heavier than the menus and replays it is measured in,
+             * and every change is a hitch of its own. */
+            uint32_t fit = (uint32_t)((float)cur * sqrtf(60.0f / (util > 1.0f ? util : 1.0f)));
             cur = fit > cur + 4 ? cur + 4 : fit > cur ? fit : cur + 1;
             if (cur > top) cur = top;
             last_step = last_up = now.QuadPart;

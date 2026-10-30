@@ -169,6 +169,8 @@ extern volatile LONG64 g_xbox_read_qpc, g_xbox_read_bytes, g_xbox_read_count;
 extern volatile LONG64 g_pb_exec_qpc, g_pb_qwait_qpc, g_pb_capture_qpc;
 extern volatile DWORD g_xbox_game_tid;
 LONGLONG xbox_ggl_waited_qpc(DWORD tid);
+LONGLONG xbox_ggl_main_waited_qpc(void);
+DWORD xbox_ggl_main_tid(void);
 
 extern volatile LONG64 g_gx_compile_qpc, g_gx_pipe_qpc;     /* gx/gx_sdl.c (0 on Direct3D 11) */
 extern volatile LONG g_gx_compiles, g_gx_pipes;
@@ -179,7 +181,7 @@ static void perf_hitch(float ms, float present_ms)
     static LONG cn, pn;
     static LONG64 rq, rb, rc, ex, qw, cp, gw, tx, tcx;
     LONG64 tq = g_tex_upload_qpc, tc = g_tex_create_qpc;
-    LONG64 lw = g_xbox_game_tid ? xbox_ggl_waited_qpc(g_xbox_game_tid) : 0;
+    LONG64 lw = xbox_ggl_main_waited_qpc();
     static uint32_t draws, texup, surfs;
     static unsigned phit, pmiss;
     static LONG ps;
@@ -201,6 +203,41 @@ static void perf_hitch(float ms, float present_ms)
     rq = q; rb = b; rc = c; ex = e; qw = w; cp = k; gw = lw; tx = tq; tcx = tc;
     draws = s_gpu11.draws; texup = s_gpu11.tex_uploads; surfs = s_gpu11.surf_creates; ps = s_ps_ready;
     phit = s_tpool_hits; pmiss = s_tpool_misses;
+    {
+        /* the game thread's own CPU time that frame: busy (the title's work)
+         * or waiting (events, sleeps, the render thread) */
+        static DWORD htid;
+        static HANDLE h;
+        static ULONG64 pc;
+        ULONG64 c = 0;
+        DWORD tid = xbox_ggl_main_tid();
+        if (tid && tid != htid) {
+            if (h) CloseHandle(h);
+            h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+            htid = tid;
+            pc = 0;
+        }
+        if (h && QueryThreadCycleTime(h, &c)) {
+            static double avg;
+            double d = pc ? (double)(c - pc) / 1e6 : 0.0;
+            if (pc && ms > 25.0f && s_perf.n > 1800 && logged < 400)
+                fprintf(stderr, "  [HITCH]   game thread %lu: %.1f Mcyc of CPU (usual %.1f)\n", (unsigned long)tid, d, avg);
+            if (pc) avg = avg * 0.98 + d * 0.02;
+            pc = c;
+        }
+    }
+    if (s_dp_on > 0) {
+        /* RECOMP_GPU_PROFILE: the draw path's stages in that frame (Mcycles) */
+        static uint64_t pd[6];
+        uint64_t d[6];
+        int j;
+        for (j = 0; j < 6; j++) d[j] = s_dp_base[j] + s_dp_acc[j];
+        if (ms > 25.0f && s_perf.n > 1800 && logged < 400)
+            fprintf(stderr, "  [HITCH]   draw path Mcyc: all %.1f build %.1f tex %.1f upload+bind %.1f state+draw %.1f\n",
+                    (d[5] - pd[5]) / 1e6, (d[0] - pd[0]) / 1e6, (d[1] - pd[1]) / 1e6, (d[2] - pd[2]) / 1e6,
+                    ((d[3] - pd[3]) - (d[2] - pd[2])) / 1e6);
+        memcpy(pd, d, sizeof pd);
+    }
     cq = g_gx_compile_qpc; pq = g_gx_pipe_qpc; cn = g_gx_compiles; pn = g_gx_pipes;
 }
 

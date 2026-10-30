@@ -600,6 +600,11 @@ static int gpu_bind_surface(void)
     uint32_t w = s_gpu.clip_x + s_gpu.clip_w, h = s_gpu.clip_y + s_gpu.clip_h;
     uint32_t guest = dma_resolve(s_gpu.color_offset);
     int i, free_i = -1;
+    LARGE_INTEGER rb_t[5];                  /* RECOMP_REBUILD_LOG: where a rebuild's time goes */
+    int rb_on = 0;
+    GpuSurface carry;                       /* the old target while a resized one takes its pixels */
+
+    memset(&carry, 0, sizeof carry);
 
     if (surface_bpp() != 4 || !w || !h || w > 4096 || h > 4096 || !s_gpu.pitch) {
         /* RECOMP_GPU_PROFILE: surfaces that fall back to the software
@@ -635,8 +640,20 @@ static int gpu_bind_surface(void)
                 }
                 return i;
             }
-            gpu_readback(s);
+            if (env_cached("RECOMP_REBUILD_LOG")) QueryPerformanceCounter(&rb_t[0]);
+            if (s->dirty && !s->stale && s->w == w && s->h == h && s->pitch == s_gpu.pitch
+                    && s->ox == gpu_wide_ox(w, h) && !env_cached("RECOMP_NO_GPU_CARRY")) {
+                /* Only the scale changed (auto resolution): the new target is
+                 * drawn from the old one on the GPU. Reading it back to guest
+                 * RAM and uploading it again waited for the GPU to finish the
+                 * frame, 5-170 ms a target (2026-10-30). */
+                carry = *s;
+                memset(s, 0, sizeof *s);
+            } else
+                gpu_readback(s);
+            if (env_cached("RECOMP_REBUILD_LOG")) QueryPerformanceCounter(&rb_t[1]);
             gpu_release_surface(s);
+            if (env_cached("RECOMP_REBUILD_LOG")) { QueryPerformanceCounter(&rb_t[2]); rb_t[3] = rb_t[4] = rb_t[2]; rb_on = 1; }
             free_i = i;
             break;
         }
@@ -662,7 +679,7 @@ retry_surface_create:
         td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
         sd.pSysMem = mem + guest; sd.SysMemPitch = s_gpu.pitch; sd.SysMemSlicePitch = 0;
-        if (FAILED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, sc == 1 && !ox ? &sd : NULL, &s->tex)) ||
+        if (FAILED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, sc == 1 && !ox && !carry.tex ? &sd : NULL, &s->tex)) ||
                 FAILED(ID3D11Device_CreateRenderTargetView(s_gpu11.dev, (ID3D11Resource *)s->tex, NULL, &s->rtv)))
             goto surface_create_failed;
         s->guest = guest; s->w = w; s->h = h; s->pitch = s_gpu.pitch;
@@ -692,7 +709,10 @@ retry_surface_create:
             if (FAILED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, NULL, &s->down)) || !s->down ||
                     FAILED(ID3D11Device_CreateRenderTargetView(s_gpu11.dev, (ID3D11Resource *)s->down, NULL, &s->down_rtv)))
                 goto surface_create_failed;
-            gpu_surface_upload(s);
+            if (rb_on) QueryPerformanceCounter(&rb_t[3]);
+            if (!carry.tex)
+                gpu_surface_upload(s);
+            if (rb_on) QueryPerformanceCounter(&rb_t[4]);
         }
         td.Usage = D3D11_USAGE_STAGING; td.BindFlags = 0; td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         if (FAILED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, NULL, &s->staging)) || !s->staging)
@@ -725,6 +745,29 @@ retry_surface_create:
             }
         }
         s->dirty = 0;
+        if (carry.tex) {
+            ID3D11ShaderResourceView *srv = NULL;
+            if (SUCCEEDED(ID3D11Device_CreateShaderResourceView(s_gpu11.dev, (ID3D11Resource *)carry.tex, NULL, &srv))) {
+                gpu_blit(srv, s->rtv, (w + 2 * ox) * sc, h * sc, 0);
+                ID3D11ShaderResourceView_Release(srv);
+                s->dirty = 1;               /* guest RAM still has the old frame */
+            } else {
+                gpu_readback(&carry);
+                gpu_surface_upload(s);
+            }
+            s->gen = carry.gen + 1;
+            gpu_release_surface(&carry);
+        }
+        if (rb_on) {
+            LARGE_INTEGER e, fq;
+            QueryPerformanceCounter(&e);
+            QueryPerformanceFrequency(&fq);
+#define RB_MS(a, b) ((double)((b).QuadPart - (a).QuadPart) * 1000.0 / (double)fq.QuadPart)
+            fprintf(stderr, "  [REBUILD] %08X x%u: readback %.1f ms, release %.1f, create %.1f, upload %.1f, rest %.1f\n",
+                    guest, sc, RB_MS(rb_t[0], rb_t[1]), RB_MS(rb_t[1], rb_t[2]), RB_MS(rb_t[2], rb_t[3]),
+                    RB_MS(rb_t[3], rb_t[4]), RB_MS(rb_t[4], e));
+#undef RB_MS
+        }
         if (sc != requested_sc)
             fprintf(stderr, "  [GPU11] render target requested %ux, allocated %ux after memory fallback\n", requested_sc, sc);
         return free_i;
@@ -732,6 +775,10 @@ surface_create_failed:
         gpu_release_surface(s);
         if (sc > 1) { sc--; goto retry_surface_create; }
         fprintf(stderr, "  [GPU11] could not allocate %ux%u render target even at 1x\n", w + 2 * ox, h);
+        if (carry.tex) {
+            gpu_readback(&carry);
+            gpu_release_surface(&carry);
+        }
         return -1;
     }
 }
@@ -1983,6 +2030,7 @@ static void gpu_log_rejected(uint32_t index, const XfVert *v)
  * stage (vertex build, textures, buffer upload + binds, state + draw call,
  * the rest), printed every five seconds. */
 static uint64_t s_dp_acc[6], s_dp_draws;
+static uint64_t s_dp_base[6];      /* what earlier reports cleared (the hitch log's running totals) */
 #define DP_NOW() (s_dp_on ? __rdtsc() : 0)
 static void gpu_dp_report(void)
 {
@@ -1998,6 +2046,10 @@ static void gpu_dp_report(void)
                 100.0 * (s_dp_acc[3] - s_dp_acc[2]) / tot, 100.0 * (tot - s_dp_acc[0] - s_dp_acc[1] - s_dp_acc[3]) / tot, s_gpu11.rt_copies, s_gpu11.surf_creates);
         s_gpu11.surf_creates = 0;
         s_gpu11.rt_copies = 0;
+    }
+    {
+        int k;
+        for (k = 0; k < 6; k++) s_dp_base[k] += s_dp_acc[k];
     }
     memset(s_dp_acc, 0, sizeof s_dp_acc);
     s_dp_draws = 0;
