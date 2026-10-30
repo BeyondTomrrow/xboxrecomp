@@ -27,7 +27,7 @@
 #include <setjmp.h>
 #if !defined(_WIN32)
 #include <unistd.h>   /* _exit */
-#if defined(__linux__) && defined(__x86_64__)
+#if defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))
 #include <signal.h>
 #include <sys/mman.h>
 #include <ucontext.h>
@@ -480,6 +480,23 @@ BOOL xbox_ac97_handle_posix_signal(int signal_number, int signal_code, uintptr_t
         context->uc_mcontext.gregs[REG_EFL] |= (greg_t)0x100u;
         return TRUE;
     }
+#elif defined(__aarch64__)
+    /* No single-step to borrow here: the store is decoded and performed with
+     * the page briefly writable, then the controller's response applied. */
+    if (g_ac97_page && raw_context && signal_number == SIGSEGV && signal_code == SEGV_ACCERR
+            && fault_address >= (uintptr_t)g_ac97_page
+            && fault_address - (uintptr_t)g_ac97_page < AC97_TRAP_BYTES) {
+        extern int xbox_arm64_take_store(void *raw_ctx, uint64_t *ea, uint64_t vals[2], int *size, int *count);
+        uint64_t ea, v[2];
+        int size, count, i;
+        if (!xbox_arm64_take_store(raw_context, &ea, v, &size, &count)) return FALSE;
+        if (mprotect(g_ac97_page, AC97_TRAP_BYTES, PROT_READ | PROT_WRITE) != 0) _exit(3);
+        for (i = 0; i < count; i++)
+            memcpy((void *)(uintptr_t)(ea + (uint64_t)(i * size)), &v[i], (size_t)size);
+        ac97_clear_reset_bits();
+        if (mprotect(g_ac97_page, AC97_TRAP_BYTES, PROT_READ) != 0) _exit(3);
+        return TRUE;
+    }
 #else
     (void)signal_number; (void)signal_code; (void)fault_address; (void)raw_context;
 #endif
@@ -514,7 +531,7 @@ static BOOL ac97_arm_write_trap(void)
         return FALSE;
     }
 #else
-#if defined(__linux__) && defined(__x86_64__)
+#if defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))
     if (!g_ac97_posix_handler_ready || mprotect(g_ac97_page, AC97_TRAP_BYTES, PROT_READ) != 0) {
 #else
     if (1) { /* No verified single-step context implementation for this host. */

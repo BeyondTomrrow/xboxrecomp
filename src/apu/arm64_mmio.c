@@ -139,6 +139,29 @@ static void set_reg(mcontext_t *m, int r, uint64_t v, int size, int sext)
 
 static unsigned long s_fail;
 
+/* A faulting store, for a handler that performs it itself (the AC'97
+ * bus-master trap, kernel/xbox_memory_layout.c): where it writes, the value(s)
+ * and their size. The instruction is retired (pc += 4, base written back).
+ * 0, untouched, when it is not a store this decodes. */
+int xbox_arm64_take_store(void *raw_ctx, uint64_t *ea, uint64_t vals[2], int *size, int *count)
+{
+    ucontext_t *uc = (ucontext_t *)raw_ctx;
+    mcontext_t *m = &uc->uc_mcontext;
+    A64Access a;
+    if (!a64_decode(*(const uint32_t *)(uintptr_t)m->pc, m, &a) || a.load) return 0;
+    *ea = a.ea;
+    *size = a.size;
+    *count = a.rt2 >= 0 ? 2 : 1;
+    vals[0] = a.rt == 31 ? 0 : m->regs[a.rt];
+    vals[1] = a.rt2 < 0 || a.rt2 == 31 ? 0 : m->regs[a.rt2];
+    if (a.wb) {
+        if (a.rn == 31) m->sp = a.wb_val;
+        else m->regs[a.rn] = a.wb_val;
+    }
+    m->pc += 4;
+    return 1;
+}
+
 /* The SIGSEGV handler's ARM64 path for the APU aperture (src/main.c). */
 int xbox_arm64_mmio_fault(void *raw_ctx, uintptr_t host, uint32_t va)
 {
