@@ -24,7 +24,8 @@
  * Opt-in with RECOMP_GPU=1 while it is verified against the software path.
  *
  * ponytail: depth/stencil clears with a partial rectangle clear the whole
- * buffer; fog is not applied; no mipmaps (level 0 only).
+ * buffer; fog is not applied. Mip levels: the title's own for DXT textures,
+ * box-filtered from level 0 for decoded ones (gpu_guest_levels, 2026-10-30).
  */
 #if defined(_WIN32)
 /* The D3D11 method calls below run on Direct3D 11 itself, or on Vulkan or
@@ -909,6 +910,20 @@ static uint32_t gpu_cube_face_bytes(int st, const Texture *t)
     return (len + 127u) & ~127u;
 }
 
+/* Mip levels the title gave the texture on stage st (format register bits
+ * 16-19), as many as its size allows. Until 2026-10-30 only level 0 was
+ * used: far-off field lines, crowds and signs had no smaller versions and
+ * shimmered, the more so at a high internal resolution. RECOMP_NO_MIPS=1
+ * goes back to level 0 only. */
+static uint32_t gpu_guest_levels(int st, const Texture *t)
+{
+    uint32_t fmtreg = s_tex_reg[(0x1B04 + 0x40u * (uint32_t)st - NV_TEX_FIRST) / 4];
+    uint32_t levels = (fmtreg >> 16) & 0xF, l = 1;
+    if (env_cached("RECOMP_NO_MIPS") || levels <= 1) return 1;
+    while (l < levels && l < 14 && ((t->width >> l) || (t->height >> l))) l++;
+    return l;
+}
+
 /* SRV for texture stage st, decoding it through the software sampler the
  * first time (and whenever its contents change). A cube map decodes all six
  * faces into a TextureCube. */
@@ -1002,12 +1017,13 @@ static void tex_pool_put(ID3D11Texture2D *tex, ID3D11ShaderResourceView *srv)
  * RECOMP_NO_TEX_WARM=1 turns it off. */
 static void tex_pool_topup(void)
 {
-    static const struct { UINT w, h; DXGI_FORMAT fmt; int want; } k_shapes[] = {
-        { 128, 128, DXGI_FORMAT_B8G8R8A8_UNORM, 48 }, { 64, 64, DXGI_FORMAT_B8G8R8A8_UNORM, 40 },
-        { 256, 256, DXGI_FORMAT_B8G8R8A8_UNORM, 24 }, { 256, 128, DXGI_FORMAT_B8G8R8A8_UNORM, 24 },
-        { 128, 64, DXGI_FORMAT_B8G8R8A8_UNORM, 16 },  { 32, 32, DXGI_FORMAT_B8G8R8A8_UNORM, 16 },
-        { 256, 256, DXGI_FORMAT_BC1_UNORM, 10 },      { 256, 32, DXGI_FORMAT_B8G8R8A8_UNORM, 10 },
-        { 512, 256, DXGI_FORMAT_B8G8R8A8_UNORM, 6 },
+    /* with their mip chains (the title's levels, 2026-10-30 histogram) */
+    static const struct { UINT w, h, mips; DXGI_FORMAT fmt; int want; } k_shapes[] = {
+        { 128, 128, 5, DXGI_FORMAT_B8G8R8A8_UNORM, 48 }, { 64, 64, 4, DXGI_FORMAT_B8G8R8A8_UNORM, 40 },
+        { 256, 32, 3, DXGI_FORMAT_B8G8R8A8_UNORM, 20 },  { 256, 128, 5, DXGI_FORMAT_B8G8R8A8_UNORM, 20 },
+        { 128, 64, 4, DXGI_FORMAT_B8G8R8A8_UNORM, 16 },  { 256, 256, 6, DXGI_FORMAT_B8G8R8A8_UNORM, 16 },
+        { 32, 32, 3, DXGI_FORMAT_B8G8R8A8_UNORM, 12 },   { 256, 256, 6, DXGI_FORMAT_BC1_UNORM, 10 },
+        { 512, 256, 6, DXGI_FORMAT_B8G8R8A8_UNORM, 8 },
     };
     LARGE_INTEGER t0, t1, fq;
     size_t s;
@@ -1019,14 +1035,14 @@ static void tex_pool_topup(void)
         int have = 0, i;
         for (i = 0; i < s_tpool_n; i++)
             if (s_tpool[i].d.Width == k_shapes[s].w && s_tpool[i].d.Height == k_shapes[s].h &&
-                    s_tpool[i].d.Format == k_shapes[s].fmt && s_tpool[i].d.MipLevels == 1 &&
+                    s_tpool[i].d.Format == k_shapes[s].fmt && s_tpool[i].d.MipLevels == k_shapes[s].mips &&
                     s_tpool[i].d.ArraySize == 1 && !s_tpool[i].d.MiscFlags) have++;
         while (have < k_shapes[s].want) {
             D3D11_TEXTURE2D_DESC td;
             ID3D11Texture2D *tex = NULL;
             ID3D11ShaderResourceView *srv = NULL;
             memset(&td, 0, sizeof td);
-            td.Width = k_shapes[s].w; td.Height = k_shapes[s].h; td.MipLevels = td.ArraySize = 1;
+            td.Width = k_shapes[s].w; td.Height = k_shapes[s].h; td.MipLevels = k_shapes[s].mips; td.ArraySize = 1;
             td.Format = k_shapes[s].fmt; td.SampleDesc.Count = 1;
             td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
             if (FAILED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, NULL, &tex)) ||
@@ -1288,9 +1304,10 @@ static ID3D11ShaderResourceView *gpu_texture(int st, int cube)
         uint32_t bb = d3d8_format_dxt_block_bytes(t->color);
         uint32_t fbytes = (t->width / 4) * (t->height / 4) * bb;
         D3D11_TEXTURE2D_DESC td;
-        D3D11_SUBRESOURCE_DATA sd[6];
+        D3D11_SUBRESOURCE_DATA sd[16];
+        uint32_t lv = cube ? 1u : gpu_guest_levels(st, t), l2;
         memset(&td, 0, sizeof td);
-        td.Width = t->width; td.Height = t->height; td.MipLevels = 1; td.ArraySize = faces;
+        td.Width = t->width; td.Height = t->height; td.MipLevels = lv; td.ArraySize = faces;
         td.Format = t->color == 0x0C ? DXGI_FORMAT_BC1_UNORM
                   : t->color == 0x0E ? DXGI_FORMAT_BC2_UNORM : DXGI_FORMAT_BC3_UNORM;
         td.SampleDesc.Count = 1;
@@ -1300,6 +1317,15 @@ static ID3D11ShaderResourceView *gpu_texture(int st, int cube)
             sd[f].pSysMem = gm + t->offset + f * face_bytes;
             sd[f].SysMemPitch = (t->width / 4) * bb;
             sd[f].SysMemSlicePitch = fbytes;
+        }
+        if (lv > 1) {   /* the levels follow level 0, each at least one block */
+            uint32_t off = t->offset, w2 = t->width, h2 = t->height;
+            for (l2 = 0; l2 < lv; l2++) {
+                uint32_t bw = (w2 + 3) / 4, bh = (h2 + 3) / 4;
+                sd[l2].pSysMem = gm + off; sd[l2].SysMemPitch = bw * bb; sd[l2].SysMemSlicePitch = bw * bh * bb;
+                off += bw * bh * bb;
+                w2 = w2 > 1 ? w2 / 2 : 1; h2 = h2 > 1 ? h2 / 2 : 1;
+            }
         }
         if (env_cached("RECOMP_GPU_TEXDUMP") && gpu_texdump_match(t, t->width * t->height)) {
             /* the blocks as they are, in a .dds (any image viewer decodes it) */
@@ -1508,7 +1534,9 @@ decoded:
     }
     {
         D3D11_TEXTURE2D_DESC td;
-        D3D11_SUBRESOURCE_DATA sd[6];
+        D3D11_SUBRESOURCE_DATA sd[16];
+        uint32_t lv = cube || (t->width & (t->width - 1)) || (t->height & (t->height - 1)) ? 1u : gpu_guest_levels(st, t);
+        uint32_t *chain = NULL;
         memset(&td, 0, sizeof td);
         td.Width = t->width; td.Height = t->height; td.MipLevels = 1; td.ArraySize = faces;
         td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
@@ -1521,6 +1549,32 @@ decoded:
             free(pix);
             return NULL;                                 /* a cube face must be square */
         }
+        if (lv > 1) {
+            /* each level the 2x2 average of the one above (a 1-wide side halves alone) */
+            size_t total = 0;
+            uint32_t l2, w2 = t->width, h2 = t->height;
+            for (l2 = 1; l2 < lv; l2++) { w2 = w2 > 1 ? w2 / 2 : 1; h2 = h2 > 1 ? h2 / 2 : 1; total += (size_t)w2 * h2; }
+            chain = (uint32_t *)malloc(total * 4);
+            if (chain) {
+                const uint32_t *src = pix;
+                uint32_t *dst = chain, sw = t->width, sh = t->height;
+                for (l2 = 1; l2 < lv; l2++) {
+                    uint32_t dw2 = sw > 1 ? sw / 2 : 1, dh2 = sh > 1 ? sh / 2 : 1, x, y, c;
+                    for (y = 0; y < dh2; y++)
+                        for (x = 0; x < dw2; x++) {
+                            uint32_t x0 = sw > 1 ? 2 * x : 0, x1 = sw > 1 ? 2 * x + 1 : 0;
+                            uint32_t y0 = sh > 1 ? 2 * y : 0, y1 = sh > 1 ? 2 * y + 1 : 0;
+                            uint32_t a = src[y0 * sw + x0], b = src[y0 * sw + x1], cc = src[y1 * sw + x0], d = src[y1 * sw + x1], o = 0;
+                            for (c = 0; c < 32; c += 8)
+                                o |= ((((a >> c) & 0xFF) + ((b >> c) & 0xFF) + ((cc >> c) & 0xFF) + ((d >> c) & 0xFF) + 2) / 4) << c;
+                            dst[y * dw2 + x] = o;
+                        }
+                    sd[l2].pSysMem = dst; sd[l2].SysMemPitch = dw2 * 4; sd[l2].SysMemSlicePitch = dw2 * dh2 * 4;
+                    src = dst; dst += (size_t)dw2 * dh2; sw = dw2; sh = dh2;
+                }
+                td.MipLevels = lv;
+            }
+        }
         {
             LARGE_INTEGER c0, c1;
             QueryPerformanceCounter(&c0);
@@ -1528,6 +1582,7 @@ decoded:
             QueryPerformanceCounter(&c1);
             g_tex_create_qpc += c1.QuadPart - c0.QuadPart;
         }
+        free(chain);
     }
     free(pix);
     e->addr = t->offset; e->fmt = t->color; e->w = t->width; e->h = t->height;
@@ -1568,13 +1623,17 @@ static ID3D11SamplerState *gpu_sampler(int st)
     static uint32_t keys[64];
     const Texture *t = st == 0 ? &s_gpu.tex : &s_stage[st];
     uint32_t filt = s_tex_reg[(0x1B14 + 0x40u * (uint32_t)st - NV_TEX_FIRST) / 4];
-    uint32_t mag = (filt >> 24) & 0xF, key;
+    uint32_t mag = (filt >> 24) & 0xF, minf = (filt >> 16) & 0xFF, key;
+    /* NV2A min filter 3-6: mipmapped (nearest/linear, between levels or
+     * not); between-level blending is always used, it costs nothing and
+     * hides the level boundaries. 1, 2 and 7: level 0 only. */
+    int mip = minf >= 3 && minf <= 6 && !env_cached("RECOMP_NO_MIPS");
     D3D11_SAMPLER_DESC sd;
     int i;
     D3D11_TEXTURE_ADDRESS_MODE am[2];
     uint32_t modes[2];
     modes[0] = t->addr_u; modes[1] = t->addr_v;
-    key = (mag == 1 ? 1u : 0u) | (t->addr_u << 4) | (t->addr_v << 8) | (g_aniso << 16);
+    key = (mag == 1 ? 1u : 0u) | (mip ? 2u : 0u) | (t->addr_u << 4) | (t->addr_v << 8) | (g_aniso << 16);
     for (i = 0; i < 64; i++) {
         if (cache[i] && keys[i] == key)
             return cache[i];
@@ -1589,13 +1648,14 @@ static ID3D11SamplerState *gpu_sampler(int st)
               : modes[k] == 4 ? D3D11_TEXTURE_ADDRESS_BORDER
               : D3D11_TEXTURE_ADDRESS_CLAMP;
     memset(&sd, 0, sizeof sd);
-    sd.Filter = mag == 1 ? D3D11_FILTER_MIN_MAG_MIP_POINT : D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+    sd.Filter = mag == 1 ? (mip ? D3D11_FILTER_MIN_MAG_POINT_MIP_LINEAR : D3D11_FILTER_MIN_MAG_MIP_POINT)
+                         : (mip ? D3D11_FILTER_MIN_MAG_MIP_LINEAR : D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT);
     if (mag != 1 && g_aniso > 1) {
         sd.Filter = D3D11_FILTER_ANISOTROPIC;
         sd.MaxAnisotropy = g_aniso;
     }
     sd.AddressU = am[0]; sd.AddressV = am[1]; sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-    sd.MaxLOD = D3D11_FLOAT32_MAX;
+    sd.MaxLOD = mip ? D3D11_FLOAT32_MAX : 0.0f;
     if (cache[i]) ID3D11SamplerState_Release(cache[i]);
     cache[i] = NULL;
     ID3D11Device_CreateSamplerState(s_gpu11.dev, &sd, &cache[i]);
