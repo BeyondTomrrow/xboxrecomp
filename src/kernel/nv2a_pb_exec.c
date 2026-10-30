@@ -60,7 +60,10 @@ static const char *env_cached(const char *name) {
     uintptr_t k = (uintptr_t) name;
     unsigned h = (unsigned) (((k >> 3) * 2654435761u) >> 8) & 1023u, i;
     for (i = 0; i < 1024; i++, h = (h + 1) & 1023u) {
-        const char *n = (const char *) InterlockedCompareExchangePointer(&tab[h].name, NULL, NULL);
+        /* A plain volatile load: x86 loads already order after the store
+         * that published the name (a locked compare-exchange here, for a
+         * read, was 1.5% of the render thread, 2026-10-30). */
+        const char *n = (const char *) tab[h].name;
         if (n == name) return tab[h].value;
         if (!n) break;
     }
