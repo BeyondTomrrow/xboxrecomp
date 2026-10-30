@@ -19,6 +19,11 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#ifdef _MSC_VER
+#define RECOMP_APU_TLS __declspec(thread)
+#else
+#define RECOMP_APU_TLS _Thread_local
+#endif
 #include "apu_state.h"
 #include "fpconv.h"
 #include "apu_xaudio2.h"   /* audio report records */
@@ -410,7 +415,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                  * pauses/resumes the voice (the FE method runs on the guest
                  * thread that wrote the MMIO register). */
                 #if defined(_MSC_VER)
-                    extern __declspec(thread) uint32_t g_esp;
+                    extern RECOMP_APU_TLS uint32_t g_esp;
                 #else
                     extern __thread uint32_t g_esp;
                 #endif
@@ -527,7 +532,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             int16_t now = (int16_t)((argument & NV1BA0_PIO_SET_VOICE_TAR_PITCH_STEP) >> 16);
             if (only3d < 0) only3d = !strcmp(getenv("RECOMP_APU_PITCH_STACK"), "3d");
             if (was != now && shown < 6000 && (!only3d || cv < MCPX_HW_MAX_3D_VOICES)) {
-                extern __declspec(thread) uint32_t g_esp;
+                extern RECOMP_APU_TLS uint32_t g_esp;
                 extern ptrdiff_t xbox_GetMemoryOffset(void);
                 const uint8_t *gm = (const uint8_t *)xbox_GetMemoryOffset();
                 int k2 = 0;
@@ -598,7 +603,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
              * the guest return addresses on the calling thread's stack. */
             static int shown;
             if (shown < 24) {
-                extern __declspec(thread) uint32_t g_esp;
+                extern RECOMP_APU_TLS uint32_t g_esp;
                 extern ptrdiff_t xbox_GetMemoryOffset(void);
                 const uint8_t *gm = (const uint8_t *)xbox_GetMemoryOffset();
                 int n = 0;
@@ -1580,7 +1585,11 @@ static void pitch_stat_report(MCPXAPUState *d)
         static ULONGLONG cpu_at;          /* this (APU) thread's CPU time, 100 ns */
         ULONGLONG cpu_now;
         FILETIME tc, te, tk, tu;
+#ifdef _WIN32
         GetThreadTimes(GetCurrentThread(), &tc, &te, &tk, &tu);
+#else
+        memset(&tk, 0, sizeof tk); memset(&tu, 0, sizeof tu); (void)tc; (void)te;
+#endif
         cpu_now = ((ULONGLONG)tk.dwHighDateTime << 32 | tk.dwLowDateTime) + ((ULONGLONG)tu.dwHighDateTime << 32 | tu.dwLowDateTime);
         fprintf(stderr, "[PITCH] qpc=%.0f t=%lu ms=%lu vpframes=%lu queue=%d..%d submits=%u dropped=%u underruns=%u bed=%.2f comm=%.2f mute_music=%d wav=%u lockwaits=%u lockwait_ms=%.1f stalls=%u stall_ms=%.1f silentvp=%lu apu_cpu_ms=%.1f\n",
                 (double)qc.QuadPart * 1000.0 / (double)qf.QuadPart,

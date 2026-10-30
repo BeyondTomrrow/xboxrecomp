@@ -10,6 +10,7 @@ add_library(xbox_apu STATIC
     apu_vp.c
     apu_dsp.c
     apu_mmio_hook.c
+    arm64_mmio.c
     apu_xaudio2.c
 )
 

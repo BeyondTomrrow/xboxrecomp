@@ -396,6 +396,20 @@ HRESULT gx_D3DCompile(LPCVOID src, SIZE_T len, LPCSTR name, const D3D_SHADER_MAC
     snprintf(profile, sizeof profile, "%s_6_0", vs ? "vs" : "ps");
     memset(&h, 0, sizeof h);
     {
+        /* RECOMP_GX_DUMP_HLSL=<folder>: every shader's source (checking the
+         * Android compiler against these, android/README.md) */
+        static int on = -1;
+        static LONG n;
+        const char *dir = getenv("RECOMP_GX_DUMP_HLSL");
+        if (on < 0) on = dir && *dir;
+        if (on) {
+            char path[512];
+            FILE *f;
+            snprintf(path, sizeof path, "%s/%05ld_%s_%s.hlsl", dir, (long)InterlockedIncrement(&n), profile, entry);
+            if ((f = fopen(path, "wb"))) { fwrite(src, 1, len, f); fclose(f); }
+        }
+    }
+    {
         LARGE_INTEGER a, b;
         int ok;
         QueryPerformanceCounter(&a);

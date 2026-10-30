@@ -439,7 +439,11 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
                 FILE *sf;
                 struct timespec ts;
                 fwrite(hdr, 1, 44, wav);
+#ifdef _WIN32
                 timespec_get(&ts, TIME_UTC);
+#else
+                clock_gettime(CLOCK_REALTIME, &ts);
+#endif
                 snprintf(sp, sizeof sp, "%s.start", pth);
                 if ((sf = fopen(sp, "w")) != NULL) {
                     fprintf(sf, "%llu\n", (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)(ts.tv_nsec / 1000000));

@@ -272,4 +272,12 @@ int xbox_overlay_load(const char *dir, const char *disc)
     (void)dir; (void)disc;
     return 0;
 }
+#include "platform/win32_compat.h"
+void xbox_overlay_attach(HANDLE h, const WCHAR *path) { (void)h; (void)path; }
+void xbox_overlay_detach(HANDLE h) { (void)h; }
+int xbox_overlay_read(HANDLE h, void *buf, ULONG len, const LARGE_INTEGER *off, ULONG *got)
+{
+    (void)h; (void)buf; (void)len; (void)off; (void)got;
+    return 0;
+}
 #endif /* _WIN32 */
