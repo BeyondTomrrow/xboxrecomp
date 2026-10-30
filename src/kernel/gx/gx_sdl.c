@@ -324,6 +324,10 @@ D3D_FEATURE_LEVEL gxs_ID3D11Device_GetFeatureLevel(void *d)
     return D3D_FEATURE_LEVEL_11_0;
 }
 
+/* Running totals for the hitch log (nv2a_gpu_perf.inc.c). */
+volatile LONG64 g_gx_compile_qpc, g_gx_pipe_qpc;
+volatile LONG g_gx_compiles, g_gx_pipes;
+
 /* ---- shaders ----------------------------------------------------------- */
 
 /* "//@GX_PAIRS <entry> t:s t:s ..." in the source: which texture and sampler
@@ -389,10 +393,19 @@ HRESULT gx_D3DCompile(LPCVOID src, SIZE_T len, LPCSTR name, const D3D_SHADER_MAC
     vs = target[0] == 'v';
     snprintf(profile, sizeof profile, "%s_6_0", vs ? "vs" : "ps");
     memset(&h, 0, sizeof h);
-    if (!gx_dxc_compile((const char *)src, len, entry, profile, s_backend == 1,
-                        (flags1 & D3DCOMPILE_IEEE_STRICTNESS) != 0, &out, &outlen, msg, sizeof msg, &h.r)) {
-        if (err) *err = (ID3DBlob *)blob_new(msg, strlen(msg) + 1);
-        return E_FAIL;
+    {
+        LARGE_INTEGER a, b;
+        int ok;
+        QueryPerformanceCounter(&a);
+        ok = gx_dxc_compile((const char *)src, len, entry, profile, s_backend == 1,
+                            (flags1 & D3DCOMPILE_IEEE_STRICTNESS) != 0, &out, &outlen, msg, sizeof msg, &h.r);
+        QueryPerformanceCounter(&b);
+        g_gx_compile_qpc += b.QuadPart - a.QuadPart;      /* the hitch log's "compiles" */
+        g_gx_compiles++;
+        if (!ok) {
+            if (err) *err = (ID3DBlob *)blob_new(msg, strlen(msg) + 1);
+            return E_FAIL;
+        }
     }
     h.magic = GXSH_MAGIC;
     h.format = s_backend == 1 ? SDL_GPU_SHADERFORMAT_SPIRV : SDL_GPU_SHADERFORMAT_DXIL;
@@ -1089,6 +1102,8 @@ static SDL_GPUGraphicsPipeline *pipe_get(GxShader *vs, GxShader *ps, D3D11_PRIMI
         QueryPerformanceCounter(&b);
         QueryPerformanceFrequency(&fq);
         s_st.pipe_ms += (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)fq.QuadPart;
+        g_gx_pipe_qpc += b.QuadPart - a.QuadPart;           /* the hitch log's "pipelines" */
+        g_gx_pipes++;
         if (!p) {
             static int told;
             if (told++ < 8) fprintf(stderr, "  [GX] pipeline: %s\n", SDL_GetError());

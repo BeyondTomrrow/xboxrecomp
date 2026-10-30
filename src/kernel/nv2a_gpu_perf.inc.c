@@ -170,8 +170,13 @@ extern volatile LONG64 g_pb_exec_qpc, g_pb_qwait_qpc, g_pb_capture_qpc;
 extern volatile DWORD g_xbox_game_tid;
 LONGLONG xbox_ggl_waited_qpc(DWORD tid);
 
+extern volatile LONG64 g_gx_compile_qpc, g_gx_pipe_qpc;     /* gx/gx_sdl.c (0 on Direct3D 11) */
+extern volatile LONG g_gx_compiles, g_gx_pipes;
+
 static void perf_hitch(float ms, float present_ms)
 {
+    static LONG64 cq, pq;
+    static LONG cn, pn;
     static LONG64 rq, rb, rc, ex, qw, cp, gw, tx, tcx;
     LONG64 tq = g_tex_upload_qpc, tc = g_tex_create_qpc;
     LONG64 lw = g_xbox_game_tid ? xbox_ggl_waited_qpc(g_xbox_game_tid) : 0;
@@ -184,7 +189,9 @@ static void perf_hitch(float ms, float present_ms)
     double f = 1000.0 / (double)s_perf.freq.QuadPart;
     if (ms > 25.0f && s_perf.n > 1800 && logged < 400) {
         logged++;
-        fprintf(stderr, "  [HITCH]   texture pool: %u reused, %u created\n", s_tpool_hits - phit, s_tpool_misses - pmiss);
+        fprintf(stderr, "  [HITCH]   texture pool: %u reused, %u created; shader compiles %ld (%.1f ms), pipelines %ld (%.1f ms)\n",
+                s_tpool_hits - phit, s_tpool_misses - pmiss, (long)(g_gx_compiles - cn), (double)(g_gx_compile_qpc - cq) * f,
+                (long)(g_gx_pipes - pn), (double)(g_gx_pipe_qpc - pq) * f);
         fprintf(stderr, "  [HITCH] %.1f ms: present %.1f ms, reads %lld (%lld KB, %.1f ms), tex uploads %u (%.1f ms, create %.1f), new targets %u, "
                         "ps ready %ld, draws %u; render thread %.1f ms, queue wait %.1f ms, capture %.1f ms, game thread lock wait %.1f ms\n",
                 ms, present_ms, (long long)(c - rc), (long long)((b - rb) >> 10), (double)(q - rq) * f,
@@ -194,6 +201,7 @@ static void perf_hitch(float ms, float present_ms)
     rq = q; rb = b; rc = c; ex = e; qw = w; cp = k; gw = lw; tx = tq; tcx = tc;
     draws = s_gpu11.draws; texup = s_gpu11.tex_uploads; surfs = s_gpu11.surf_creates; ps = s_ps_ready;
     phit = s_tpool_hits; pmiss = s_tpool_misses;
+    cq = g_gx_compile_qpc; pq = g_gx_pipe_qpc; cn = g_gx_compiles; pn = g_gx_pipes;
 }
 
 /* Frames presented and the longest frame (us) since the APU's audio report

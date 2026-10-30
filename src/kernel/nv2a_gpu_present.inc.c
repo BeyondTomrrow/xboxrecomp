@@ -79,6 +79,7 @@ typedef struct {
 static VideoSettings s_vs = { VM_BORDERLESS, 1920, 1080, AR_ORIGINAL, 3, SF_ENHANCED, 1, 100, 100, 0, 0, 8, 0, 1, 0, 0, 0, 0, 1, 1, 1, 0 };
 static volatile LONG s_vs_dirty = 1;
 static uint32_t pr_dynres_scale(void);
+static float s_last_present_ms;                     /* how long the last Present waited */
 static void preset_apply(VideoSettings *v, int p);
 void xbox_VideoSettingsLoad(void);           /* window/swap chain need (re)applying */
 
@@ -1902,7 +1903,8 @@ static int pr_present(uint32_t guest)
                                 ((!s_vs.vsync && s_pr.tearing && s_vs.mode != VM_FULLSCREEN) ? DXGI_PRESENT_ALLOW_TEARING : 0) |
                                 (gen_srv ? GX_PRESENT_PAIR : 0));
         QueryPerformanceCounter(&b);
-        perf_on_present((int)g_render_scale, (float)((double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)s_perf.freq.QuadPart));
+        s_last_present_ms = (float)((double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)s_perf.freq.QuadPart);
+        perf_on_present((int)g_render_scale, s_last_present_ms);
         QueryPerformanceFrequency(&fq);
         if ((b.QuadPart - a.QuadPart) * 1000 / fq.QuadPart > 200)
             fprintf(stderr, "  [PRESENT] Present took %lld ms (thread %lu)\n",
@@ -1924,11 +1926,28 @@ static uint32_t pr_dynres_scale(void)
     static uint32_t cur;
     static LONGLONG last_step, last_down, last_up, seen;
     static float hold = 10.0f;                      /* seconds after a step down before going up */
-    static int quiet, slow;
+    static int quiet, slow, waits;
     uint32_t top = 16;                              /* auto: as high as holds the cap */
     LARGE_INTEGER now;
     float util = s_gpuctr.util, f = s_perf.freq.QuadPart ? (float)s_perf.freq.QuadPart : 1.0f;
     if (!cur) cur = (uint32_t)s_vs.scale;           /* start from the chosen scale */
+    /* Fast path, every frame: Present blocking means the GPU is behind. The
+     * busy share is only read once a second, so a step from a light scene
+     * (menus, at 16x) into play used to drop frames for 2-3 s before it
+     * came down (the demo's commonest hitch, 2026-10-30). 20 such frames in
+     * a row -- a third of a second -- step down at once. With VSync on,
+     * Present waits for the display anyway: only long waits count there. */
+    waits = s_last_present_ms > (s_vs.vsync ? 14.0f : 6.0f) ? waits + 1 : 0;
+    if (waits >= 20 && cur > 1) {
+        uint32_t to = cur * 4 / 5;
+        QueryPerformanceCounter(&now);
+        cur = to < cur ? (to ? to : 1) : cur - 1;
+        last_step = last_down = now.QuadPart;
+        quiet = 0;
+        waits = 0;
+        fprintf(stderr, "  [DYNRES] Present waiting %.0f ms a frame: internal resolution %ux\n", s_last_present_ms, cur);
+        return cur;
+    }
     if (s_gpuctr.state != 1 || !s_perf.freq.QuadPart || s_perf.pub_t0.QuadPart == seen) return cur;
     seen = s_perf.pub_t0.QuadPart;                  /* a new reading */
     QueryPerformanceCounter(&now);
