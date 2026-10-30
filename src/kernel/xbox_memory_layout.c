@@ -1059,7 +1059,13 @@ static void pb_exec_poll_to(volatile uint32_t *regs, uint32_t put)
 
 static void pb_exec_poll(volatile uint32_t *regs)
 {
-    pb_exec_poll_to(regs, *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT));
+    uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
+#if defined(__aarch64__)
+    /* Another thread's PUT: on ARM the commands below it are not ordered
+     * before it the way x86 orders stores, so read them only after PUT. */
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+#endif
+    pb_exec_poll_to(regs, put);
 }
 
 /* One walker at a time: the title's kickoff (xbox_Nv2aKick) and the
