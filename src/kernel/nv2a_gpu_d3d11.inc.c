@@ -689,8 +689,12 @@ static uint32_t *dxt_decode(const uint8_t *src, uint32_t w, uint32_t h, uint32_t
 static uint32_t gpu_tex_bytes(const Texture *t);
 static int tex_override_wants(const Texture *t)
 {
-    return g_xbox_tex_override && g_xbox_tex_override_wants &&
-           g_xbox_tex_override_wants(t->color, t->width, t->height);
+    /* The hook's own value: bit 0 may replace, bit 1 follows gen(). As
+     * "a && b && wants()" it was 0/1, so bit 1 never reached gpu_tex_hash and a
+     * gen() change never re-uploaded anything (My NFL Eras office, 2026-10-16). */
+    if (!g_xbox_tex_override || !g_xbox_tex_override_wants)
+        return 0;
+    return g_xbox_tex_override_wants(t->color, t->width, t->height);
 }
 
 static uint32_t tex_content_hash(const Texture *t)

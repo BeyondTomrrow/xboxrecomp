@@ -18,6 +18,10 @@
 #include "kernel.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+#if defined(_WIN32)
+#include <dbghelp.h>
+#endif
 
 #if !defined(_WIN32)
 #include <fcntl.h>
@@ -558,19 +562,85 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
     }
 }
 
+/* Free space as a title sees it: the host volume the handle lives on.
+ *
+ * The handle is what the title opened for the query (XAPI's GetDiskFreeSpaceEx
+ * opens the drive root, e.g. U:\, with FILE_OPEN_FOR_FREE_SPACE_QUERY), so
+ * its own volume is the right one: saves can live on a different drive from
+ * the working directory (NFL2K5_ROOT). The working directory is only the
+ * fallback.
+ *
+ * Clamped to XBOX_FREE_BYTES_MAX. Xbox titles were written for an 8 GB disk
+ * and do their own arithmetic on the result: NFL 2K5 divides the 64-bit byte
+ * count by its 16 KB block and then keeps only the low 32 bits as a signed
+ * int, and other code linked into titles (CRI's cvFsGetFreeSize, dashboard
+ * helpers) works in 32-bit bytes. Keeping the byte count below 2^31 is safe
+ * for every one of those, and 2 GB is still 131,071 blocks -- the game shows
+ * anything over 50,000 as "50000+ blocks" and its largest save is ~100.
+ *
+ * RECOMP_FREE_SPACE_MB=<n> overrides the host value (testing a full disk). */
+#include <stdlib.h>   /* getenv, strtoul */
+#define XBOX_FREE_BYTES_MAX 0x7FFFC000ull   /* 2 GB - one 16 KB cluster */
+static BOOL host_volume_space(HANDLE h, ULONGLONG *free_out, ULONGLONG *total_out)
+{
+    ULARGE_INTEGER avail, total, total_free;
+    WCHAR path[MAX_PATH + 8];
+    const char *fake = getenv("RECOMP_FREE_SPACE_MB");
+    BOOL ok = FALSE;
+    DWORD n = 0;
+
+    if (h && h != INVALID_HANDLE_VALUE)
+        n = GetFinalPathNameByHandleW(h, path, MAX_PATH,
+                                      FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (n && n < MAX_PATH) {
+        if (path[n - 1] != L'\\' && n + 1 < MAX_PATH) { path[n++] = L'\\'; path[n] = 0; }
+        ok = GetDiskFreeSpaceExW(path, &avail, &total, &total_free);
+        if (!ok) {   /* a file handle: ask for its directory */
+            WCHAR *slash;
+            path[n - 1] = 0;
+            slash = wcsrchr(path, L'\\');
+            if (slash) { slash[1] = 0; ok = GetDiskFreeSpaceExW(path, &avail, &total, &total_free); }
+        }
+    }
+    if (!ok)
+        ok = GetDiskFreeSpaceExW(NULL, &avail, &total, &total_free);
+    if (!ok)
+        return FALSE;
+    *free_out = avail.QuadPart;
+    *total_out = total.QuadPart;
+    if (fake && *fake)
+        *free_out = (ULONGLONG)strtoul(fake, NULL, 10) * 1024ull * 1024ull;
+    if (*free_out > XBOX_FREE_BYTES_MAX)
+        *free_out = XBOX_FREE_BYTES_MAX;
+    if (*total_out > XBOX_FREE_BYTES_MAX)
+        *total_out = XBOX_FREE_BYTES_MAX;
+    if (*total_out < *free_out)
+        *total_out = *free_out;
+    return TRUE;
+}
+
 NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FsInformation, ULONG Length, XBOX_FS_INFORMATION_CLASS FsInformationClass)
 {
-    (void)FileHandle; (void)Length;
+    (void)Length;
     if (!IoStatusBlock || !FsInformation)
         return STATUS_INVALID_PARAMETER;
 
     switch (FsInformationClass) {
         case XboxFileFsSizeInformation: {
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
-            ULARGE_INTEGER free_bytes, total_bytes, total_free;
-            if (GetDiskFreeSpaceExW(NULL, &free_bytes, &total_bytes, &total_free)) {
+            ULONGLONG free_q, total_q;
+            if (host_volume_space(FileHandle, &free_q, &total_q)) {
+                ULARGE_INTEGER free_bytes, total_bytes;
+                static int logged;
+                free_bytes.QuadPart = free_q;
+                total_bytes.QuadPart = total_q;
+                if (logged++ < 4) {
+                    fprintf(stderr, "  [FILE] volume free space: %llu MB reported (%llu blocks)\n",
+                            free_q >> 20, free_q / (XBOX_BYTES_PER_SECTOR * XBOX_SECTORS_PER_CLUSTER));
+                    fflush(stderr);
+                }
                 info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
                 info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
@@ -579,8 +649,10 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
             } else {
                 info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
                 info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
-                info->TotalAllocationUnits.QuadPart = 1048576;
-                info->AvailableAllocationUnits.QuadPart = 524288;
+                /* the clamp, not 8 GB: see XBOX_FREE_BYTES_MAX */
+                info->TotalAllocationUnits.QuadPart =
+                    XBOX_FREE_BYTES_MAX / (XBOX_BYTES_PER_SECTOR * XBOX_SECTORS_PER_CLUSTER);
+                info->AvailableAllocationUnits.QuadPart = info->TotalAllocationUnits.QuadPart;
             }
             IoStatusBlock->Status = STATUS_SUCCESS;
             IoStatusBlock->Information = sizeof(XBOX_FILE_FS_SIZE_INFORMATION);
@@ -742,6 +814,26 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
             swprintf_s(search_path, MAX_PATH, L"%s\\*", clean_path);
         }
         ctx->find_handle = FindFirstFileW(search_path, &ctx->find_data);
+        {   /* NFL2K5_DIRTRACE=1 (study): which recompiled functions list a directory */
+            static int on = -1, n;
+            if (on < 0) on = getenv("NFL2K5_DIRTRACE") != NULL;
+            if (on && n < 30) {
+                void *frames[24];
+                USHORT k, got = CaptureStackBackTrace(0, 24, frames, NULL);
+                char storage[sizeof(SYMBOL_INFO) + 128];
+                SYMBOL_INFO *sym = (SYMBOL_INFO *)storage;
+                n++;
+                fprintf(stderr, "[DIRTRACE] %ls:", search_path);
+                for (k = 1; k < got; k++) {
+                    DWORD64 disp = 0;
+                    memset(storage, 0, sizeof storage);
+                    sym->SizeOfStruct = sizeof(SYMBOL_INFO); sym->MaxNameLen = 127;
+                    if (SymFromAddr(GetCurrentProcess(), (DWORD64)(uintptr_t)frames[k], &disp, sym))
+                        fprintf(stderr, " %s", sym->Name);
+                }
+                fprintf(stderr, "\n");
+            }
+        }
         if (ctx->find_handle == INVALID_HANDLE_VALUE) {
             ctx->find_handle = NULL;
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
@@ -776,6 +868,11 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     int name_len = WideCharToMultiByte(CP_ACP, 0, ctx->find_data.cFileName, -1,
                                        filename_ansi, MAX_PATH, NULL, NULL);
     if (name_len > 0) name_len--;
+    {
+        static int on = -1;
+        if (on < 0) on = getenv("NFL2K5_DIRTRACE") != NULL;
+        if (on) fprintf(stderr, "[DIRTRACE] entry %s\n", filename_ansi);
+    }
 
     entry->NextEntryOffset = 0;
     entry->FileIndex = 0;

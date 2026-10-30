@@ -146,7 +146,8 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         fflush(stderr);
     }
     if (m == FB_WM_APPLY_MODE) {
-        fb_apply_mode(h, (int)w, LOWORD(l), HIWORD(l));
+        if (!getenv("RECOMP_BACKGROUND"))     /* background runs stay off-screen */
+            fb_apply_mode(h, (int)w, LOWORD(l), HIWORD(l));
         return 0;
     }
     if ((m == WM_KEYDOWN || m == WM_SYSKEYDOWN) && s_fb_key_hook) {
@@ -294,9 +295,28 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         }
         style = WS_POPUP | WS_VISIBLE;
     }
-    hwnd = CreateWindowExA(0, "ESPN NFL 2K5", "ESPN NFL 2K5",
-                           style, win_x, win_y, win_w, win_h,
-                           NULL, NULL, GetModuleHandleA(NULL), NULL);
+    {   /* RECOMP_BACKGROUND=1 (unattended test runs while the PC is in use):
+         * an off-screen window that never takes focus and stays out of the
+         * taskbar and Alt-Tab; the game renders and captures frames as usual */
+        DWORD ex = 0;
+        if (getenv("RECOMP_BACKGROUND")) {
+            style = WS_POPUP;
+            ex = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
+            win_x = -20000; win_y = -20000;
+            win_w = (int)s_fb_width; win_h = (int)s_fb_height;
+            {   /* RECOMP_BACKGROUND_WINDOW=WxH: a larger off-screen window (sharper test captures) */
+                const char *bw = getenv("RECOMP_BACKGROUND_WINDOW");
+                int w2 = 0, h2 = 0;
+                if (bw && sscanf(bw, "%dx%d", &w2, &h2) == 2 && w2 >= 320 && h2 >= 240 && w2 <= 3840 && h2 <= 2160) {
+                    win_w = w2; win_h = h2;
+                }
+            }
+        }
+        hwnd = CreateWindowExA(ex, "ESPN NFL 2K5", "ESPN NFL 2K5",
+                               style, win_x, win_y, win_w, win_h,
+                               NULL, NULL, GetModuleHandleA(NULL), NULL);
+        if (hwnd && ex) ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    }
     if (!hwnd) {
         InterlockedExchange(&s_fb_running, 0);
         return 0;
