@@ -524,6 +524,8 @@ enum { DR_TEX, DR_BUF, DR_SHADER, DR_SMP, DR_TB };
 static struct { int kind; void *p; } *s_dr;
 static int s_ndr, s_capdr;
 
+static volatile LONG s_jobs_inflight;   /* background pipeline compiles (see pipe_get) */
+
 static void defer_release(int kind, void *p)
 {
     if (!p) return;
@@ -539,8 +541,13 @@ static void defer_release(int kind, void *p)
 static void run_releases(void)
 {
     int i;
+    int keep = 0;
     EnterCriticalSection(&G.create_lock);
     for (i = 0; i < s_ndr; i++) {
+        if (s_dr[i].kind == DR_SHADER && s_jobs_inflight > 0) {   /* a background compile may use it */
+            s_dr[keep++] = s_dr[i];
+            continue;
+        }
         switch (s_dr[i].kind) {
         case DR_TEX:    SDL_ReleaseGPUTexture(G.dev, (SDL_GPUTexture *)s_dr[i].p); break;
         case DR_BUF:    SDL_ReleaseGPUBuffer(G.dev, (SDL_GPUBuffer *)s_dr[i].p); break;
@@ -549,7 +556,7 @@ static void run_releases(void)
         case DR_TB:     SDL_ReleaseGPUTransferBuffer(G.dev, (SDL_GPUTransferBuffer *)s_dr[i].p); break;
         }
     }
-    s_ndr = 0;
+    s_ndr = keep;
     LeaveCriticalSection(&G.create_lock);
 }
 
@@ -939,6 +946,79 @@ typedef struct {
 static struct { GxPipeKey k; uint32_t h; SDL_GPUGraphicsPipeline *p; } s_pipes[PIPE_CACHE];
 static unsigned s_npipes;
 
+/* Background pipeline compiles (RECOMP_GX_ASYNC_PIPES; on by default on
+ * Android). Adreno's driver takes ~0.7 s per new pipeline, and compiling at
+ * the draw froze the game for seconds whenever a scene first appeared. A
+ * missing pipeline is queued for a worker and its draws are skipped until it
+ * is ready -- an object pops in a few frames late instead of the game
+ * stopping. Shaders a queued job refers to are kept alive (run_releases). */
+typedef struct {
+    GxPipeKey k;
+    uint32_t h;
+    int state;                          /* 0 free, 1 queued, 2 compiling, 3 done */
+    SDL_GPUGraphicsPipelineCreateInfo ci;
+    SDL_GPUColorTargetDescription ct[4];
+    SDL_GPUGraphicsPipeline *p;
+} GxPipeJob;
+#define PIPE_JOBS 256
+static GxPipeJob s_jobs[PIPE_JOBS];
+static SDL_Mutex *s_job_lock;
+static SDL_Condition *s_job_cond;
+static volatile LONG s_jobs_inflight;   /* queued or compiling */
+static int s_async_pipes = -1;
+
+static int pipe_job_worker(void *arg)
+{
+    (void)arg;
+    SDL_LockMutex(s_job_lock);
+    for (;;) {
+        GxPipeJob *j = NULL;
+        int i;
+        for (i = 0; i < PIPE_JOBS && !j; i++)
+            if (s_jobs[i].state == 1) j = &s_jobs[i];
+        if (!j) { SDL_WaitCondition(s_job_cond, s_job_lock); continue; }
+        j->state = 2;
+        SDL_UnlockMutex(s_job_lock);
+        {
+            Uint64 t0 = SDL_GetTicksNS();
+            SDL_GPUGraphicsPipeline *p = SDL_CreateGPUGraphicsPipeline(G.dev, &j->ci);
+            Uint64 ms = (SDL_GetTicksNS() - t0) / 1000000u;
+            static volatile LONG made;
+            LONG n = InterlockedIncrement(&made);
+            if (n <= 3 || n % 200 == 0 || ms > 100)
+                fprintf(stderr, "  [GX] background pipeline #%ld took %llu ms%s\n", (long)n,
+                        (unsigned long long)ms, p ? "" : " (failed)");
+            SDL_LockMutex(s_job_lock);
+            j->p = p;
+            j->state = 3;
+            InterlockedDecrement(&s_jobs_inflight);
+        }
+    }
+    return 0;
+}
+
+static int pipe_async_on(void)
+{
+    if (s_async_pipes < 0) {
+        const char *e = getenv("RECOMP_GX_ASYNC_PIPES");
+#ifdef __ANDROID__
+        s_async_pipes = !e || *e != '0';
+#else
+        s_async_pipes = e && *e == '1';
+#endif
+        if (s_async_pipes) {
+            s_job_lock = SDL_CreateMutex();
+            s_job_cond = SDL_CreateCondition();
+            if (!s_job_lock || !s_job_cond ||
+                !SDL_CreateThread(pipe_job_worker, "gx_pipe0", NULL) ||
+                !SDL_CreateThread(pipe_job_worker, "gx_pipe1", NULL))
+                s_async_pipes = 0;
+            fprintf(stderr, "  [GX] background pipeline compiles %s\n", s_async_pipes ? "on" : "off");
+        }
+    }
+    return s_async_pipes;
+}
+
 static uint32_t key_hash(const void *p, size_t n)
 {
     const uint8_t *b = (const uint8_t *)p;
@@ -1120,9 +1200,44 @@ static SDL_GPUGraphicsPipeline *pipe_get(GxShader *vs, GxShader *ps, D3D11_PRIMI
     {
         static unsigned created;
         LARGE_INTEGER a, b, fq;
-        SDL_GPUGraphicsPipeline *p;
+        SDL_GPUGraphicsPipeline *p = NULL;
+        int from_job = 0;
+        if (pipe_async_on()) {
+            int got = 0, freej = -1;
+            SDL_LockMutex(s_job_lock);
+            for (i = 0; i < PIPE_JOBS; i++) {
+                GxPipeJob *j = &s_jobs[i];
+                if (!j->state) { if (freej < 0) freej = (int)i; continue; }
+                if (j->h == h && !memcmp(&j->k, &k, sizeof k)) {
+                    if (j->state == 3) { p = j->p; j->state = 0; got = 1; }
+                    else got = -1;                  /* still compiling */
+                    break;
+                }
+            }
+            if (!got && freej >= 0) {
+                GxPipeJob *j = &s_jobs[freej];
+                j->k = k; j->h = h;
+                j->ci = ci;
+                memcpy(j->ct, ct, sizeof ct);
+                j->ci.target_info.color_target_descriptions = j->ct;
+                j->p = NULL;
+                j->state = 1;
+                InterlockedIncrement(&s_jobs_inflight);
+                SDL_SignalCondition(s_job_cond);
+                got = -1;
+            }
+            SDL_UnlockMutex(s_job_lock);
+            if (got < 0)
+                return NULL;                        /* draw skipped until it is ready */
+            if (got > 0) {
+                if (!p) return NULL;
+                from_job = 1;
+            }
+            /* no free job slot: compile here, as before */
+        }
         QueryPerformanceCounter(&a);
-        p = SDL_CreateGPUGraphicsPipeline(G.dev, &ci);
+        if (!from_job)
+            p = SDL_CreateGPUGraphicsPipeline(G.dev, &ci);
         QueryPerformanceCounter(&b);
         QueryPerformanceFrequency(&fq);
         s_st.pipe_ms += (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)fq.QuadPart;
