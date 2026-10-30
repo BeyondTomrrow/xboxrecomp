@@ -36,6 +36,7 @@ static uint32_t s_ps_sheet[128 * 128];
 static int s_ps_sheet_built;
 
 /* GDI-draw the PlayStation cells into s_ps_sheet (BGRA, alpha from coverage). */
+#ifdef _WIN32
 static void prompt_build_ps(const uint32_t *orig)
 {
     BITMAPINFO bi;
@@ -143,6 +144,10 @@ static void prompt_build_ps(const uint32_t *orig)
         }
     }
 }
+#else
+/* No GDI: the Xbox icons stay. */
+static void prompt_build_ps(const uint32_t *orig) { memcpy(s_ps_sheet, orig, sizeof s_ps_sheet); }
+#endif
 
 /* After a 128x128 paletted texture is decoded into `pix` (BGRA). */
 static void prompt_patch(uint32_t *pix, uint32_t addr)

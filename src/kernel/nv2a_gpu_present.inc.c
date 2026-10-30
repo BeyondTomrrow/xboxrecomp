@@ -1298,6 +1298,7 @@ static void menu_pad(void)
 
 /* Draw the page (or just the FPS counter) with GDI into a BGRA bitmap and
  * upload it; alpha is made from a colour key. */
+#ifdef _WIN32
 static void pr_build_overlay(void)
 {
     /* Tall enough for the open page's rows (32 px each), at least the old 560. */
@@ -1414,6 +1415,9 @@ static void pr_build_overlay(void)
     DeleteDC(dc);
     s_pr.ovl_valid = 1;
 }
+#else
+static void pr_build_overlay(void) { }   /* GDI text: Windows only (Android has no F1 menu) */
+#endif
 
 /* ── Toast: a short banner in the bottom-left corner ──────────────────
  * xbox_PresentToast(header, line1, line2, ms): "NOW PLAYING" for the local
@@ -1435,6 +1439,7 @@ void xbox_PresentToast(const char *header, const char *line1, const char *line2,
     ReleaseSRWLockExclusive(&s_toast_lock);
 }
 
+#ifdef _WIN32
 static void pr_build_toast(void)
 {
     const int W = 640, H = 132;
@@ -1515,6 +1520,9 @@ static void pr_build_toast(void)
     DeleteObject(fh); DeleteObject(ft); DeleteObject(fs);
     DeleteDC(dc);
 }
+#else
+static void pr_build_toast(void) { }   /* GDI text: Windows only */
+#endif
 
 /* Draw the toast while it is due, in the bottom-left corner. */
 static void pr_draw_toast(void)
@@ -2187,6 +2195,9 @@ void xbox_AudioRecordTap(const char *path);   /* apu_xaudio2.c */
  * ffmpeg runs in the background so the game does not wait for it. */
 static void pr_record_mux(const char *ff, const char *video, const char *raw, const char *out)
 {
+#ifndef _WIN32
+    (void)ff; (void)video; (void)raw; (void)out;   /* recording clips: Windows only */
+#else
     char cmd[2048];
     STARTUPINFOA si;
     PROCESS_INFORMATION pi;
@@ -2200,6 +2211,7 @@ static void pr_record_mux(const char *ff, const char *video, const char *raw, co
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
     }
+#endif
 }
 
 void xbox_PresentRecord(int seconds)

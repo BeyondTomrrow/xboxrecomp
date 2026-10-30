@@ -1020,6 +1020,7 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
 /* Windows reads the game data into the file cache at start (above); here
  * the kernel's own read-ahead does. */
 void xbox_PrefetchGameData(const char *root) { (void)root; }
+volatile LONG64 g_xbox_read_qpc, g_xbox_read_bytes, g_xbox_read_count;   /* the hitch log's disc reads */
 
 /* ====================  POSIX backend  =================================== */
 /* ======================================================================== */

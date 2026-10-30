@@ -23,7 +23,13 @@
  *    the CPU, its existing fallback).
  */
 #define GX_IMPL
+#ifdef XBOX_GX_PORTABLE
+#include "platform/xbox_winnt.h"       /* the NT types and Win32 calls (platform layer) */
+#include "platform/win32_compat.h"
+#include "gx_portable.h"
+#else
 #include <windows.h>
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,8 +43,10 @@
 extern void *SDL_GetGPUCommandBufferNativeD3D12(SDL_GPUCommandBuffer *commandBuffer);
 extern void SDL_RestoreGPUCommandBufferD3D12(SDL_GPUCommandBuffer *commandBuffer);
 
+#ifdef _MSC_VER
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3dcompiler.lib")
+#endif
 
 int g_gx_sg;
 static int s_backend;

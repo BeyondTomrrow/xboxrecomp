@@ -35,8 +35,27 @@ if(WIN32)
     list(APPEND KERNEL_SOURCES gx/gx_sdl.c gx/gx_dxc.cpp gx/gx_ffx.cpp)
 endif()
 
+# The same renderer on hosts without Direct3D (Android): SDL_GPU on Vulkan,
+# shaders compiled by glslang (gx/gx_glslang.cpp), Direct3D types from the
+# mingw-w64 headers (DXVK's native set) and gx/portable.
+if(ANDROID)
+    set(_gx_portable_default ON)
+else()
+    set(_gx_portable_default OFF)
+endif()
+option(XBOXRECOMP_GX_PORTABLE "Build the D3D11 renderer on SDL_GPU/Vulkan without Windows" ${_gx_portable_default})
+set(XBOXRECOMP_DX_HEADERS "C:/Android/src/dxvk/include/native/directx" CACHE PATH "mingw-w64 DirectX headers (DXVK include/native/directx)")
+if(XBOXRECOMP_GX_PORTABLE AND NOT WIN32)
+    list(APPEND KERNEL_SOURCES gx/gx_sdl.c gx/gx_glslang.cpp gx/gx_portable.c)
+endif()
+
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
 target_link_libraries(xbox_kernel PUBLIC SDL3::SDL3)
+if(XBOXRECOMP_GX_PORTABLE AND NOT WIN32)
+    target_compile_definitions(xbox_kernel PRIVATE XBOX_GX_PORTABLE=1)
+    target_include_directories(xbox_kernel PRIVATE ${XBOXRECOMP_DX_HEADERS} ${CMAKE_CURRENT_SOURCE_DIR}/gx/portable)
+    target_link_libraries(xbox_kernel PRIVATE glslang SPIRV glslang-default-resource-limits)
+endif()
 
 # See src/platform/CMakeLists.txt: resolve src/ relative to this file, not via
 # CMAKE_SOURCE_DIR, which is the consuming project's root under add_subdirectory().

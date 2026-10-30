@@ -11,6 +11,11 @@
 #ifndef GX_D3D11_H
 #define GX_D3D11_H
 
+#ifdef XBOX_GX_PORTABLE
+/* Android: the Direct3D headers (mingw-w64's, through DXVK's native set,
+ * gx/portable) for the types only; xboxrecomp supplies the NT types. */
+#define GX_PORTABLE_NT_TYPES 1
+#endif
 #include <d3d11.h>
 #include <d3d11_1.h>
 #include <d3dcompiler.h>

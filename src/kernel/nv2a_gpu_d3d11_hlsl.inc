@@ -507,7 +507,7 @@ static const char k_gpu_hlsl[] =
     "        }\n"
     "        o = saturate(o);\n"
     "    }\n"
-    "    if (show.x >= 1u && show.x <= 4u) return float4(t[show.x - 1u].rgb, 1.0);\n"
+    "    if (show.x >= 1u && show.x <= 4u) return float4(t[(show.x - 1u) & 3u].rgb, 1.0);\n"
     "    if (show.x == 5u) return float4(d0.rgb, 1.0);\n"
     "    if (show.x == 6u) return float4(o.aaa, 1.0);\n"
     "    if (alpha.x != 0u) {\n"

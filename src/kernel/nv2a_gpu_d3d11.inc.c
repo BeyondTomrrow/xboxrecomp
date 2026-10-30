@@ -27,13 +27,18 @@
  * buffer; fog is not applied. Mip levels: the title's own for DXT textures,
  * box-filtered from level 0 for decoded ones (gpu_guest_levels, 2026-10-30).
  */
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(XBOX_GX_PORTABLE)
 /* The D3D11 method calls below run on Direct3D 11 itself, or on Vulkan or
- * Direct3D 12 through SDL_GPU (gx/gx_sdl.c), chosen at start-up. */
+ * Direct3D 12 through SDL_GPU (gx/gx_sdl.c), chosen at start-up. With
+ * XBOX_GX_PORTABLE (Android) only SDL_GPU on Vulkan exists. */
 #include "gx/gx_d3d11.h"
+#ifdef _WIN32
 #include <intrin.h>        /* __rdtsc: draw-path profile */
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3dcompiler.lib")
+#else
+#include "gx/gx_portable.h"
+#endif
 
 typedef struct {
     float pos[4];

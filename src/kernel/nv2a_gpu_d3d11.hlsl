@@ -505,7 +505,7 @@ float4 shade(PIn i)
         }
         o = saturate(o);
     }
-    if (show.x >= 1u && show.x <= 4u) return float4(t[show.x - 1u].rgb, 1.0);
+    if (show.x >= 1u && show.x <= 4u) return float4(t[(show.x - 1u) & 3u].rgb, 1.0);
     if (show.x == 5u) return float4(d0.rgb, 1.0);
     if (show.x == 6u) return float4(o.aaa, 1.0);
     if (alpha.x != 0u) {
