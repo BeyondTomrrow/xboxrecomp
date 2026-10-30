@@ -2041,6 +2041,24 @@ static GxTex *make_bb(int w, int h)
     return (GxTex *)t;
 }
 
+/* 1 when the device samples BC1/BC2/BC3 (DXT): every desktop GPU does;
+ * many phone GPUs do not, and get the textures decoded instead. */
+int gxs_bc_supported(void)
+{
+    static int ok = -1;
+    if (ok < 0 && G.dev) {
+        ok = SDL_GPUTextureSupportsFormat(G.dev, SDL_GPU_TEXTUREFORMAT_BC1_RGBA_UNORM, SDL_GPU_TEXTURETYPE_2D,
+                                          SDL_GPU_TEXTUREUSAGE_SAMPLER) &&
+             SDL_GPUTextureSupportsFormat(G.dev, SDL_GPU_TEXTUREFORMAT_BC2_RGBA_UNORM, SDL_GPU_TEXTURETYPE_2D,
+                                          SDL_GPU_TEXTUREUSAGE_SAMPLER) &&
+             SDL_GPUTextureSupportsFormat(G.dev, SDL_GPU_TEXTUREFORMAT_BC3_RGBA_UNORM, SDL_GPU_TEXTURETYPE_2D,
+                                          SDL_GPU_TEXTUREUSAGE_SAMPLER);
+        if (getenv("RECOMP_GX_NO_BC")) ok = 0;   /* test the decoded path on a GPU that has BC */
+        fprintf(stderr, "  [GX] DXT (BC1-3) textures: %s\n", ok ? "sampled as they are" : "not supported here, decoded");
+    }
+    return ok != 0;
+}
+
 IDXGISwapChain1 *gxs_swapchain(void *sdl_window, int *out_w, int *out_h)
 {
     int w = 0, h = 0;

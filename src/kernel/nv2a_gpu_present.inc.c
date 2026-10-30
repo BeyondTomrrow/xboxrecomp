@@ -33,11 +33,18 @@ static HWND xbox_GetNativeHwnd(void)
 {
     SDL_Window *win = (SDL_Window *)xbox_FramebufferWindowHwnd();
     if (!win) return NULL;
+#ifndef _WIN32
+    /* No Win32 window: only SDL_GPU presents here, and the presenter uses
+     * the handle as the window's identity (Android/Linux showed nothing,
+     * the swap chain waiting forever for an HWND, 2026-10-30). */
+    return (HWND)win;
+#else
     return (HWND)SDL_GetPointerProperty(
         SDL_GetWindowProperties(win),
         SDL_PROP_WINDOW_WIN32_HWND_POINTER,
         NULL
     );
+#endif
 }
 
 int  xbox_ggl_release_all(void);

@@ -483,7 +483,12 @@ BOOL xbox_ac97_handle_posix_signal(int signal_number, int signal_code, uintptr_t
 #elif defined(__aarch64__)
     /* No single-step to borrow here: the store is decoded and performed with
      * the page briefly writable, then the controller's response applied. */
-    if (g_ac97_page && raw_context && signal_number == SIGSEGV && signal_code == SEGV_ACCERR
+    /* Any SIGSEGV code: a Samsung S22+ (Android 14, kernel 5.10) reports a
+     * write to this read-only page as SEGV_MAPERR, not SEGV_ACCERR, and the
+     * game closed at its first AC'97 write (2026-10-30). The address alone
+     * says it is ours. */
+    (void)signal_code;
+    if (g_ac97_page && raw_context && signal_number == SIGSEGV
             && fault_address >= (uintptr_t)g_ac97_page
             && fault_address - (uintptr_t)g_ac97_page < AC97_TRAP_BYTES) {
         extern int xbox_arm64_take_store(void *raw_ctx, uint64_t *ea, uint64_t vals[2], int *size, int *count);

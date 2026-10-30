@@ -833,6 +833,10 @@ const uint32_t *(*g_xbox_tex_override)(uint32_t fmt, uint32_t w, uint32_t h, uin
 volatile long g_xbox_tex_dump_wanted;   /* the title dumps textures: DXT ones are decoded for it */
 
 /* DXT1/3/5 (BC1/2/3) to BGRA, for a texture dump. */
+/* BC1-3 sampled as they are, unless the device lacks them (gx/gx_sdl.c) */
+int gxs_bc_supported(void);
+static int gpu_bc_ok(void) { return !g_gx_sg || gxs_bc_supported(); }
+
 static uint32_t *dxt_decode(const uint8_t *src, uint32_t w, uint32_t h, uint32_t fmt)
 {
     uint32_t *out = (uint32_t *)calloc((size_t)w * h, 4), bx, by, i;
@@ -1085,6 +1089,8 @@ static void tex_pool_topup(void)
     QueryPerformanceFrequency(&fq);
     for (s = 0; s < sizeof k_shapes / sizeof k_shapes[0]; s++) {
         int have = 0, i;
+        if (k_shapes[s].fmt == DXGI_FORMAT_BC1_UNORM && !gpu_bc_ok())
+            continue;                           /* no BC on this GPU: DXT is decoded */
         for (i = 0; i < s_tpool_n; i++)
             if (s_tpool[i].d.Width == k_shapes[s].w && s_tpool[i].d.Height == k_shapes[s].h &&
                     s_tpool[i].d.Format == k_shapes[s].fmt && s_tpool[i].d.MipLevels == k_shapes[s].mips &&
@@ -1351,7 +1357,7 @@ static ID3D11ShaderResourceView *gpu_texture(int st, int cube)
      * no swizzle -- instead of being decoded texel by texel on the CPU,
      * which re-decoded the whole 4x4 block for every texel (2026-09-26). */
     if (d3d8_format_dxt_block_bytes(t->color) && (t->width & 3) == 0 && (t->height & 3) == 0
-            && (!cube || t->width == t->height)) {
+            && (!cube || t->width == t->height) && gpu_bc_ok()) {
         const uint8_t *gm = (const uint8_t *)xbox_GetMemoryOffset();
         uint32_t bb = d3d8_format_dxt_block_bytes(t->color);
         uint32_t fbytes = (t->width / 4) * (t->height / 4) * bb;
@@ -1510,6 +1516,20 @@ static ID3D11ShaderResourceView *gpu_texture(int st, int cube)
             if (ok)
                 goto decoded;
         }
+    }
+    if (d3d8_format_dxt_block_bytes(t->color) && (t->width & 3) == 0 && (t->height & 3) == 0) {
+        /* No BC formats on this GPU (many phones): the blocks decoded whole,
+         * a face at a time, rather than texel by texel below. */
+        const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+        int ok = 1;
+        for (f = 0; f < faces && ok; f++) {
+            uint32_t *dec = dxt_decode(mem + t->offset + f * face_bytes, t->width, t->height, t->color);
+            if (!dec) { ok = 0; break; }
+            memcpy(pix + (size_t)f * n, dec, (size_t)n * 4);
+            free(dec);
+        }
+        if (ok)
+            goto decoded;
     }
     {
         uint32_t u, v, base = t->offset;

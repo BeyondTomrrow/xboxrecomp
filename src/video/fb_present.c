@@ -290,6 +290,14 @@ static int SDLCALL fb_thread_sdl(void *data) {
     {
         const char *on = getenv("RECOMP_SDLGPU"), *pres = getenv("RECOMP_SDLGPU_PRESENT");
         int expect = on && *on && strcmp(on, "0") != 0 && !(pres && strcmp(pres, "0") == 0);
+#if defined(__ANDROID__)
+        /* gx on Vulkan presents into this window: no SDL_Renderer (an EGL
+         * surface) first, which the Vulkan swap chain would then replace */
+        {
+            const char *r = getenv("RECOMP_RENDERER");
+            if (r && (!strcmp(r, "vulkan") || !strcmp(r, "vk"))) expect = 1;
+        }
+#endif
         gpu_expected_until = expect ? SDL_GetTicks() + 10000 : 0;
     }
 
