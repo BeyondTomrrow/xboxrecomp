@@ -68,12 +68,14 @@ typedef struct {
     int upscaler;           /* 0 off, 1 FSR 3 native AA, 2 quality, 3 balanced, 4 performance, 5 ultra performance */
     int framegen;           /* FSR 3 frame generation: a generated frame between each two (Direct3D 12) */
     int dynres;             /* dynamic resolution: the internal resolution drops below `scale` while the GPU is the limit */
+    int post;               /* post-processing preset (nv2a_gpu_post.inc.c): 0 off, 1 Broadcast, 2 Cinematic, 3 Vivid, 4 Night Game */
+    int sharpen;            /* 0 off, 1 low, 2 medium, 3 high */
 } VideoSettings;
 
 /* NFL 2K5 draws several full-screen backdrops only inside the 640-pixel
  * title-safe area of its 720-pixel scanout.  A CRT hid the remaining edge;
  * showing the full scanout exposes hard black strips beside the sky. */
-static VideoSettings s_vs = { VM_BORDERLESS, 1920, 1080, AR_ORIGINAL, 3, SF_ENHANCED, 1, 100, 100, 0, 0, 8, 0, 1, 0, 0, 0, 0, 1 };
+static VideoSettings s_vs = { VM_BORDERLESS, 1920, 1080, AR_ORIGINAL, 3, SF_ENHANCED, 1, 100, 100, 0, 0, 8, 0, 1, 0, 0, 0, 0, 1, 1, 1 };
 static volatile LONG s_vs_dirty = 1;
 static uint32_t pr_dynres_scale(void);
 void xbox_VideoSettingsLoad(void);           /* window/swap chain need (re)applying */
@@ -111,6 +113,8 @@ static void vs_load(void)
         else if (!strcmp(key, "upscaler")) s_vs.upscaler = v;
         else if (!strcmp(key, "framegen")) s_vs.framegen = v != 0;
         else if (!strcmp(key, "dynres")) s_vs.dynres = v != 0;
+        else if (!strcmp(key, "post")) s_vs.post = v;
+        else if (!strcmp(key, "sharpen")) s_vs.sharpen = v;
     }
     fclose(f);
     if (s_vs.scale < 1) s_vs.scale = 1;
@@ -118,6 +122,8 @@ static void vs_load(void)
     if (s_vs.lighting < 0 || s_vs.lighting > 2) s_vs.lighting = 0;
     if (s_vs.renderer < 0 || s_vs.renderer > 2) s_vs.renderer = 0;
     if (s_vs.upscaler < 0 || s_vs.upscaler > 5) s_vs.upscaler = 0;
+    if (s_vs.post < 0 || s_vs.post > 4) s_vs.post = 0;
+    if (s_vs.sharpen < 0 || s_vs.sharpen > 3) s_vs.sharpen = 0;
     if (s_vs.filter < SF_BILINEAR || s_vs.filter > SF_ENHANCED) s_vs.filter = SF_ENHANCED;
     if (s_vs.crop < 0) s_vs.crop = 0;
     if (s_vs.crop > 40) s_vs.crop = 40;
@@ -155,10 +161,14 @@ static void vs_save(void)
                "framegen = %d\n"
                "; dynres: 1 auto: the highest internal resolution (up to 16x) that holds the frame-rate cap;\n"
                "; scale is only where it starts. 0 a fixed scale\n"
-               "dynres = %d\n",
+               "dynres = %d\n"
+               "; post: 0 off, 1 Broadcast, 2 Cinematic, 3 Vivid, 4 Night Game (bloom, highlight roll-off, grading)\n"
+               "post = %d\n"
+               "; sharpen: 0 off, 1 low, 2 medium, 3 high (contrast-adaptive)\n"
+               "sharpen = %d\n",
             s_vs.mode, s_vs.res_w, s_vs.res_h, s_vs.aspect, s_vs.scale, s_vs.filter, s_vs.vsync,
             s_vs.brightness, s_vs.gamma, s_vs.crop, s_vs.show_fps, s_vs.aniso, s_vs.fps_limit, s_vs.widescreen, s_vs.lighting, s_vs.renderer, s_vs.upscaler, s_vs.framegen,
-            s_vs.dynres);
+            s_vs.dynres, s_vs.post, s_vs.sharpen);
     fclose(f);
 }
 
@@ -361,6 +371,9 @@ static int pr_init(void)
     g_lighting_profile = (uint32_t)s_vs.lighting;
     return s_pr.ok;
 }
+
+#include "nv2a_gpu_post.inc.c"
+static const char *const k_sharpen_names[] = { "Off", "Low", "Medium", "High" };
 
 /* Common state for the helper draws below. */
 static void pr_helper_state(ID3D11RenderTargetView *dst, UINT x, UINT y, UINT w, UINT h, const PresentConsts *pc)
@@ -733,7 +746,7 @@ static void pr_draw_hud(float gx, float gy, float gw, float gh)
 
 /* ---- the settings page -------------------------------------------------- */
 
-enum { MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_FILTER, MI_VSYNC, MI_BRIGHT, MI_GAMMA, MI_CROP,
+enum { MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_FILTER, MI_VSYNC, MI_BRIGHT, MI_GAMMA, MI_CROP,
        MI_ANISO, MI_FPS, MI_LIMIT, MI_API, MI_UPSCALE, MI_FRAMEGEN, MI_RESET, MI_CLOSE, MI_COUNT };
 static const char *const k_upscaler_names[] = { "Off", "FSR 3 Native AA", "FSR 3 Quality", "FSR 3 Balanced",
                                                  "FSR 3 Performance", "FSR 3 Ultra Performance" };
@@ -768,6 +781,8 @@ static void menu_label(int item, char *name, char *val, size_t n)
                     if (s_vs.dynres) snprintf(val, n, "Auto, max for the cap  (now %ux)", g_render_scale);
                     else snprintf(val, n, "Off"); break;
     case MI_LIGHTING: strcpy(name, "Lighting and materials"); snprintf(val, n, "%s", lighting[s_vs.lighting % 3]); break;
+    case MI_POST:   strcpy(name, "Post-processing"); snprintf(val, n, "%s", k_post_presets[s_vs.post % POST_PRESETS].name); break;
+    case MI_SHARPEN: strcpy(name, "Sharpening"); snprintf(val, n, "%s", k_sharpen_names[s_vs.sharpen & 3]); break;
     case MI_FILTER: strcpy(name, "Upscaling filter"); snprintf(val, n, "%s", filters[s_vs.filter % 4]); break;
     case MI_VSYNC:  strcpy(name, "VSync"); snprintf(val, n, "%s", s_vs.vsync ? "On" : "Off"); break;
     case MI_BRIGHT: strcpy(name, "Brightness"); snprintf(val, n, "%d%%", s_vs.brightness); break;
@@ -810,6 +825,8 @@ static void menu_change(int item, int dir)
     case MI_ASPECT: s_vs.aspect = (s_vs.aspect + 6 + dir) % 6; break;
     case MI_SCALE:  s_vs.scale += dir; if (s_vs.scale < 1) s_vs.scale = 16; if (s_vs.scale > 16) s_vs.scale = 1; break;
     case MI_LIGHTING: s_vs.lighting = (s_vs.lighting + 3 + dir) % 3; break;
+    case MI_POST:   s_vs.post = (s_vs.post + POST_PRESETS + dir) % POST_PRESETS; break;
+    case MI_SHARPEN: s_vs.sharpen = (s_vs.sharpen + 4 + dir) % 4; break;
     case MI_FILTER: s_vs.filter = (s_vs.filter + 4 + dir) % 4; break;
     case MI_VSYNC:  s_vs.vsync = !s_vs.vsync; break;
     case MI_BRIGHT: s_vs.brightness += 5 * dir; if (s_vs.brightness < 50) s_vs.brightness = 50;
@@ -838,7 +855,7 @@ static void menu_change(int item, int dir)
 static void menu_activate(int item)
 {
     if (item == MI_RESET) {
-        VideoSettings d = { VM_BORDERLESS, 1920, 1080, AR_ORIGINAL, 3, SF_ENHANCED, 1, 100, 100, 0, 0, 8, 0, 1, 0, 0, 0, 0, 1 };
+        VideoSettings d = { VM_BORDERLESS, 1920, 1080, AR_ORIGINAL, 3, SF_ENHANCED, 1, 100, 100, 0, 0, 8, 0, 1, 0, 0, 0, 0, 1, 1, 1 };
         d.renderer = s_vs.renderer;          /* the API is not a picture setting */
         d.upscaler = s_vs.upscaler;
         d.framegen = s_vs.framegen;
@@ -885,7 +902,7 @@ static int menu_rows(void) { int n = menu_page()->count(); return n > 0 ? n : 1;
  * menu; its rows are these settings as indexed value lists. Called from the
  * game thread: changes mark the swap chain for re-applying on the next flip
  * and are saved at once. */
-static const int k_vm_items[] = { MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_FILTER, MI_VSYNC,
+static const int k_vm_items[] = { MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_FILTER, MI_VSYNC,
                                   MI_BRIGHT, MI_GAMMA, MI_CROP, MI_ANISO, MI_FPS, MI_LIMIT, MI_API, MI_UPSCALE, MI_FRAMEGEN };
 #define VM_COUNT ((int)(sizeof k_vm_items / sizeof k_vm_items[0]))
 static const int k_vm_aniso[] = { 1, 2, 4, 8, 16 };
@@ -895,7 +912,7 @@ int xbox_VideoSettingCount(void) { return VM_COUNT; }
 const char *xbox_VideoSettingName(int i)
 {
     static const char *names[] = { "Display Mode", "Resolution", "Widescreen", "Aspect Ratio", "Render Scale", "Dynamic Resolution",
-                                   "Lighting & Materials",
+                                   "Lighting & Materials", "Post-Processing", "Sharpening",
                                    "Upscaling Filter", "VSync", "Brightness", "Gamma",
                                    "Overscan Crop", "Texture Filtering", "Show FPS", "Frame Rate Cap", "Graphics API", "Upscaling", "Frame Generation" };
     return (i >= 0 && i < VM_COUNT) ? names[i] : "";
@@ -917,6 +934,8 @@ int xbox_VideoSettingValues(int i)
     case MI_ASPECT: return 6;
     case MI_SCALE:  return 16;
     case MI_LIGHTING: return 3;
+    case MI_POST:   return POST_PRESETS;
+    case MI_SHARPEN: return 4;
     case MI_VSYNC: case MI_FPS: case MI_WIDE: return 2;
     case MI_BRIGHT: case MI_GAMMA: return 21;
     case MI_CROP: case MI_ANISO: return 5;
@@ -942,6 +961,8 @@ static int vm_get(const VideoSettings *vs, int item)
     case MI_ASPECT: return vs->aspect;
     case MI_SCALE:  return vs->scale - 1;
     case MI_LIGHTING: return vs->lighting;
+    case MI_POST:   return vs->post;
+    case MI_SHARPEN: return vs->sharpen;
     case MI_FILTER: return vs->filter;
     case MI_VSYNC:  return vs->vsync ? 1 : 0;
     case MI_BRIGHT: return (vs->brightness - 50) / 5;
@@ -973,6 +994,8 @@ static void vm_set(VideoSettings *vs, int item, int idx)
     case MI_ASPECT: vs->aspect = idx; break;
     case MI_SCALE:  vs->scale = idx + 1; break;
     case MI_LIGHTING: vs->lighting = idx; break;
+    case MI_POST:   vs->post = idx % POST_PRESETS; break;
+    case MI_SHARPEN: vs->sharpen = idx & 3; break;
     case MI_FILTER: vs->filter = idx; break;
     case MI_VSYNC:  vs->vsync = idx; break;
     case MI_BRIGHT: vs->brightness = 50 + 5 * idx; break;
@@ -1008,6 +1031,8 @@ void xbox_VideoSettingValueName(int i, int idx, char *buf, size_t n)
     case MI_ASPECT: snprintf(buf, n, "%s", aspects[v.aspect % 6]); break;
     case MI_SCALE:  snprintf(buf, n, "%dx (%d x %d)", v.scale, 720 * v.scale, 480 * v.scale); break;
     case MI_LIGHTING: snprintf(buf, n, "%s", lighting[v.lighting % 3]); break;
+    case MI_POST:   snprintf(buf, n, "%s", k_post_presets[v.post % POST_PRESETS].name); break;
+    case MI_SHARPEN: snprintf(buf, n, "%s", k_sharpen_names[v.sharpen & 3]); break;
     case MI_FILTER: snprintf(buf, n, "%s", filters[v.filter % 4]); break;
     case MI_VSYNC:  snprintf(buf, n, "%s", v.vsync ? "On" : "Off"); break;
     case MI_BRIGHT: snprintf(buf, n, "%d%%", v.brightness); break;
@@ -1664,7 +1689,13 @@ static int pr_present(uint32_t guest)
     }
     ID3D11DeviceContext_OMSetRenderTargets(s_gpu11.ctx, 1, &target, NULL);
     ID3D11DeviceContext_ClearRenderTargetView(s_gpu11.ctx, target, clear);
-    vp.TopLeftX = dx; vp.TopLeftY = dy; vp.Width = dw; vp.Height = dh; vp.MinDepth = 0; vp.MaxDepth = 1;
+    /* Post-processing: the picture goes to an off-screen image of the size it
+     * is shown at, and bloom/grading/sharpening put it on the back buffer. */
+    ID3D11RenderTargetView *post_rtv = post_begin((UINT)(dw + 0.5f), (UINT)(dh + 0.5f));
+    if (post_rtv)
+        ID3D11DeviceContext_OMSetRenderTargets(s_gpu11.ctx, 1, &post_rtv, NULL);
+    vp.TopLeftX = post_rtv ? 0.0f : dx; vp.TopLeftY = post_rtv ? 0.0f : dy;
+    vp.Width = dw; vp.Height = dh; vp.MinDepth = 0; vp.MaxDepth = 1;
     ID3D11DeviceContext_RSSetViewports(s_gpu11.ctx, 1, &vp);
     {
         D3D11_RECT all = { 0, 0, (LONG)s_pr.bb_w, (LONG)s_pr.bb_h };
@@ -1685,6 +1716,11 @@ static int pr_present(uint32_t guest)
         ID3D11DeviceContext_PSSetSamplers(s_gpu11.ctx, 0, 2, smp);
     }
     ID3D11DeviceContext_Draw(s_gpu11.ctx, 3, 0);
+    if (post_rtv) {
+        ID3D11ShaderResourceView *none = NULL;
+        ID3D11DeviceContext_PSSetShaderResources(s_gpu11.ctx, 0, 1, &none);
+        post_finish(target, dx, dy);
+    }
     {
         /* The HUD lays out against the whole surface; a side crop pushes part
          * of it past the picture's edges. */
