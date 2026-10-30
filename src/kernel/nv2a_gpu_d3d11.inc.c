@@ -112,11 +112,66 @@ static uint32_t gpu_wide_ox(uint32_t w, uint32_t h)
 /* The scale a target of this guest size (with its widescreen columns) gets:
  * the setting, stepped down until it fits D3D11's 16384 texture limit (a 32:9
  * target at a higher multiplier can exceed the hardware dimension limit). */
+#include <dxgi1_4.h>
+
+/* The graphics card with the most video memory, straight from DXGI: on
+ * Direct3D 12/Vulkan the IDXGI* macros go to gx_sdl.c, so the methods are
+ * called through the vtables. *dedicated gets its video memory in bytes. */
+static IDXGIAdapter3 *gpu_dxgi_adapter3(UINT64 *dedicated)
+{
+    static int tried;
+    static IDXGIAdapter3 *a3;
+    static UINT64 ded;
+    if (!tried) {
+        IDXGIFactory1 *f = NULL;
+        tried = 1;
+        if (SUCCEEDED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f))) {
+            IDXGIAdapter1 *a = NULL;
+            UINT i;
+            for (i = 0; f->lpVtbl->EnumAdapters1(f, i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
+                DXGI_ADAPTER_DESC1 d;
+                if (SUCCEEDED(a->lpVtbl->GetDesc1(a, &d)) && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+                        d.DedicatedVideoMemory > ded) {
+                    IDXGIAdapter3 *n = NULL;
+                    if (SUCCEEDED(a->lpVtbl->QueryInterface(a, &IID_IDXGIAdapter3, (void **)&n))) {
+                        if (a3) a3->lpVtbl->Release(a3);
+                        a3 = n;
+                        ded = d.DedicatedVideoMemory;
+                    }
+                }
+                a->lpVtbl->Release(a);
+            }
+            f->lpVtbl->Release(f);
+        }
+    }
+    if (dedicated) *dedicated = ded;
+    return a3;
+}
+
 static uint32_t gpu_fit_scale(uint32_t full_w, uint32_t h)
 {
     uint32_t sc = g_render_scale;
+    UINT64 ded = 0;
     while (sc > 1 && (full_w * sc > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION || h * sc > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION))
         sc--;
+    /* Video memory: three screen-sized targets (colour 4 + depth 8 + centre
+     * copy 4 bytes a pixel, + 9 with FSR 3's targets) within 55% of it. At
+     * 16x in 21:9 one target is ~2 GB; past an 8 GB card's memory Windows
+     * pages them to system RAM and the game ran at 2-8 fps with the GPU
+     * idle (2026-10-29). RECOMP_NO_VRAM_CAP=1 lifts the cap. */
+    gpu_dxgi_adapter3(&ded);
+    if (ded >= (512ull << 20) && !env_cached("RECOMP_NO_VRAM_CAP")) {
+        UINT64 budget = ded / 100 * 55 / 3, bpp = 16 + (GPU_SURF_WANTS_MV(640, 480) ? 9 : 0);
+        static uint32_t told;
+        uint32_t want = sc;
+        while (sc > 1 && (UINT64)full_w * sc * h * sc * bpp > budget)
+            sc--;
+        if (sc != want && told != sc) {
+            told = sc;
+            fprintf(stderr, "  [GPU11] %ux%u: internal resolution %ux -> %ux to fit %llu MB of video memory\n",
+                    full_w, h, want, sc, (unsigned long long)(ded >> 20));
+        }
+    }
     return sc;
 }
 

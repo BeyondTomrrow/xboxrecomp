@@ -73,7 +73,7 @@ typedef struct {
 /* NFL 2K5 draws several full-screen backdrops only inside the 640-pixel
  * title-safe area of its 720-pixel scanout.  A CRT hid the remaining edge;
  * showing the full scanout exposes hard black strips beside the sky. */
-static VideoSettings s_vs = { VM_BORDERLESS, 1920, 1080, AR_ORIGINAL, 3, SF_ENHANCED, 1, 100, 100, 0, 0, 8, 0, 1 };
+static VideoSettings s_vs = { VM_BORDERLESS, 1920, 1080, AR_ORIGINAL, 3, SF_ENHANCED, 1, 100, 100, 0, 0, 8, 0, 1, 0, 0, 0, 0, 1 };
 static volatile LONG s_vs_dirty = 1;
 static uint32_t pr_dynres_scale(void);
 void xbox_VideoSettingsLoad(void);           /* window/swap chain need (re)applying */
@@ -153,8 +153,8 @@ static void vs_save(void)
                "upscaler = %d\n"
                "; framegen (Direct3D 12): 1 FSR 3 frame generation, a generated frame between each two\n"
                "framegen = %d\n"
-               "; dynres: 1 lowers the internal resolution (down to 1x) while the GPU cannot keep up, and\n"
-               "; raises it again (up to scale) when it can\n"
+               "; dynres: 1 auto: the highest internal resolution (up to 16x) that holds the frame-rate cap;\n"
+               "; scale is only where it starts. 0 a fixed scale\n"
                "dynres = %d\n",
             s_vs.mode, s_vs.res_w, s_vs.res_h, s_vs.aspect, s_vs.scale, s_vs.filter, s_vs.vsync,
             s_vs.brightness, s_vs.gamma, s_vs.crop, s_vs.show_fps, s_vs.aniso, s_vs.fps_limit, s_vs.widescreen, s_vs.lighting, s_vs.renderer, s_vs.upscaler, s_vs.framegen,
@@ -765,7 +765,7 @@ static void menu_label(int item, char *name, char *val, size_t n)
     case MI_SCALE:  strcpy(name, "Internal resolution");
                     snprintf(val, n, "%dx  (%d x %d)", s_vs.scale, 720 * s_vs.scale, 480 * s_vs.scale); break;
     case MI_DYNRES: strcpy(name, "Dynamic resolution");
-                    if (s_vs.dynres) snprintf(val, n, "On  (now %ux)", g_render_scale);
+                    if (s_vs.dynres) snprintf(val, n, "Auto, max for the cap  (now %ux)", g_render_scale);
                     else snprintf(val, n, "Off"); break;
     case MI_LIGHTING: strcpy(name, "Lighting and materials"); snprintf(val, n, "%s", lighting[s_vs.lighting % 3]); break;
     case MI_FILTER: strcpy(name, "Upscaling filter"); snprintf(val, n, "%s", filters[s_vs.filter % 4]); break;
@@ -838,7 +838,7 @@ static void menu_change(int item, int dir)
 static void menu_activate(int item)
 {
     if (item == MI_RESET) {
-        VideoSettings d = { VM_BORDERLESS, 1920, 1080, AR_ORIGINAL, 3, SF_ENHANCED, 1, 100, 100, 0, 0, 8, 0, 1 };
+        VideoSettings d = { VM_BORDERLESS, 1920, 1080, AR_ORIGINAL, 3, SF_ENHANCED, 1, 100, 100, 0, 0, 8, 0, 1, 0, 0, 0, 0, 1 };
         d.renderer = s_vs.renderer;          /* the API is not a picture setting */
         d.upscaler = s_vs.upscaler;
         d.framegen = s_vs.framegen;
@@ -1022,7 +1022,7 @@ void xbox_VideoSettingValueName(int i, int idx, char *buf, size_t n)
                              strcmp(k_api_names[v.renderer % 3], gx_backend_name()) ? " (restart)" : ""); break;
     case MI_UPSCALE: snprintf(buf, n, "%s", k_upscaler_names[v.upscaler % 6]); break;
     case MI_FRAMEGEN: snprintf(buf, n, "%s", v.framegen ? "FSR 3 (2x)" : "Off"); break;
-    case MI_DYNRES: snprintf(buf, n, "%s", v.dynres ? "On" : "Off"); break;
+    case MI_DYNRES: snprintf(buf, n, "%s", v.dynres ? "Auto (max for the cap)" : "Off"); break;
     }
 }
 
@@ -1762,8 +1762,8 @@ static int pr_present(uint32_t guest)
 
 /* Dynamic resolution (2026-10-29): on each new reading of the GPU's busy
  * share (perf_gpu_counter, once a second), step the internal resolution down
- * while the GPU is nearly always busy, and back up -- never above the chosen
- * scale -- when the next step's cost (pixels grow with the square of the
+ * while the GPU is nearly always busy, and back up -- as far as 16x, so the
+ * highest scale that holds the frame-rate cap -- when the next step's cost (pixels grow with the square of the
  * scale) still leaves headroom. The load swings with the camera from one
  * second to the next, and every step rebuilds the render targets, so going
  * up waits for four quiet readings in a row and for 10 s after a step down,
@@ -1773,16 +1773,27 @@ static uint32_t pr_dynres_scale(void)
     static uint32_t cur;
     static LONGLONG last_step, last_down, last_up, seen;
     static float hold = 10.0f;                      /* seconds after a step down before going up */
-    static int quiet;
-    uint32_t top = (uint32_t)s_vs.scale;
+    static int quiet, slow;
+    uint32_t top = 16;                              /* auto: as high as holds the cap */
     LARGE_INTEGER now;
     float util = s_gpuctr.util, f = s_perf.freq.QuadPart ? (float)s_perf.freq.QuadPart : 1.0f;
-    if (!cur || cur > top) cur = top;
+    if (!cur) cur = (uint32_t)s_vs.scale;           /* start from the chosen scale */
     if (s_gpuctr.state != 1 || !s_perf.freq.QuadPart || s_perf.pub_t0.QuadPart == seen) return cur;
     seen = s_perf.pub_t0.QuadPart;                  /* a new reading */
     QueryPerformanceCounter(&now);
     if ((float)(now.QuadPart - last_step) < 2.0f * f) return cur;   /* still settling */
-    if (util > 92.0f && cur > 1) {
+    slow = s_perf.ft_avg > 1000.0f / (s_vs.fps_limit == 30 ? 30.0f : 60.0f) * 1.5f && util < 85.0f ? slow + 1 : 0;
+    if (cur > (uint32_t)s_vs.scale && slow >= 3) {   /* 3 s in a row: not a loading screen */
+        /* far too slow without the GPU being busy above the chosen scale (one 16x
+         * run fell to 2-8 fps with the GPU idle): back to the chosen scale */
+        cur = (uint32_t)s_vs.scale;
+        last_step = last_down = now.QuadPart;
+        quiet = 0;
+        hold = 30.0f;
+        slow = 0;
+        fprintf(stderr, "  [DYNRES] %.0f ms frames, GPU %.0f%% busy: back to %ux\n", s_perf.ft_avg, util, cur);
+    } else if (cur > 1 && (util > 92.0f ||       /* GPU-bound, or nearly so while frames run late */
+                    (util > 85.0f && s_perf.ft_avg > 1000.0f / (s_vs.fps_limit == 30 ? 30.0f : 60.0f) * 1.05f))) {
         /* well over the frame budget: one step to the size that fits (cost
          * goes with the pixel count), not one scale a time */
         float budget = 1000.0f / (s_vs.fps_limit == 30 ? 30.0f : 60.0f);
@@ -1799,7 +1810,10 @@ static uint32_t pr_dynres_scale(void)
         float r = (float)(cur + 1) / (float)cur;
         quiet = util * r * r < 75.0f ? quiet + 1 : 0;
         if (quiet >= 4 && (float)(now.QuadPart - last_down) >= hold * f) {
-            cur++;
+            /* lots of headroom: toward the size the load says fits, up to 4 steps */
+            uint32_t fit = (uint32_t)((float)cur * sqrtf(70.0f / (util > 1.0f ? util : 1.0f)));
+            cur = fit > cur + 4 ? cur + 4 : fit > cur ? fit : cur + 1;
+            if (cur > top) cur = top;
             last_step = last_up = now.QuadPart;
             quiet = 0;
             fprintf(stderr, "  [DYNRES] GPU %.0f%% busy: internal resolution %ux\n", util, cur);

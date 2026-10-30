@@ -144,6 +144,12 @@ static void perf_memory(void)
         DXGI_QUERY_VIDEO_MEMORY_INFO vi;
         if (SUCCEEDED(IDXGIAdapter3_QueryVideoMemoryInfo(s_perf.adapter3, 0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vi)))
             s_perf.vram_mb = (unsigned)(vi.CurrentUsage >> 20);
+    } else {
+        /* Direct3D 12/Vulkan: no D3D11 device to ask; DXGI directly */
+        IDXGIAdapter3 *a3 = gpu_dxgi_adapter3(NULL);
+        DXGI_QUERY_VIDEO_MEMORY_INFO vi;
+        if (a3 && SUCCEEDED(a3->lpVtbl->QueryVideoMemoryInfo(a3, 0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vi)))
+            s_perf.vram_mb = (unsigned)(vi.CurrentUsage >> 20);
     }
 #else
     FILE *f = fopen("/proc/self/statm", "r");
