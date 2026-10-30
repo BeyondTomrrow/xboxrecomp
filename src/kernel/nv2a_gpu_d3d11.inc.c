@@ -79,6 +79,7 @@ static uint32_t g_render_scale = 1;
  * FSR 3) are only made while upscaling or frame generation is on: at a
  * high scale they were most of the bandwidth of every draw (2026-10-29). */
 static int g_want_mv = 1;
+static int g_want_motion = 1;   /* last frame's constants for motion vectors (FSR 3 only) */
 #define GPU_SURF_WANTS_MV(w, h) (g_gx_sg && g_want_mv && (w) >= 640 && (h) >= 448)
 static uint32_t g_aniso = 1;
 /* 0 preserves the original Xbox combiner output. Optional profiles are

@@ -70,12 +70,13 @@ typedef struct {
     int dynres;             /* dynamic resolution: the internal resolution drops below `scale` while the GPU is the limit */
     int post;               /* post-processing preset (nv2a_gpu_post.inc.c): 0 off, 1 Broadcast, 2 Cinematic, 3 Vivid, 4 Night Game */
     int sharpen;            /* 0 off, 1 low, 2 medium, 3 high */
+    int ao;                 /* ambient occlusion (Direct3D 12 / Vulkan): 0 off, 1 on, 2 strong */
 } VideoSettings;
 
 /* NFL 2K5 draws several full-screen backdrops only inside the 640-pixel
  * title-safe area of its 720-pixel scanout.  A CRT hid the remaining edge;
  * showing the full scanout exposes hard black strips beside the sky. */
-static VideoSettings s_vs = { VM_BORDERLESS, 1920, 1080, AR_ORIGINAL, 3, SF_ENHANCED, 1, 100, 100, 0, 0, 8, 0, 1, 0, 0, 0, 0, 1, 1, 1 };
+static VideoSettings s_vs = { VM_BORDERLESS, 1920, 1080, AR_ORIGINAL, 3, SF_ENHANCED, 1, 100, 100, 0, 0, 8, 0, 1, 0, 0, 0, 0, 1, 1, 1, 0 };
 static volatile LONG s_vs_dirty = 1;
 static uint32_t pr_dynres_scale(void);
 void xbox_VideoSettingsLoad(void);           /* window/swap chain need (re)applying */
@@ -115,6 +116,7 @@ static void vs_load(void)
         else if (!strcmp(key, "dynres")) s_vs.dynres = v != 0;
         else if (!strcmp(key, "post")) s_vs.post = v;
         else if (!strcmp(key, "sharpen")) s_vs.sharpen = v;
+        else if (!strcmp(key, "ao")) s_vs.ao = v;
     }
     fclose(f);
     if (s_vs.scale < 1) s_vs.scale = 1;
@@ -124,6 +126,7 @@ static void vs_load(void)
     if (s_vs.upscaler < 0 || s_vs.upscaler > 5) s_vs.upscaler = 0;
     if (s_vs.post < 0 || s_vs.post > 4) s_vs.post = 0;
     if (s_vs.sharpen < 0 || s_vs.sharpen > 3) s_vs.sharpen = 0;
+    if (s_vs.ao < 0 || s_vs.ao > 2) s_vs.ao = 0;
     if (s_vs.filter < SF_BILINEAR || s_vs.filter > SF_ENHANCED) s_vs.filter = SF_ENHANCED;
     if (s_vs.crop < 0) s_vs.crop = 0;
     if (s_vs.crop > 40) s_vs.crop = 40;
@@ -165,10 +168,12 @@ static void vs_save(void)
                "; post: 0 off, 1 Broadcast, 2 Cinematic, 3 Vivid, 4 Night Game (bloom, highlight roll-off, grading)\n"
                "post = %d\n"
                "; sharpen: 0 off, 1 low, 2 medium, 3 high (contrast-adaptive)\n"
-               "sharpen = %d\n",
+               "sharpen = %d\n"
+               "; ao: ambient occlusion, Direct3D 12 / Vulkan: 0 off, 1 on, 2 strong\n"
+               "ao = %d\n",
             s_vs.mode, s_vs.res_w, s_vs.res_h, s_vs.aspect, s_vs.scale, s_vs.filter, s_vs.vsync,
             s_vs.brightness, s_vs.gamma, s_vs.crop, s_vs.show_fps, s_vs.aniso, s_vs.fps_limit, s_vs.widescreen, s_vs.lighting, s_vs.renderer, s_vs.upscaler, s_vs.framegen,
-            s_vs.dynres, s_vs.post, s_vs.sharpen);
+            s_vs.dynres, s_vs.post, s_vs.sharpen, s_vs.ao);
     fclose(f);
 }
 
@@ -365,6 +370,12 @@ static int pr_init(void)
         if (e) s_vs.framegen = atoi(e) != 0;
         e = getenv("NFL2K5_DYNRES");         /* and dynamic resolution (0/1) */
         if (e) s_vs.dynres = atoi(e) != 0;
+        e = getenv("NFL2K5_POST");           /* post-processing preset, sharpening, ambient occlusion */
+        if (e && atoi(e) >= 0 && atoi(e) <= 4) s_vs.post = atoi(e);
+        e = getenv("NFL2K5_SHARPEN");
+        if (e && atoi(e) >= 0 && atoi(e) <= 3) s_vs.sharpen = atoi(e);
+        e = getenv("NFL2K5_AO");
+        if (e && atoi(e) >= 0 && atoi(e) <= 2) s_vs.ao = atoi(e);
     }
     g_render_scale = (uint32_t)s_vs.scale;
     g_aniso = (uint32_t)s_vs.aniso;
@@ -374,6 +385,7 @@ static int pr_init(void)
 
 #include "nv2a_gpu_post.inc.c"
 static const char *const k_sharpen_names[] = { "Off", "Low", "Medium", "High" };
+static const char *const k_ao_names[] = { "Off", "On", "Strong" };
 
 /* Common state for the helper draws below. */
 static void pr_helper_state(ID3D11RenderTargetView *dst, UINT x, UINT y, UINT w, UINT h, const PresentConsts *pc)
@@ -746,7 +758,7 @@ static void pr_draw_hud(float gx, float gy, float gw, float gh)
 
 /* ---- the settings page -------------------------------------------------- */
 
-enum { MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_FILTER, MI_VSYNC, MI_BRIGHT, MI_GAMMA, MI_CROP,
+enum { MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_AO, MI_FILTER, MI_VSYNC, MI_BRIGHT, MI_GAMMA, MI_CROP,
        MI_ANISO, MI_FPS, MI_LIMIT, MI_API, MI_UPSCALE, MI_FRAMEGEN, MI_RESET, MI_CLOSE, MI_COUNT };
 static const char *const k_upscaler_names[] = { "Off", "FSR 3 Native AA", "FSR 3 Quality", "FSR 3 Balanced",
                                                  "FSR 3 Performance", "FSR 3 Ultra Performance" };
@@ -783,6 +795,8 @@ static void menu_label(int item, char *name, char *val, size_t n)
     case MI_LIGHTING: strcpy(name, "Lighting and materials"); snprintf(val, n, "%s", lighting[s_vs.lighting % 3]); break;
     case MI_POST:   strcpy(name, "Post-processing"); snprintf(val, n, "%s", k_post_presets[s_vs.post % POST_PRESETS].name); break;
     case MI_SHARPEN: strcpy(name, "Sharpening"); snprintf(val, n, "%s", k_sharpen_names[s_vs.sharpen & 3]); break;
+    case MI_AO:     strcpy(name, "Ambient occlusion");
+                    snprintf(val, n, "%s%s", k_ao_names[s_vs.ao % 3], s_vs.ao && !g_gx_sg ? "  (Direct3D 12 only)" : ""); break;
     case MI_FILTER: strcpy(name, "Upscaling filter"); snprintf(val, n, "%s", filters[s_vs.filter % 4]); break;
     case MI_VSYNC:  strcpy(name, "VSync"); snprintf(val, n, "%s", s_vs.vsync ? "On" : "Off"); break;
     case MI_BRIGHT: strcpy(name, "Brightness"); snprintf(val, n, "%d%%", s_vs.brightness); break;
@@ -827,6 +841,7 @@ static void menu_change(int item, int dir)
     case MI_LIGHTING: s_vs.lighting = (s_vs.lighting + 3 + dir) % 3; break;
     case MI_POST:   s_vs.post = (s_vs.post + POST_PRESETS + dir) % POST_PRESETS; break;
     case MI_SHARPEN: s_vs.sharpen = (s_vs.sharpen + 4 + dir) % 4; break;
+    case MI_AO:     s_vs.ao = (s_vs.ao + 3 + dir) % 3; break;
     case MI_FILTER: s_vs.filter = (s_vs.filter + 4 + dir) % 4; break;
     case MI_VSYNC:  s_vs.vsync = !s_vs.vsync; break;
     case MI_BRIGHT: s_vs.brightness += 5 * dir; if (s_vs.brightness < 50) s_vs.brightness = 50;
@@ -855,7 +870,7 @@ static void menu_change(int item, int dir)
 static void menu_activate(int item)
 {
     if (item == MI_RESET) {
-        VideoSettings d = { VM_BORDERLESS, 1920, 1080, AR_ORIGINAL, 3, SF_ENHANCED, 1, 100, 100, 0, 0, 8, 0, 1, 0, 0, 0, 0, 1, 1, 1 };
+        VideoSettings d = { VM_BORDERLESS, 1920, 1080, AR_ORIGINAL, 3, SF_ENHANCED, 1, 100, 100, 0, 0, 8, 0, 1, 0, 0, 0, 0, 1, 1, 1, 0 };
         d.renderer = s_vs.renderer;          /* the API is not a picture setting */
         d.upscaler = s_vs.upscaler;
         d.framegen = s_vs.framegen;
@@ -902,7 +917,7 @@ static int menu_rows(void) { int n = menu_page()->count(); return n > 0 ? n : 1;
  * menu; its rows are these settings as indexed value lists. Called from the
  * game thread: changes mark the swap chain for re-applying on the next flip
  * and are saved at once. */
-static const int k_vm_items[] = { MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_FILTER, MI_VSYNC,
+static const int k_vm_items[] = { MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_AO, MI_FILTER, MI_VSYNC,
                                   MI_BRIGHT, MI_GAMMA, MI_CROP, MI_ANISO, MI_FPS, MI_LIMIT, MI_API, MI_UPSCALE, MI_FRAMEGEN };
 #define VM_COUNT ((int)(sizeof k_vm_items / sizeof k_vm_items[0]))
 static const int k_vm_aniso[] = { 1, 2, 4, 8, 16 };
@@ -912,7 +927,7 @@ int xbox_VideoSettingCount(void) { return VM_COUNT; }
 const char *xbox_VideoSettingName(int i)
 {
     static const char *names[] = { "Display Mode", "Resolution", "Widescreen", "Aspect Ratio", "Render Scale", "Dynamic Resolution",
-                                   "Lighting & Materials", "Post-Processing", "Sharpening",
+                                   "Lighting & Materials", "Post-Processing", "Sharpening", "Ambient Occlusion",
                                    "Upscaling Filter", "VSync", "Brightness", "Gamma",
                                    "Overscan Crop", "Texture Filtering", "Show FPS", "Frame Rate Cap", "Graphics API", "Upscaling", "Frame Generation" };
     return (i >= 0 && i < VM_COUNT) ? names[i] : "";
@@ -936,6 +951,7 @@ int xbox_VideoSettingValues(int i)
     case MI_LIGHTING: return 3;
     case MI_POST:   return POST_PRESETS;
     case MI_SHARPEN: return 4;
+    case MI_AO:     return 3;
     case MI_VSYNC: case MI_FPS: case MI_WIDE: return 2;
     case MI_BRIGHT: case MI_GAMMA: return 21;
     case MI_CROP: case MI_ANISO: return 5;
@@ -963,6 +979,7 @@ static int vm_get(const VideoSettings *vs, int item)
     case MI_LIGHTING: return vs->lighting;
     case MI_POST:   return vs->post;
     case MI_SHARPEN: return vs->sharpen;
+    case MI_AO:     return vs->ao;
     case MI_FILTER: return vs->filter;
     case MI_VSYNC:  return vs->vsync ? 1 : 0;
     case MI_BRIGHT: return (vs->brightness - 50) / 5;
@@ -996,6 +1013,7 @@ static void vm_set(VideoSettings *vs, int item, int idx)
     case MI_LIGHTING: vs->lighting = idx; break;
     case MI_POST:   vs->post = idx % POST_PRESETS; break;
     case MI_SHARPEN: vs->sharpen = idx & 3; break;
+    case MI_AO:     vs->ao = idx % 3; break;
     case MI_FILTER: vs->filter = idx; break;
     case MI_VSYNC:  vs->vsync = idx; break;
     case MI_BRIGHT: vs->brightness = 50 + 5 * idx; break;
@@ -1033,6 +1051,7 @@ void xbox_VideoSettingValueName(int i, int idx, char *buf, size_t n)
     case MI_LIGHTING: snprintf(buf, n, "%s", lighting[v.lighting % 3]); break;
     case MI_POST:   snprintf(buf, n, "%s", k_post_presets[v.post % POST_PRESETS].name); break;
     case MI_SHARPEN: snprintf(buf, n, "%s", k_sharpen_names[v.sharpen & 3]); break;
+    case MI_AO:     snprintf(buf, n, "%s", k_ao_names[v.ao % 3]); break;
     case MI_FILTER: snprintf(buf, n, "%s", filters[v.filter % 4]); break;
     case MI_VSYNC:  snprintf(buf, n, "%s", v.vsync ? "On" : "Off"); break;
     case MI_BRIGHT: snprintf(buf, n, "%d%%", v.brightness); break;
@@ -1549,7 +1568,8 @@ static int pr_present(uint32_t guest)
     if (InterlockedExchange(&s_vs_dirty, 0))
         pr_apply_mode();
     g_render_scale = (uint32_t)s_vs.scale;     /* surfaces follow on their next use */
-    g_want_mv = ((s_vs.upscaler || s_vs.framegen) && gxs_fsr_available()) || env_cached("RECOMP_FORCE_MV");
+    g_want_motion = ((s_vs.upscaler || s_vs.framegen) && gxs_fsr_available()) || env_cached("RECOMP_FORCE_MV");
+    g_want_mv = g_want_motion || s_vs.ao > 0;   /* the depth copy also feeds ambient occlusion */
     if (s_vs.dynres)
         g_render_scale = pr_dynres_scale();
     if ((s_vs.upscaler || s_vs.framegen) && gxs_fsr_available() && s_fsr_out_h) {
@@ -1649,6 +1669,44 @@ static int pr_present(uint32_t guest)
             }
             last = t;
         }
+        if (s->dz && env_cached("RECOMP_DZ_STATS")) {
+            /* test only: what the depth copy holds mid-screen, every 300 frames */
+            static ID3D11Texture2D *st;
+            static unsigned n;
+            if (n++ % 300 == 150) {
+                D3D11_TEXTURE2D_DESC td;
+                D3D11_MAPPED_SUBRESOURCE mm;
+                ID3D11Texture2D_GetDesc(s->dz, &td);
+                if (!st) {
+                    D3D11_TEXTURE2D_DESC sd2;
+                    memset(&sd2, 0, sizeof sd2);
+                    sd2.Width = 64; sd2.Height = 64; sd2.MipLevels = sd2.ArraySize = 1;
+                    sd2.Format = DXGI_FORMAT_R32_FLOAT; sd2.SampleDesc.Count = 1;
+                    sd2.Usage = D3D11_USAGE_STAGING; sd2.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                    ID3D11Device_CreateTexture2D(s_gpu11.dev, &sd2, NULL, &st);
+                }
+                if (st) {
+                    D3D11_BOX box = { td.Width / 2 - 32, td.Height * 2 / 3 - 32, 0, td.Width / 2 + 32, td.Height * 2 / 3 + 32, 1 };
+                    ID3D11DeviceContext_CopySubresourceRegion(s_gpu11.ctx, (ID3D11Resource *)st, 0, 0, 0, 0,
+                                                              (ID3D11Resource *)s->dz, 0, &box);
+                    if (SUCCEEDED(ID3D11DeviceContext_Map(s_gpu11.ctx, (ID3D11Resource *)st, 0, D3D11_MAP_READ, 0, &mm))) {
+                        float mn = 1e30f, mx = -1e30f, sum = 0.0f;
+                        int y, x;
+                        for (y = 0; y < 64; y++)
+                            for (x = 0; x < 64; x++) {
+                                float v = ((const float *)((const uint8_t *)mm.pData + y * mm.RowPitch))[x];
+                                if (v < mn) mn = v;
+                                if (v > mx) mx = v;
+                                sum += v;
+                            }
+                        fprintf(stderr, "  [DZ] %ux%u centre-low 64x64: min %.6f max %.6f mean %.6f  (row0: %.6f %.6f %.6f)\n",
+                                td.Width, td.Height, mn, mx, sum / 4096.0f,
+                                ((const float *)mm.pData)[0], ((const float *)mm.pData)[32], ((const float *)mm.pData)[63]);
+                        ID3D11DeviceContext_Unmap(s_gpu11.ctx, (ID3D11Resource *)st, 0);
+                    }
+                }
+            }
+        }
         /* The surface texture is scale x its guest size once the internal
          * resolution is raised; the shader's texel maths wants its real size. */
         {
@@ -1719,7 +1777,7 @@ static int pr_present(uint32_t guest)
     if (post_rtv) {
         ID3D11ShaderResourceView *none = NULL;
         ID3D11DeviceContext_PSSetShaderResources(s_gpu11.ctx, 0, 1, &none);
-        post_finish(target, dx, dy);
+        post_finish(target, dx, dy, s->dz, pc.src);
     }
     {
         /* The HUD lays out against the whole surface; a side crop pushes part

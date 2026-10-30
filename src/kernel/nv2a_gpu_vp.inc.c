@@ -1096,7 +1096,7 @@ static int gpu_vp_bind(uint32_t nverts, uint32_t nidx, uint32_t rw, uint32_t rh,
             s_bound.vs_cb1 = s_vp_cb;
         }
         if (g_gx_sg) {
-            int have = g_want_mv ? gpu_vp_prev_consts() : 0;   /* motion only for FSR 3 */
+            int have = g_want_motion ? gpu_vp_prev_consts() : 0;   /* motion only for FSR 3 */
             if (have)
                 ID3D11DeviceContext_VSSetConstantBuffers(s_gpu11.ctx, 3, 1, &s_vp_cbprev);
             gxs_set_pull_mv(have);
