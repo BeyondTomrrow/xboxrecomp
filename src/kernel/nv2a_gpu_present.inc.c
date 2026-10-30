@@ -1773,6 +1773,7 @@ static uint32_t pr_dynres_scale(void)
         float budget = 1000.0f / (s_vs.fps_limit == 30 ? 30.0f : 60.0f);
         uint32_t fit = s_perf.ft_avg > budget * 1.2f
             ? (uint32_t)((float)cur * sqrtf(budget / s_perf.ft_avg * 0.9f)) : cur - 1;
+        if (fit < cur * 3 / 5) fit = cur * 3 / 5;   /* a rebuild hitch inflates ft_avg: at most 0.6x a step */
         cur = fit < 1 ? 1 : fit >= cur ? cur - 1 : fit;
         if (last_up && (float)(now.QuadPart - last_up) < 30.0f * f)
             hold = hold * 2.0f > 120.0f ? 120.0f : hold * 2.0f;   /* it went up too far: wait longer next time */
