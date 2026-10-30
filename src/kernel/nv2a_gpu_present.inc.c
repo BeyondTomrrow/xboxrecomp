@@ -67,6 +67,7 @@ typedef struct {
     int renderer;           /* graphics API from the next start: 0 Direct3D 11, 1 Vulkan, 2 Direct3D 12 (gx/gx_sdl.c) */
     int upscaler;           /* 0 off, 1 FSR 3 native AA, 2 quality, 3 balanced, 4 performance, 5 ultra performance */
     int framegen;           /* FSR 3 frame generation: a generated frame between each two (Direct3D 12) */
+    int dynres;             /* dynamic resolution: the internal resolution drops below `scale` while the GPU is the limit */
 } VideoSettings;
 
 /* NFL 2K5 draws several full-screen backdrops only inside the 640-pixel
@@ -74,6 +75,7 @@ typedef struct {
  * showing the full scanout exposes hard black strips beside the sky. */
 static VideoSettings s_vs = { VM_BORDERLESS, 1920, 1080, AR_ORIGINAL, 3, SF_ENHANCED, 1, 100, 100, 0, 0, 8, 0, 1 };
 static volatile LONG s_vs_dirty = 1;
+static uint32_t pr_dynres_scale(void);
 void xbox_VideoSettingsLoad(void);           /* window/swap chain need (re)applying */
 
 static const char *k_vs_file = "nfl2k5_video.ini";
@@ -108,6 +110,7 @@ static void vs_load(void)
         else if (!strcmp(key, "renderer")) s_vs.renderer = v;
         else if (!strcmp(key, "upscaler")) s_vs.upscaler = v;
         else if (!strcmp(key, "framegen")) s_vs.framegen = v != 0;
+        else if (!strcmp(key, "dynres")) s_vs.dynres = v != 0;
     }
     fclose(f);
     if (s_vs.scale < 1) s_vs.scale = 1;
@@ -149,9 +152,13 @@ static void vs_save(void)
                "; upscaler (Direct3D 12): 0 off, 1 FSR 3 native AA, 2 quality, 3 balanced, 4 performance, 5 ultra performance\n"
                "upscaler = %d\n"
                "; framegen (Direct3D 12): 1 FSR 3 frame generation, a generated frame between each two\n"
-               "framegen = %d\n",
+               "framegen = %d\n"
+               "; dynres: 1 lowers the internal resolution (down to 1x) while the GPU cannot keep up, and\n"
+               "; raises it again (up to scale) when it can\n"
+               "dynres = %d\n",
             s_vs.mode, s_vs.res_w, s_vs.res_h, s_vs.aspect, s_vs.scale, s_vs.filter, s_vs.vsync,
-            s_vs.brightness, s_vs.gamma, s_vs.crop, s_vs.show_fps, s_vs.aniso, s_vs.fps_limit, s_vs.widescreen, s_vs.lighting, s_vs.renderer, s_vs.upscaler, s_vs.framegen);
+            s_vs.brightness, s_vs.gamma, s_vs.crop, s_vs.show_fps, s_vs.aniso, s_vs.fps_limit, s_vs.widescreen, s_vs.lighting, s_vs.renderer, s_vs.upscaler, s_vs.framegen,
+            s_vs.dynres);
     fclose(f);
 }
 
@@ -335,6 +342,8 @@ static int pr_init(void)
         if (e && atoi(e) >= 0 && atoi(e) <= 5) s_vs.upscaler = atoi(e);
         e = getenv("NFL2K5_FRAMEGEN");       /* and frame generation (0/1) */
         if (e) s_vs.framegen = atoi(e) != 0;
+        e = getenv("NFL2K5_DYNRES");         /* and dynamic resolution (0/1) */
+        if (e) s_vs.dynres = atoi(e) != 0;
     }
     g_render_scale = (uint32_t)s_vs.scale;
     g_aniso = (uint32_t)s_vs.aniso;
@@ -713,7 +722,7 @@ static void pr_draw_hud(float gx, float gy, float gw, float gh)
 
 /* ---- the settings page -------------------------------------------------- */
 
-enum { MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_LIGHTING, MI_FILTER, MI_VSYNC, MI_BRIGHT, MI_GAMMA, MI_CROP,
+enum { MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_FILTER, MI_VSYNC, MI_BRIGHT, MI_GAMMA, MI_CROP,
        MI_ANISO, MI_FPS, MI_LIMIT, MI_API, MI_UPSCALE, MI_FRAMEGEN, MI_RESET, MI_CLOSE, MI_COUNT };
 static const char *const k_upscaler_names[] = { "Off", "FSR 3 Native AA", "FSR 3 Quality", "FSR 3 Balanced",
                                                  "FSR 3 Performance", "FSR 3 Ultra Performance" };
@@ -744,6 +753,9 @@ static void menu_label(int item, char *name, char *val, size_t n)
     case MI_ASPECT: strcpy(name, "Aspect ratio"); snprintf(val, n, "%s", aspects[s_vs.aspect % 6]); break;
     case MI_SCALE:  strcpy(name, "Internal resolution");
                     snprintf(val, n, "%dx  (%d x %d)", s_vs.scale, 720 * s_vs.scale, 480 * s_vs.scale); break;
+    case MI_DYNRES: strcpy(name, "Dynamic resolution");
+                    if (s_vs.dynres) snprintf(val, n, "On  (now %ux)", g_render_scale);
+                    else snprintf(val, n, "Off"); break;
     case MI_LIGHTING: strcpy(name, "Lighting and materials"); snprintf(val, n, "%s", lighting[s_vs.lighting % 3]); break;
     case MI_FILTER: strcpy(name, "Upscaling filter"); snprintf(val, n, "%s", filters[s_vs.filter % 4]); break;
     case MI_VSYNC:  strcpy(name, "VSync"); snprintf(val, n, "%s", s_vs.vsync ? "On" : "Off"); break;
@@ -805,6 +817,7 @@ static void menu_change(int item, int dir)
     case MI_API:    s_vs.renderer = (s_vs.renderer + 3 + dir) % 3; break;
     case MI_UPSCALE: s_vs.upscaler = (s_vs.upscaler + 6 + dir) % 6; break;
     case MI_FRAMEGEN: s_vs.framegen = !s_vs.framegen; break;
+    case MI_DYNRES: s_vs.dynres = !s_vs.dynres; break;
     default: return;
     }
     s_pr.ovl_valid = 0;
@@ -861,7 +874,7 @@ static int menu_rows(void) { int n = menu_page()->count(); return n > 0 ? n : 1;
  * menu; its rows are these settings as indexed value lists. Called from the
  * game thread: changes mark the swap chain for re-applying on the next flip
  * and are saved at once. */
-static const int k_vm_items[] = { MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_LIGHTING, MI_FILTER, MI_VSYNC,
+static const int k_vm_items[] = { MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_FILTER, MI_VSYNC,
                                   MI_BRIGHT, MI_GAMMA, MI_CROP, MI_ANISO, MI_FPS, MI_LIMIT, MI_API, MI_UPSCALE, MI_FRAMEGEN };
 #define VM_COUNT ((int)(sizeof k_vm_items / sizeof k_vm_items[0]))
 static const int k_vm_aniso[] = { 1, 2, 4, 8, 16 };
@@ -870,7 +883,8 @@ int xbox_VideoSettingCount(void) { return VM_COUNT; }
 
 const char *xbox_VideoSettingName(int i)
 {
-    static const char *names[] = { "Display Mode", "Resolution", "Widescreen", "Aspect Ratio", "Render Scale", "Lighting & Materials",
+    static const char *names[] = { "Display Mode", "Resolution", "Widescreen", "Aspect Ratio", "Render Scale", "Dynamic Resolution",
+                                   "Lighting & Materials",
                                    "Upscaling Filter", "VSync", "Brightness", "Gamma",
                                    "Overscan Crop", "Texture Filtering", "Show FPS", "Frame Rate Cap", "Graphics API", "Upscaling", "Frame Generation" };
     return (i >= 0 && i < VM_COUNT) ? names[i] : "";
@@ -879,7 +893,7 @@ const char *xbox_VideoSettingName(int i)
 int xbox_VideoSettingIsToggle(int i)
 {
     return i >= 0 && i < VM_COUNT && (k_vm_items[i] == MI_VSYNC || k_vm_items[i] == MI_FPS || k_vm_items[i] == MI_WIDE ||
-                                          k_vm_items[i] == MI_FRAMEGEN);
+                                          k_vm_items[i] == MI_FRAMEGEN || k_vm_items[i] == MI_DYNRES);
 }
 
 int xbox_VideoSettingValues(int i)
@@ -899,6 +913,7 @@ int xbox_VideoSettingValues(int i)
     case MI_API:    return 3;
     case MI_UPSCALE: return 6;
     case MI_FRAMEGEN: return 2;
+    case MI_DYNRES: return 2;
     }
     return 1;
 }
@@ -934,6 +949,7 @@ static int vm_get(const VideoSettings *vs, int item)
     case MI_API:    return vs->renderer;
     case MI_UPSCALE: return vs->upscaler;
     case MI_FRAMEGEN: return vs->framegen;
+    case MI_DYNRES: return vs->dynres;
     }
     return 0;
 }
@@ -958,6 +974,7 @@ static void vm_set(VideoSettings *vs, int item, int idx)
     case MI_API:    vs->renderer = idx % 3; break;
     case MI_UPSCALE: vs->upscaler = idx % 6; break;
     case MI_FRAMEGEN: vs->framegen = idx != 0; break;
+    case MI_DYNRES: vs->dynres = idx != 0; break;
     }
 }
 
@@ -994,6 +1011,7 @@ void xbox_VideoSettingValueName(int i, int idx, char *buf, size_t n)
                              strcmp(k_api_names[v.renderer % 3], gx_backend_name()) ? " (restart)" : ""); break;
     case MI_UPSCALE: snprintf(buf, n, "%s", k_upscaler_names[v.upscaler % 6]); break;
     case MI_FRAMEGEN: snprintf(buf, n, "%s", v.framegen ? "FSR 3 (2x)" : "Off"); break;
+    case MI_DYNRES: snprintf(buf, n, "%s", v.dynres ? "On" : "Off"); break;
     }
 }
 
@@ -1495,6 +1513,8 @@ static int pr_present(uint32_t guest)
     if (InterlockedExchange(&s_vs_dirty, 0))
         pr_apply_mode();
     g_render_scale = (uint32_t)s_vs.scale;     /* surfaces follow on their next use */
+    if (s_vs.dynres)
+        g_render_scale = pr_dynres_scale();
     if ((s_vs.upscaler || s_vs.framegen) && gxs_fsr_available() && s_fsr_out_h) {
         /* FSR 3: render at the on-screen size over the quality ratio (the
          * internal-resolution setting does not apply), rounded to a whole
@@ -1716,13 +1736,60 @@ static int pr_present(uint32_t guest)
                                 ((!s_vs.vsync && s_pr.tearing && s_vs.mode != VM_FULLSCREEN) ? DXGI_PRESENT_ALLOW_TEARING : 0) |
                                 (gen_srv ? GX_PRESENT_PAIR : 0));
         QueryPerformanceCounter(&b);
-        perf_on_present(s_vs.scale, (float)((double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)s_perf.freq.QuadPart));
+        perf_on_present((int)g_render_scale, (float)((double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)s_perf.freq.QuadPart));
         QueryPerformanceFrequency(&fq);
         if ((b.QuadPart - a.QuadPart) * 1000 / fq.QuadPart > 200)
             fprintf(stderr, "  [PRESENT] Present took %lld ms (thread %lu)\n",
                     (long long)((b.QuadPart - a.QuadPart) * 1000 / fq.QuadPart), GetCurrentThreadId());
     }
     return 1;
+}
+
+/* Dynamic resolution (2026-10-29): on each new reading of the GPU's busy
+ * share (perf_gpu_counter, once a second), step the internal resolution down
+ * while the GPU is nearly always busy, and back up -- never above the chosen
+ * scale -- when the next step's cost (pixels grow with the square of the
+ * scale) still leaves headroom. The load swings with the camera from one
+ * second to the next, and every step rebuilds the render targets, so going
+ * up waits for four quiet readings in a row and for 10 s after a step down,
+ * doubled (to 2 min) each time a step up had to be taken back. */
+static uint32_t pr_dynres_scale(void)
+{
+    static uint32_t cur;
+    static LONGLONG last_step, last_down, last_up, seen;
+    static float hold = 10.0f;                      /* seconds after a step down before going up */
+    static int quiet;
+    uint32_t top = (uint32_t)s_vs.scale;
+    LARGE_INTEGER now;
+    float util = s_gpuctr.util, f = s_perf.freq.QuadPart ? (float)s_perf.freq.QuadPart : 1.0f;
+    if (!cur || cur > top) cur = top;
+    if (s_gpuctr.state != 1 || !s_perf.freq.QuadPart || s_perf.pub_t0.QuadPart == seen) return cur;
+    seen = s_perf.pub_t0.QuadPart;                  /* a new reading */
+    QueryPerformanceCounter(&now);
+    if ((float)(now.QuadPart - last_step) < 2.0f * f) return cur;   /* still settling */
+    if (util > 92.0f && cur > 1) {
+        /* well over the frame budget: one step to the size that fits (cost
+         * goes with the pixel count), not one scale a time */
+        float budget = 1000.0f / (s_vs.fps_limit == 30 ? 30.0f : 60.0f);
+        uint32_t fit = s_perf.ft_avg > budget * 1.2f
+            ? (uint32_t)((float)cur * sqrtf(budget / s_perf.ft_avg * 0.9f)) : cur - 1;
+        cur = fit < 1 ? 1 : fit >= cur ? cur - 1 : fit;
+        if (last_up && (float)(now.QuadPart - last_up) < 30.0f * f)
+            hold = hold * 2.0f > 120.0f ? 120.0f : hold * 2.0f;   /* it went up too far: wait longer next time */
+        last_step = last_down = now.QuadPart;
+        quiet = 0;
+        fprintf(stderr, "  [DYNRES] GPU %.0f%% busy: internal resolution %ux\n", util, cur);
+    } else if (cur < top) {
+        float r = (float)(cur + 1) / (float)cur;
+        quiet = util * r * r < 75.0f ? quiet + 1 : 0;
+        if (quiet >= 4 && (float)(now.QuadPart - last_down) >= hold * f) {
+            cur++;
+            last_step = last_up = now.QuadPart;
+            quiet = 0;
+            fprintf(stderr, "  [DYNRES] GPU %.0f%% busy: internal resolution %ux\n", util, cur);
+        }
+    }
+    return cur;
 }
 
 /* Frame-rate cap (video settings): hold each presented frame until its
