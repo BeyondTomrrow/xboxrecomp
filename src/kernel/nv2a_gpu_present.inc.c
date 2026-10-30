@@ -79,6 +79,7 @@ typedef struct {
 static VideoSettings s_vs = { VM_BORDERLESS, 1920, 1080, AR_ORIGINAL, 3, SF_ENHANCED, 1, 100, 100, 0, 0, 8, 0, 1, 0, 0, 0, 0, 1, 1, 1, 0 };
 static volatile LONG s_vs_dirty = 1;
 static uint32_t pr_dynres_scale(void);
+static void preset_apply(VideoSettings *v, int p);
 void xbox_VideoSettingsLoad(void);           /* window/swap chain need (re)applying */
 
 static const char *k_vs_file = "nfl2k5_video.ini";
@@ -89,8 +90,17 @@ static void vs_load(void)
     char vpath[MAX_PATH];
     FILE *f = fopen(xbox_user_path(k_vs_file, vpath, sizeof vpath), "r");
     char line[256];
-    if (!f)
+    if (!f) {
+        /* first start: a preset from the graphics card's video memory */
+        UINT64 ded = 0;
+        int p;
+        gpu_dxgi_adapter3(&ded);
+        p = ded >= (7ull << 30) ? 4 : ded >= (5ull << 30) ? 3 : ded >= (3ull << 30) ? 2 : 1;
+        preset_apply(&s_vs, p);
+        fprintf(stderr, "  [VIDEO] first start: %llu MB of video memory, preset %s\n",
+                (unsigned long long)(ded >> 20), p == 4 ? "Ultra" : p == 3 ? "High" : p == 2 ? "Medium" : "Low");
         return;
+    }
     while (fgets(line, sizeof line, f)) {
         char key[64];
         int v, v2;
@@ -758,7 +768,7 @@ static void pr_draw_hud(float gx, float gy, float gw, float gh)
 
 /* ---- the settings page -------------------------------------------------- */
 
-enum { MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_AO, MI_FILTER, MI_VSYNC, MI_BRIGHT, MI_GAMMA, MI_CROP,
+enum { MI_PRESET, MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_AO, MI_FILTER, MI_VSYNC, MI_BRIGHT, MI_GAMMA, MI_CROP,
        MI_ANISO, MI_FPS, MI_LIMIT, MI_API, MI_UPSCALE, MI_FRAMEGEN, MI_RESET, MI_CLOSE, MI_COUNT };
 static const char *const k_upscaler_names[] = { "Off", "FSR 3 Native AA", "FSR 3 Quality", "FSR 3 Balanced",
                                                  "FSR 3 Performance", "FSR 3 Ultra Performance" };
@@ -774,6 +784,36 @@ void (*g_xbox_fps_limit_changed)(void);
 int xbox_VideoFpsLimit(void) { return s_vs.fps_limit; }
 static void fps_limit_changed(void) { if (g_xbox_fps_limit_changed) g_xbox_fps_limit_changed(); }
 
+/* ---- graphics presets (2026-10-30) ---------------------------------------
+ * One choice that sets the internal resolution, texture filtering, the post
+ * effects and Auto resolution together. The values stay editable after; the
+ * row then reads "Custom". A first start with no settings file picks one from
+ * the graphics card's video memory (vs_load). */
+static const char *const k_preset_names[] = { "Custom", "Low", "Medium", "High", "Ultra" };
+static void preset_apply(VideoSettings *v, int p)
+{
+    static const struct { int scale, aniso, post, sharpen, ao, lighting; } k[] = {
+        { 0, 0, 0, 0, 0, 0 },
+        { 2, 4, 0, 0, 0, 0 },     /* Low: 2x, no effects; Auto lowers it further if needed */
+        { 3, 8, 1, 1, 0, 1 },     /* Medium */
+        { 6, 16, 1, 1, 1, 1 },    /* High */
+        { 9, 16, 1, 1, 2, 2 },    /* Ultra */
+    };
+    if (p < 1 || p > 4) return;
+    v->scale = k[p].scale; v->aniso = k[p].aniso; v->post = k[p].post; v->sharpen = k[p].sharpen;
+    v->ao = k[p].ao; v->lighting = k[p].lighting; v->dynres = 1;
+}
+static int preset_current(const VideoSettings *v)
+{
+    int p;
+    for (p = 1; p <= 4; p++) {
+        VideoSettings c = *v;
+        preset_apply(&c, p);
+        if (!memcmp(&c, v, sizeof c)) return p;
+    }
+    return 0;
+}
+
 static void menu_label(int item, char *name, char *val, size_t n)
 {
     static const char *modes[] = { "Windowed", "Borderless fullscreen", "Exclusive fullscreen" };
@@ -783,6 +823,7 @@ static void menu_label(int item, char *name, char *val, size_t n)
     static const char *lighting[] = { "Classic Xbox", "Enhanced", "Maximum" };
     val[0] = 0;
     switch (item) {
+    case MI_PRESET: strcpy(name, "Graphics preset"); snprintf(val, n, "%s", k_preset_names[preset_current(&s_vs)]); break;
     case MI_MODE:   strcpy(name, "Display mode"); snprintf(val, n, "%s", modes[s_vs.mode % 3]); break;
     case MI_RES:    strcpy(name, s_vs.mode == VM_BORDERLESS ? "Resolution (desktop)" : "Resolution");
                     snprintf(val, n, "%d x %d", s_vs.res_w, s_vs.res_h); break;
@@ -828,6 +869,11 @@ static void menu_change(int item, int dir)
 {
     int i;
     switch (item) {
+    case MI_PRESET: { int p = preset_current(&s_vs);
+                      p = p ? p + dir : (dir > 0 ? 1 : 4);
+                      if (p < 1) p = 4;
+                      if (p > 4) p = 1;
+                      preset_apply(&s_vs, p); } break;
     case MI_MODE:   s_vs.mode = (s_vs.mode + 3 + dir) % 3; InterlockedExchange(&s_vs_dirty, 1); break;
     case MI_RES:
         for (i = 0; i < s_nres; i++)
@@ -917,7 +963,7 @@ static int menu_rows(void) { int n = menu_page()->count(); return n > 0 ? n : 1;
  * menu; its rows are these settings as indexed value lists. Called from the
  * game thread: changes mark the swap chain for re-applying on the next flip
  * and are saved at once. */
-static const int k_vm_items[] = { MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_AO, MI_FILTER, MI_VSYNC,
+static const int k_vm_items[] = { MI_PRESET, MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_AO, MI_FILTER, MI_VSYNC,
                                   MI_BRIGHT, MI_GAMMA, MI_CROP, MI_ANISO, MI_FPS, MI_LIMIT, MI_API, MI_UPSCALE, MI_FRAMEGEN };
 #define VM_COUNT ((int)(sizeof k_vm_items / sizeof k_vm_items[0]))
 static const int k_vm_aniso[] = { 1, 2, 4, 8, 16 };
@@ -926,7 +972,7 @@ int xbox_VideoSettingCount(void) { return VM_COUNT; }
 
 const char *xbox_VideoSettingName(int i)
 {
-    static const char *names[] = { "Display Mode", "Resolution", "Widescreen", "Aspect Ratio", "Render Scale", "Dynamic Resolution",
+    static const char *names[] = { "Graphics Preset", "Display Mode", "Resolution", "Widescreen", "Aspect Ratio", "Render Scale", "Dynamic Resolution",
                                    "Lighting & Materials", "Post-Processing", "Sharpening", "Ambient Occlusion",
                                    "Upscaling Filter", "VSync", "Brightness", "Gamma",
                                    "Overscan Crop", "Texture Filtering", "Show FPS", "Frame Rate Cap", "Graphics API", "Upscaling", "Frame Generation" };
@@ -943,6 +989,7 @@ int xbox_VideoSettingValues(int i)
 {
     if (i < 0 || i >= VM_COUNT) return 1;
     switch (k_vm_items[i]) {
+    case MI_PRESET: return 5;
     case MI_MODE: return 3;
     case MI_FILTER: return 4;
     case MI_RES:    res_build(); return s_nres ? s_nres : 1;
@@ -968,6 +1015,7 @@ static int vm_get(const VideoSettings *vs, int item)
 {
     int k;
     switch (item) {
+    case MI_PRESET: return preset_current(vs);
     case MI_MODE:   return vs->mode;
     case MI_RES:
         res_build();
@@ -1006,6 +1054,7 @@ static int vm_get(const VideoSettings *vs, int item)
 static void vm_set(VideoSettings *vs, int item, int idx)
 {
     switch (item) {
+    case MI_PRESET: preset_apply(vs, idx); break;
     case MI_MODE:   vs->mode = idx; break;
     case MI_RES:    res_build(); if (idx < s_nres) { vs->res_w = s_res[idx][0]; vs->res_h = s_res[idx][1]; } break;
     case MI_ASPECT: vs->aspect = idx; break;
@@ -1044,6 +1093,7 @@ void xbox_VideoSettingValueName(int i, int idx, char *buf, size_t n)
     item = k_vm_items[i];
     vm_set(&v, item, idx);
     switch (item) {
+    case MI_PRESET: snprintf(buf, n, "%s", k_preset_names[idx >= 0 && idx <= 4 ? idx : 0]); break;
     case MI_MODE:   snprintf(buf, n, "%s", modes[v.mode % 3]); break;
     case MI_RES:    snprintf(buf, n, "%d x %d", v.res_w, v.res_h); break;
     case MI_ASPECT: snprintf(buf, n, "%s", aspects[v.aspect % 6]); break;
