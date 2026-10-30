@@ -917,6 +917,16 @@ static void *thread_trampoline(void *arg)
     w32_object *o = (w32_object *)arg;
     t_self_obj = o;
     t_tid      = o->tid;
+#if defined(__ANDROID__)
+    {   /* a stack for signal handlers: a crash reporter must still run when
+         * this thread's own stack is what overflowed */
+        stack_t ss;
+        ss.ss_sp = malloc(64 * 1024);
+        ss.ss_size = 64 * 1024;
+        ss.ss_flags = 0;
+        if (ss.ss_sp) sigaltstack(&ss, NULL);
+    }
+#endif
 
     /* CREATE_SUSPENDED gate */
     pthread_mutex_lock(&o->lock);

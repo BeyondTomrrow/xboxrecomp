@@ -260,6 +260,7 @@ static int SDLCALL fb_thread_sdl(void *data) {
 
     g_fb.ultrawide = getenv("RECOMP_ULTRAWIDE") && *getenv("RECOMP_ULTRAWIDE") != '0';
 
+    fprintf(stderr, "  [FBWIN] window thread: SDL video init\n");
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         fprintf(stderr, "  [FBWIN] SDL_Init failed: %s\n", SDL_GetError());
         SDL_SetAtomicInt(&g_fb.running, 0);
@@ -278,6 +279,7 @@ static int SDLCALL fb_thread_sdl(void *data) {
         g_fb.mode = FB_MODE_BORDERLESS;
     }
 
+    fprintf(stderr, "  [FBWIN] window thread: creating the window\n");
     win = SDL_CreateWindow(FB_TITLE, (int) g_fb.width, (int) g_fb.height, flags);
     if (!win) {
         fprintf(stderr, "  [FBWIN] SDL_CreateWindow failed: %s\n", SDL_GetError());
