@@ -2841,6 +2841,20 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         }
     }
 
+#if defined(__ANDROID__)
+    {   /* the guest's 4 GB as mapped now, from 0xF0000000 up (the apertures) */
+        FILE *mf = fopen("/proc/self/maps", "r");
+        char ml[512];
+        uintptr_t lo0 = (uintptr_t)g_memory_offset + 0xF0000000u, hi0 = (uintptr_t)g_memory_offset + 0x100000000ull;
+        while (mf && fgets(ml, sizeof ml, mf)) {
+            unsigned long lo = 0, hi = 0;
+            if (sscanf(ml, "%lx-%lx", &lo, &hi) == 2 && hi > lo0 && lo < hi0)
+                fprintf(stderr, "  [MAPS] guest 0x%08lX-0x%08lX %s", (unsigned long)(lo - (uintptr_t)g_memory_offset),
+                        (unsigned long)(hi - (uintptr_t)g_memory_offset), ml);
+        }
+        if (mf) fclose(mf);
+    }
+#endif
     fprintf(stderr, "xbox_MemoryLayoutInit: complete\n");
     return TRUE;
 }
