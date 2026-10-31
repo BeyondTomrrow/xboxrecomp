@@ -666,9 +666,9 @@ typedef int (*XboxHudCallback)(const XboxHudFrame *f, XboxHudImage *img);
 static void pr_present_shot(void);
 static void pr_frame_limit(void);
 static void pr_record(void);
-static XboxHudCallback s_hud_cbs[2];   /* 0: the broadcast HUD; 1: drawn over it (Android touch controls) */
+static XboxHudCallback s_hud_cbs[3];   /* 0: the broadcast HUD; 1: drawn over it (Android touch controls); 2: performance overlay */
 static struct {
-    struct { ID3D11Texture2D *tex; ID3D11ShaderResourceView *srv; int w, h; } layer[2];
+    struct { ID3D11Texture2D *tex; ID3D11ShaderResourceView *srv; int w, h; } layer[3];
     ID3D11BlendState *blend;
     /* Shared textures from the HTML host, opened once per handle. */
     struct { HANDLE handle; ID3D11Texture2D *tex; ID3D11ShaderResourceView *srv; IDXGIKeyedMutex *mutex; } sh[4];
@@ -808,10 +808,14 @@ static void pr_draw_hud_layer(int l, float gx, float gy, float gw, float gh)
     }
 }
 
+#include "nv2a_gpu_perfhud.inc.c"   /* the performance overlay: HUD layer 2 */
+
 static void pr_draw_hud(float gx, float gy, float gw, float gh)
 {
     pr_draw_hud_layer(0, gx, gy, gw, gh);
     pr_draw_hud_layer(1, gx, gy, gw, gh);
+    s_hud_cbs[2] = perfhud_frame;
+    pr_draw_hud_layer(2, gx, gy, gw, gh);
 }
 
 /* ---- the settings page -------------------------------------------------- */
@@ -823,6 +827,7 @@ static const char *const k_upscaler_names[] = { "Off", "FSR 3 Native AA", "FSR 3
 static const float k_upscaler_ratio[] = { 1.0f, 1.0f, 1.5f, 1.7f, 2.0f, 3.0f };
 static UINT s_fsr_out_h;                 /* last upscale's output height, 0 when off */
 static const char *const k_api_names[] = { "Direct3D 11", "Vulkan", "Direct3D 12" };
+static const char *const k_perf_overlay_names[] = { "Off", "FPS only", "Full" };   /* show_fps */
 static const int k_fps_limits[] = { 30, 60, 120, 0, -1 };
 #define FPS_LIMITS 5
 /* The title's frame-interval hook (src/main.c) re-reads the cap when it
@@ -912,7 +917,7 @@ static void menu_label(int item, char *name, char *val, size_t n)
     case MI_CROP:   strcpy(name, "Crop sides"); snprintf(val, n, s_vs.crop ? "%d px" : "Off", s_vs.crop); break;
     case MI_ANISO:  strcpy(name, "Anisotropic filtering");
                     snprintf(val, n, s_vs.aniso > 1 ? "%dx" : "Off", s_vs.aniso); break;
-    case MI_FPS:    strcpy(name, "Show FPS"); snprintf(val, n, "%s", s_vs.show_fps ? "On" : "Off"); break;
+    case MI_FPS:    strcpy(name, "Performance overlay"); snprintf(val, n, "%s", k_perf_overlay_names[s_vs.show_fps % 3]); break;
     case MI_WIDE:   strcpy(name, "Widescreen"); snprintf(val, n, "%s", s_vs.widescreen ? "On" : "Off"); break;
     case MI_LIMIT:  strcpy(name, "Frame rate cap");
                     if (s_vs.fps_limit < 0) snprintf(val, n, "Original (30/60)");
@@ -969,7 +974,7 @@ static void menu_change(int item, int dir)
     case MI_ANISO:  { static const int a[] = { 1, 2, 4, 8, 16 }; int k;
                       for (k = 0; k < 5 && a[k] != s_vs.aniso; k++) {}
                       k = (k >= 5 ? 0 : (k + 5 + dir) % 5); s_vs.aniso = a[k]; } break;
-    case MI_FPS:    s_vs.show_fps = !s_vs.show_fps; break;
+    case MI_FPS:    s_vs.show_fps = (s_vs.show_fps % 3 + 3 + dir) % 3; break;
     case MI_WIDE:   s_vs.widescreen = !s_vs.widescreen; break;
     case MI_LIMIT:  { int k;
                       for (k = 0; k < FPS_LIMITS && k_fps_limits[k] != s_vs.fps_limit; k++) {}
@@ -1069,14 +1074,14 @@ const char *xbox_VideoSettingName(int i)
         [MI_LIGHTING] = "Lighting & Materials", [MI_POST] = "Post-Processing", [MI_SHARPEN] = "Sharpening",
         [MI_AO] = "Ambient Occlusion", [MI_HDR] = "HDR Output", [MI_FILTER] = "Upscaling Filter", [MI_VSYNC] = "VSync",
         [MI_BRIGHT] = "Brightness", [MI_GAMMA] = "Gamma", [MI_CROP] = "Overscan Crop", [MI_ANISO] = "Texture Filtering",
-        [MI_FPS] = "Show FPS", [MI_LIMIT] = "Frame Rate Cap", [MI_API] = "Graphics API", [MI_UPSCALE] = "Upscaling",
+        [MI_FPS] = "Performance Overlay", [MI_LIMIT] = "Frame Rate Cap", [MI_API] = "Graphics API", [MI_UPSCALE] = "Upscaling",
         [MI_FRAMEGEN] = "Frame Generation" };
     return (i >= 0 && i < VM_COUNT && names[k_vm_items[i]]) ? names[k_vm_items[i]] : "";
 }
 
 int xbox_VideoSettingIsToggle(int i)
 {
-    return i >= 0 && i < VM_COUNT && (k_vm_items[i] == MI_VSYNC || k_vm_items[i] == MI_FPS || k_vm_items[i] == MI_WIDE ||
+    return i >= 0 && i < VM_COUNT && (k_vm_items[i] == MI_VSYNC || k_vm_items[i] == MI_WIDE ||
                                           k_vm_items[i] == MI_FRAMEGEN || k_vm_items[i] == MI_DYNRES);
 }
 
@@ -1095,7 +1100,8 @@ int xbox_VideoSettingValues(int i)
     case MI_SHARPEN: return 4;
     case MI_AO:     return 3;
     case MI_HDR:    return 2;
-    case MI_VSYNC: case MI_FPS: case MI_WIDE: return 2;
+    case MI_VSYNC: case MI_WIDE: return 2;
+    case MI_FPS:    return 3;
     case MI_BRIGHT: case MI_GAMMA: return 21;
     case MI_CROP: case MI_ANISO: return 5;
     case MI_LIMIT:  return FPS_LIMITS;
@@ -1134,7 +1140,7 @@ static int vm_get(const VideoSettings *vs, int item)
         for (k = 0; k < 5; k++)
             if (k_vm_aniso[k] == vs->aniso) return k;
         return 0;
-    case MI_FPS:    return vs->show_fps ? 1 : 0;
+    case MI_FPS:    return vs->show_fps % 3;
     case MI_WIDE:   return vs->widescreen ? 1 : 0;
     case MI_LIMIT:
         for (k = 0; k < FPS_LIMITS; k++)
@@ -1167,7 +1173,7 @@ static void vm_set(VideoSettings *vs, int item, int idx)
     case MI_GAMMA:  vs->gamma = 60 + 5 * idx; break;
     case MI_CROP:   vs->crop = 8 * idx; break;
     case MI_ANISO:  vs->aniso = k_vm_aniso[idx % 5]; break;
-    case MI_FPS:    vs->show_fps = idx; break;
+    case MI_FPS:    vs->show_fps = idx % 3; break;
     case MI_WIDE:   vs->widescreen = idx; break;
     case MI_LIMIT:  vs->fps_limit = k_fps_limits[idx % FPS_LIMITS]; break;
     case MI_API:    vs->renderer = idx % 3; break;
@@ -1207,7 +1213,7 @@ void xbox_VideoSettingValueName(int i, int idx, char *buf, size_t n)
     case MI_GAMMA:  snprintf(buf, n, "%d.%02d", v.gamma / 100, v.gamma % 100); break;
     case MI_CROP:   if (v.crop) snprintf(buf, n, "%d px", v.crop); else snprintf(buf, n, "Off"); break;
     case MI_ANISO:  if (v.aniso > 1) snprintf(buf, n, "%dx Anisotropic", v.aniso); else snprintf(buf, n, "Standard"); break;
-    case MI_FPS:    snprintf(buf, n, "%s", v.show_fps ? "On" : "Off"); break;
+    case MI_FPS:    snprintf(buf, n, "%s", k_perf_overlay_names[v.show_fps % 3]); break;
     case MI_WIDE:   snprintf(buf, n, "%s", v.widescreen ? "On" : "Off"); break;
     case MI_LIMIT:  if (v.fps_limit < 0) snprintf(buf, n, "Original (30/60)");
                     else if (v.fps_limit) snprintf(buf, n, "%d FPS", v.fps_limit); else snprintf(buf, n, "Unlimited"); break;
@@ -1436,23 +1442,6 @@ static void pr_build_overlay(void)
         TextOutA(dc, 50, H - 56, "Arrows / D-pad: choose   Left/Right: change   Enter / A: select", 64);
         SelectObject(dc, of);
         DeleteObject(panel); DeleteObject(bar); DeleteObject(selb);
-    }
-    if (s_vs.show_fps) {
-        char t[64], t2[128];
-        int len, len2;
-        perf_overlay_text(t, sizeof t, t2, sizeof t2, s_pr.fps);
-        len = (int)strlen(t); len2 = (int)strlen(t2);
-        of = (HFONT)SelectObject(dc, fb);
-        SetTextColor(dc, RGB(1, 1, 1));
-        TextOutA(dc, 6, 6, t, len);
-        SetTextColor(dc, RGB(120, 255, 120));
-        TextOutA(dc, 4, 4, t, len);
-        SelectObject(dc, fs);
-        SetTextColor(dc, RGB(1, 1, 1));
-        TextOutA(dc, 6, 40, t2, len2);
-        SetTextColor(dc, RGB(200, 230, 200));
-        TextOutA(dc, 4, 38, t2, len2);
-        SelectObject(dc, of);
     }
     GdiFlush();
     {
@@ -1973,9 +1962,8 @@ static int pr_present(uint32_t guest)
             if (++secs % 10 == 0)
                 fprintf(stderr, "  [FPS] %d (scale %d, vsync %d)\n", s_pr.fps, s_vs.scale, s_vs.vsync);
         }
-        if (s_vs.show_fps) s_pr.ovl_valid = 0;
     }
-    if (s_menu_open || s_vs.show_fps) {
+    if (s_menu_open) {   /* the performance overlay is HUD layer 2 (nv2a_gpu_perfhud.inc.c) */
         if (!s_pr.ovl_valid)
             pr_build_overlay();
         if (s_pr.ovl_srv) {
