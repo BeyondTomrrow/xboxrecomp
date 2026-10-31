@@ -133,7 +133,7 @@ static GxObj s_ctx_obj = { GX_MAGIC, K_CONTEXT, 1, NULL };
 /* Per-frame counters, logged every 300 presents (where the time goes). */
 static struct {
     unsigned mvt_draws, mv_draws, draws, rpasses, cpasses, copies, uploads, downloads, submits, waits, flushes;
-    double wait_ms, flush_ms, pipe_ms, uni_bytes;
+    double wait_ms, flush_ms, pipe_ms, uni_bytes, copy_ms, replay_ms, submit_ms, acquire_ms, staged_tex, staged_vb;
     unsigned frames;
 } s_st;
 
@@ -332,6 +332,17 @@ static int gx_sdl_init(int backend)
     }
     SDL_GetLogOutputFunction(&s_prev_log, &s_prev_log_ud);
     SDL_SetLogOutputFunction(gx_log, NULL);
+#ifndef XBOX_GX_PORTABLE
+    /* Vulkan pipeline cache file (local SDL build, SDL_gpu_vulkan.c): read
+     * when the device is made, written by gx_pipe_cache_save. Keeps start-up
+     * and first scenes free of pipeline compiles when the driver's own cache
+     * has been cleared or evicted. RECOMP_NO_PIPE_CACHE=1 turns it off. */
+    if (backend == 1 && !getenv("RECOMP_NO_PIPE_CACHE") && !SDL_getenv("SDL_GPU_VULKAN_PIPELINE_CACHE")) {
+        char path[MAX_PATH];
+        SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "SDL_GPU_VULKAN_PIPELINE_CACHE",
+                                   xbox_user_path("cache\\pipelines-vk.bin", path, sizeof path), true);
+    }
+#endif
     SDL_SetLogPriority(SDL_LOG_CATEGORY_GPU, getenv("RECOMP_GPU_DEBUG") ? SDL_LOG_PRIORITY_VERBOSE : SDL_LOG_PRIORITY_INFO);
     p = SDL_CreateProperties();
     SDL_SetStringProperty(p, SDL_PROP_GPU_DEVICE_CREATE_NAME_STRING, backend == 1 ? "vulkan" : "direct3d12");
@@ -2097,6 +2108,8 @@ static void flush_locked(int submit)
             if (b->hi > b->d.ByteWidth) b->hi = b->d.ByteWidth;
             if (b->lo < b->hi) total += (b->hi - b->lo + 255u) & ~255u;
         }
+        s_st.staged_tex += s_nup;
+        s_st.staged_vb += total - ((s_nup + 511u) & ~511u);
         if (total) {
             uint8_t *p;
             if (total > s_tb_size) {
@@ -2132,7 +2145,12 @@ static void flush_locked(int submit)
                 }
             }
         }
-        replay(s_cb, up_base);
+        {
+            double tr = qpc_ms();
+            s_st.copy_ms += tr - t0;
+            replay(s_cb, up_base);
+            s_st.replay_ms += qpc_ms() - tr;
+        }
         /* SDL cycles a transfer buffer the GPU still reads, keeping each copy
          * for reuse: one sized for a load-time burst of textures, cycled
          * every submission, held gigabytes. Back to a small one afterwards. */
@@ -2158,7 +2176,9 @@ static void flush_locked(int submit)
      * with this one. Recorded but unsubmitted ones wait for the next. */
     if (submit) {
         GxFence *fence = NULL;
+        double ts = qpc_ms();
         SDL_GPUFence *f = SDL_SubmitGPUCommandBufferAndAcquireFence(s_cb);
+        s_st.submit_ms += qpc_ms() - ts;
         s_st.submits++;
         s_cb = NULL;
         if (f) {
@@ -2536,6 +2556,48 @@ HRESULT gxs_IDXGISwapChain1_GetBuffer(void *s, UINT i, REFIID riid, void **out)
 HRESULT gxs_IDXGISwapChain1_ResizeTarget(void *s, const DXGI_MODE_DESC *d) { (void)s; (void)d; return S_OK; }
 HRESULT gxs_IDXGISwapChain1_SetFullscreenState(void *s, BOOL fs, IDXGIOutput *o) { (void)s; (void)fs; (void)o; return S_OK; }
 
+#ifndef XBOX_GX_PORTABLE
+/* Write the Vulkan pipeline cache in the background once new pipelines have
+ * stopped arriving for a few seconds (and at most every 20 s while they keep
+ * coming), so a run that is killed still leaves its pipelines on disk. */
+bool SDL_SaveGPUPipelineCacheVulkan(SDL_GPUDevice *device, const char *path);   /* local SDL build */
+static volatile LONG s_pc_saving;
+static int SDLCALL pipe_cache_save_thread(void *arg)
+{
+    const char *path = SDL_getenv("SDL_GPU_VULKAN_PIPELINE_CACHE");
+    double t0 = qpc_ms();
+    (void)arg;
+    if (path && *path && SDL_SaveGPUPipelineCacheVulkan(G.dev, path))
+        fprintf(stderr, "  [GX] pipeline cache saved (%ld pipelines so far, %.0f ms)\n", (long)g_gx_pipes, qpc_ms() - t0);
+    InterlockedExchange(&s_pc_saving, 0);
+    return 0;
+}
+
+static void gx_pipe_cache_save(void)
+{
+    static LONG saved_at = -1, seen;
+    static double changed, last_save;
+    double now;
+    LONG n = g_gx_pipes;
+    if (s_backend != 1 || getenv("RECOMP_NO_PIPE_CACHE")) return;
+    now = qpc_ms();
+    if (saved_at < 0) { saved_at = 0; seen = n; changed = last_save = now; return; }
+    if (n != seen) { seen = n; changed = now; }
+    if (n == saved_at || s_pc_saving) return;
+    if (now - changed < 3000.0 && now - last_save < 20000.0) return;
+    {
+        SDL_Thread *t;
+        InterlockedExchange(&s_pc_saving, 1);
+        saved_at = n; last_save = now;
+        t = SDL_CreateThread(pipe_cache_save_thread, "gx_pcsave", NULL);
+        if (t) SDL_DetachThread(t);
+        else InterlockedExchange(&s_pc_saving, 0);
+    }
+}
+#else
+static void gx_pipe_cache_save(void) {}
+#endif
+
 HRESULT gxs_IDXGISwapChain1_Present(void *s, UINT sync, UINT flags)
 {
     GxSwap *sw = (GxSwap *)s;
@@ -2545,6 +2607,7 @@ HRESULT gxs_IDXGISwapChain1_Present(void *s, UINT sync, UINT flags)
     static LARGE_INTEGER last_pair;
     static double interval;                     /* real frames, ms (smoothed) */
     pacer_wait();
+    gx_pipe_cache_save();
     if (!G.win || !sw->bb) { flush(1); return S_OK; }
 #ifdef __ANDROID__
     if (s_backgrounded) { flush(1); return S_OK; }
@@ -2584,7 +2647,12 @@ HRESULT gxs_IDXGISwapChain1_Present(void *s, UINT sync, UINT flags)
         }
     }
     flush(0);
-    if (s_cb && SDL_WaitAndAcquireGPUSwapchainTexture(s_cb, G.win, &sct, &w, &h) && sct) {
+    {
+        double ta = qpc_ms();
+        if (!(s_cb && SDL_WaitAndAcquireGPUSwapchainTexture(s_cb, G.win, &sct, &w, &h))) sct = NULL;
+        s_st.acquire_ms += qpc_ms() - ta;
+    }
+    if (sct) {
         GxTex *first = pair ? sw->bb2 : sw->bb;
         present_blit(s_cb, first->t, first->d.Width, first->d.Height, sct, w, h);
     }
@@ -2630,11 +2698,13 @@ HRESULT gxs_IDXGISwapChain1_Present(void *s, UINT sync, UINT flags)
     LeaveCriticalSection(&G.submit_lock);
     if (++s_st.frames == 300) {
         fprintf(stderr, "  [GX] per frame: %.0f draws, %.1f render passes, %.1f copy passes, %.1f copies, %.1f uploads, "
-                "%.2f downloads, %.2f submits, %.2f GPU waits (%.2f ms), flush %.2f ms, new pipelines %.2f ms, "
-                "motion target draws %.0f (with history %.0f), upload buffer %u MB, uniforms %.1f KB\n",
+                "%.2f downloads, %.2f submits, %.2f GPU waits (%.2f ms), flush %.2f ms (staging %.2f, replay %.2f, submit %.2f), "
+                "swap-chain wait %.2f ms, new pipelines %.2f ms, "
+                "motion target draws %.0f (with history %.0f), upload buffer %u MB (staged %.2f MB textures, %.2f MB vertex data), uniforms %.1f KB\n",
                 s_st.draws / 300.0, s_st.rpasses / 300.0, s_st.cpasses / 300.0, s_st.copies / 300.0, s_st.uploads / 300.0,
                 s_st.downloads / 300.0, s_st.submits / 300.0, s_st.waits / 300.0, s_st.wait_ms / 300.0,
-                s_st.flush_ms / 300.0, s_st.pipe_ms / 300.0, s_st.mvt_draws / 300.0, s_st.mv_draws / 300.0, s_tb_size >> 20, s_st.uni_bytes / 300.0 / 1024.0);
+                s_st.flush_ms / 300.0, s_st.copy_ms / 300.0, s_st.replay_ms / 300.0, s_st.submit_ms / 300.0,
+                s_st.acquire_ms / 300.0, s_st.pipe_ms / 300.0, s_st.mvt_draws / 300.0, s_st.mv_draws / 300.0, s_tb_size >> 20, s_st.staged_tex / 300.0 / 1048576.0, s_st.staged_vb / 300.0 / 1048576.0, s_st.uni_bytes / 300.0 / 1024.0);
         memset(&s_st, 0, sizeof s_st);
     }
     return S_OK;
