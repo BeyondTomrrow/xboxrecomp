@@ -829,7 +829,19 @@ static const int k_fps_limits[] = { 30, 60, 120, 0, -1 };
  * changes, so a new setting applies at once rather than at the game's next
  * camera change. */
 void (*g_xbox_fps_limit_changed)(void);
-int xbox_VideoFpsLimit(void) { return s_vs.fps_limit; }
+/* Android 12+ Game Mode "battery" (Samsung Game Booster's battery setting;
+ * NFL2K5_GAME_MODE from android/app NFL2K5Activity): 1x internal resolution
+ * and 30 FPS, applied over the saved settings without changing them. */
+static int vs_battery_mode(void)
+{
+    static int b = -1;
+    if (b < 0) {
+        const char *m = getenv("NFL2K5_GAME_MODE");
+        b = m && !strcmp(m, "battery");
+    }
+    return b;
+}
+int xbox_VideoFpsLimit(void) { return vs_battery_mode() ? 30 : s_vs.fps_limit; }
 static void fps_limit_changed(void) { if (g_xbox_fps_limit_changed) g_xbox_fps_limit_changed(); }
 
 /* ---- graphics presets (2026-10-30) ---------------------------------------
@@ -1713,10 +1725,10 @@ static int pr_present(uint32_t guest)
         return 0;
     if (InterlockedExchange(&s_vs_dirty, 0))
         pr_apply_mode();
-    g_render_scale = (uint32_t)s_vs.scale;     /* surfaces follow on their next use */
+    g_render_scale = vs_battery_mode() ? 1u : (uint32_t)s_vs.scale;     /* surfaces follow on their next use */
     g_want_motion = ((s_vs.upscaler || s_vs.framegen) && gxs_fsr_available()) || env_cached("RECOMP_FORCE_MV");
     g_want_mv = g_want_motion || s_vs.ao > 0;   /* the depth copy also feeds ambient occlusion */
-    if (s_vs.dynres)
+    if (s_vs.dynres && !vs_battery_mode())
         g_render_scale = pr_dynres_scale();
     g_gx_hdr_wanted = s_vs.hdr;                /* gx/gx_sdl.c switches the swap chain */
     if (env_cached("RECOMP_SCALE_CYCLE")) {
