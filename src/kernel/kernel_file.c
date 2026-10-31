@@ -1023,6 +1023,14 @@ void xbox_PrefetchGameData(const char *root) { (void)root; }
 volatile LONG64 g_xbox_read_qpc, g_xbox_read_bytes, g_xbox_read_count;   /* the hitch log's disc reads */
 
 /* ====================  POSIX backend  =================================== */
+
+/* Mod pack disc overlays (kernel_overlay.c, POSIX half). */
+int  xbox_overlay_load(const char *dir, const char *disc);
+void xbox_overlay_attach_path(HANDLE h, const char *host_path);
+void xbox_overlay_detach(HANDLE h);
+int  xbox_overlay_read(HANDLE h, void *buf, ULONG len, const LARGE_INTEGER *off, ULONG *got);
+int  xbox_overlay_size(HANDLE h, LONGLONG *size);
+int  xbox_overlay_path_size_a(const char *host_path, LONGLONG *size);
 /* ======================================================================== */
 
 /* Convert Xbox access mask + disposition to POSIX open() flags. */
@@ -1136,6 +1144,8 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     }
 
     *FileHandle = w32_open_handle(fd, host_path);
+    if (!(CreateOptions & XBOX_FILE_DIRECTORY_FILE))
+        xbox_overlay_attach_path(*FileHandle, host_path);
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_SUCCESS;
         IoStatusBlock->Information = (CreateDisposition == XBOX_FILE_CREATE) ? 2 : 1;
@@ -1152,6 +1162,20 @@ NTSTATUS __stdcall xbox_NtReadFile(
     (void)ApcRoutine; (void)ApcContext;
     if (!IoStatusBlock)
         return STATUS_INVALID_PARAMETER;
+
+    {
+        ULONG got;
+        if (xbox_overlay_read(FileHandle, Buffer, Length, ByteOffset, &got)) {
+            IoStatusBlock->Information = got;
+            if (got == 0 && Length > 0) {
+                IoStatusBlock->Status = STATUS_END_OF_FILE;
+                return STATUS_END_OF_FILE;
+            }
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            if (Event) SetEvent(Event);
+            return STATUS_SUCCESS;
+        }
+    }
 
     int fd = w32_handle_fd(FileHandle);
     if (fd < 0) {
@@ -1216,6 +1240,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
+        xbox_overlay_detach(Handle);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
@@ -1267,7 +1292,8 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
         case XboxFileStandardInformation: {
             PXBOX_FILE_STANDARD_INFORMATION info = (PXBOX_FILE_STANDARD_INFORMATION)FileInformation;
             info->EndOfFile.QuadPart = st.st_size;
-            info->AllocationSize.QuadPart = (st.st_size + 4095) & ~4095LL;
+            xbox_overlay_size(FileHandle, &info->EndOfFile.QuadPart);
+            info->AllocationSize.QuadPart = (info->EndOfFile.QuadPart + 4095) & ~4095LL;
             info->NumberOfLinks = (ULONG)st.st_nlink;
             info->DeletePending = FALSE;
             info->Directory = S_ISDIR(st.st_mode) ? TRUE : FALSE;
@@ -1291,7 +1317,8 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
             unix_to_filetime(st.st_mtime, 0, &info->LastWriteTime);
             info->ChangeTime = info->LastWriteTime;
             info->EndOfFile.QuadPart = st.st_size;
-            info->AllocationSize.QuadPart = (st.st_size + 4095) & ~4095LL;
+            xbox_overlay_size(FileHandle, &info->EndOfFile.QuadPart);
+            info->AllocationSize.QuadPart = (info->EndOfFile.QuadPart + 4095) & ~4095LL;
             info->FileAttributes = mode_to_xbox_attrs(st.st_mode);
             IoStatusBlock->Status = STATUS_SUCCESS;
             IoStatusBlock->Information = sizeof(XBOX_FILE_NETWORK_OPEN_INFORMATION);
@@ -1428,7 +1455,8 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
     unix_to_filetime(st.st_mtime, 0, &FileInformation->LastWriteTime);
     FileInformation->ChangeTime = FileInformation->LastWriteTime;
     FileInformation->EndOfFile.QuadPart = st.st_size;
-    FileInformation->AllocationSize.QuadPart = (st.st_size + 4095) & ~4095LL;
+    xbox_overlay_path_size_a(host_path, &FileInformation->EndOfFile.QuadPart);
+    FileInformation->AllocationSize.QuadPart = (FileInformation->EndOfFile.QuadPart + 4095) & ~4095LL;
     FileInformation->FileAttributes = mode_to_xbox_attrs(st.st_mode);
     return STATUS_SUCCESS;
 }
