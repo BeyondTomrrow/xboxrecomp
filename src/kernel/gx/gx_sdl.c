@@ -2140,6 +2140,25 @@ static GxSwap *s_swap;
 /* The game runs at 60 frames a second; a 120 Hz phone screen left at 120
  * refreshes twice per frame for nothing. Asking for 60 lets the display
  * drop its rate (Android 11+; a no-op before). */
+static void android_frame_rate_hint(SDL_Window *w);
+
+/* Android takes the window's surface away while the app is in the
+ * background (home button, screen off). Acquiring a swap chain image then
+ * crashed inside the Vulkan driver, so frames are not presented until the
+ * app is back. */
+static volatile LONG s_backgrounded;
+static bool SDLCALL android_app_state(void *ud, SDL_Event *e)
+{
+    (void)ud;
+    if (e->type == SDL_EVENT_WILL_ENTER_BACKGROUND || e->type == SDL_EVENT_DID_ENTER_BACKGROUND)
+        InterlockedExchange(&s_backgrounded, 1);
+    else if (e->type == SDL_EVENT_DID_ENTER_FOREGROUND) {
+        InterlockedExchange(&s_backgrounded, 0);
+        if (G.win) android_frame_rate_hint(G.win);   /* a new surface */
+    }
+    return true;
+}
+
 static void android_frame_rate_hint(SDL_Window *w)
 {
     typedef int32_t (*SetFrameRate)(void *win, float fps, int8_t compat);
@@ -2160,6 +2179,7 @@ static int gx_presenter(void *window, int letterbox)
             InterlockedExchange(&G.claimed, 1);
 #ifdef __ANDROID__
             android_frame_rate_hint(G.win);
+            SDL_AddEventWatch(android_app_state, NULL);
 #endif
             fprintf(stderr, "  [GX] window claimed for %s (HDR10 %s, extended linear %s)\n", gx_backend_name(),
                     SDL_WindowSupportsGPUSwapchainComposition(G.dev, G.win, SDL_GPU_SWAPCHAINCOMPOSITION_HDR10_ST2084) ? "yes" : "no",
@@ -2469,6 +2489,9 @@ HRESULT gxs_IDXGISwapChain1_Present(void *s, UINT sync, UINT flags)
     static double interval;                     /* real frames, ms (smoothed) */
     pacer_wait();
     if (!G.win || !sw->bb) { flush(1); return S_OK; }
+#ifdef __ANDROID__
+    if (s_backgrounded) { flush(1); return S_OK; }
+#endif
     /* A frame missing draws whose pipelines are still compiling is not
      * shown: the screen keeps the last full frame instead of flashing
      * half-drawn ones. Never for more than about 2 seconds in a row. */

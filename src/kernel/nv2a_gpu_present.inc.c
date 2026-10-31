@@ -84,6 +84,13 @@ typedef struct {
 /* NFL 2K5 draws several full-screen backdrops only inside the 640-pixel
  * title-safe area of its 720-pixel scanout.  A CRT hid the remaining edge;
  * showing the full scanout exposes hard black strips beside the sky. */
+/* Highest internal resolution offered: a phone GPU runs out of memory and
+ * time long before 16x (a player picked it and the game fell to 9 FPS). */
+#ifdef __ANDROID__
+#define VS_MAX_SCALE 4
+#else
+#define VS_MAX_SCALE 16
+#endif
 static VideoSettings s_vs = { VM_BORDERLESS, 1920, 1080, AR_ORIGINAL, 3, SF_ENHANCED, 1, 100, 100, 0, 0, 8, 0, 1, 0, 0, 0, 0, 1, 1, 1, 0, 0 };
 static volatile LONG s_vs_dirty = 1;
 static uint32_t pr_dynres_scale(void);
@@ -142,7 +149,7 @@ static void vs_load(void)
     }
     fclose(f);
     if (s_vs.scale < 1) s_vs.scale = 1;
-    if (s_vs.scale > 16) s_vs.scale = 16;   /* stable maximum for the supported display modes */
+    if (s_vs.scale > VS_MAX_SCALE) s_vs.scale = VS_MAX_SCALE;   /* stable maximum for the supported display modes */
     if (s_vs.lighting < 0 || s_vs.lighting > 2) s_vs.lighting = 0;
     if (s_vs.renderer < 0 || s_vs.renderer > 2) s_vs.renderer = 0;
     if (s_vs.upscaler < 0 || s_vs.upscaler > 5) s_vs.upscaler = 0;
@@ -843,6 +850,7 @@ static void preset_apply(VideoSettings *v, int p)
     if (p < 1 || p > 4) return;
     v->scale = k[p].scale; v->aniso = k[p].aniso; v->post = k[p].post; v->sharpen = k[p].sharpen;
     v->ao = k[p].ao; v->lighting = k[p].lighting; v->dynres = 1;
+    if (v->scale > VS_MAX_SCALE) v->scale = VS_MAX_SCALE;
 }
 static int preset_current(const VideoSettings *v)
 {
@@ -931,7 +939,7 @@ static void menu_change(int item, int dir)
         InterlockedExchange(&s_vs_dirty, 1);
         break;
     case MI_ASPECT: s_vs.aspect = (s_vs.aspect + 6 + dir) % 6; break;
-    case MI_SCALE:  s_vs.scale += dir; if (s_vs.scale < 1) s_vs.scale = 16; if (s_vs.scale > 16) s_vs.scale = 1; break;
+    case MI_SCALE:  s_vs.scale += dir; if (s_vs.scale < 1) s_vs.scale = VS_MAX_SCALE; if (s_vs.scale > VS_MAX_SCALE) s_vs.scale = 1; break;
     case MI_LIGHTING: s_vs.lighting = (s_vs.lighting + 3 + dir) % 3; break;
     case MI_POST:   s_vs.post = (s_vs.post + POST_PRESETS + dir) % POST_PRESETS; break;
     case MI_SHARPEN: s_vs.sharpen = (s_vs.sharpen + 4 + dir) % 4; break;
@@ -1066,7 +1074,7 @@ int xbox_VideoSettingValues(int i)
     case MI_FILTER: return 4;
     case MI_RES:    res_build(); return s_nres ? s_nres : 1;
     case MI_ASPECT: return 6;
-    case MI_SCALE:  return 16;
+    case MI_SCALE:  return VS_MAX_SCALE;
     case MI_LIGHTING: return 3;
     case MI_POST:   return POST_PRESETS;
     case MI_SHARPEN: return 4;
