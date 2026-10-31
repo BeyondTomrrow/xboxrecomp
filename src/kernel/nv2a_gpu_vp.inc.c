@@ -109,13 +109,13 @@ static const char *k_vp_prelude =
  * draw copies the guest's raw vertex bytes into a ByteAddressBuffer and the
  * program decodes each input itself (vfetch), from a per-draw table in b2:
  * va[k] = { byte offset of vertex 0, stride, type | size << 8 | mode << 16 }
- * with mode 0 = no data (0,0,0,1), 1 = constant (vk[k]), 2 = array. The
+ * with mode 0 = no data (0,0,0,1), 1 = constant (vkon[k]; "vk" is a reserved namespace for DXC -spirv), 2 = array. The
  * decoding is fetch_attr's, format for format. Converting every vertex on
  * the CPU and sending 256 bytes of it was ~70% of the draw path
  * (2026-10-02). */
 static const char *k_vp_prelude_raw =
     "cbuffer VC : register(b1) { float4 c[192]; float4 info; float4 clipr; float4 fogp; float4 lightp; };\n"
-    "cbuffer VA : register(b2) { int4 va[16]; float4 vk[16]; };\n"
+    "cbuffer VA : register(b2) { int4 va[16]; float4 vkon[16]; };\n"
     "ByteAddressBuffer RB : register(t0);\n"
     "struct PIn { float4 pos:SV_Position; float4 d0:COLOR0; float4 d1:COLOR1;\n"
     "  float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3; float4 wz:TEXCOORD4; float4 rawscreen:TEXCOORD5;\n"
@@ -128,7 +128,7 @@ static const char *k_vp_prelude_raw =
     "float4 vfetch(int k, uint vid) {\n"
     "  int4 d = va[k]; uint ty = (uint)d.z & 255u, sz = ((uint)d.z >> 8) & 255u, md = ((uint)d.z >> 16) & 255u;\n"
     "  float4 r = float4(0, 0, 0, 1);\n"
-    "  if (md == 1u) return vk[k];\n"
+    "  if (md == 1u) return vkon[k];\n"
     "  if (md != 2u) return r;\n"
     "  int a = d.x + (int)vid * d.y;\n"
     "  if (ty == 0u) { uint w = rb32(a); float4 q = float4(w & 255u, (w >> 8) & 255u, (w >> 16) & 255u, w >> 24) / 255.0;\n"
@@ -199,7 +199,7 @@ static const char *k_vp_epilogue =
 static const char *k_vp_sg_head =
     "[[vk::binding(0, 1)]] cbuffer VPULL : register(b0, space1) { uint4 vpull; float4 vjit; };\n"
     "[[vk::binding(1, 1)]] cbuffer VC : register(b1, space1) { float4 c[192]; float4 info; float4 clipr; float4 fogp; float4 lightp; };\n"
-    "[[vk::binding(2, 1)]] cbuffer VA : register(b2, space1) { int4 va[16]; float4 vk[16]; };\n"
+    "[[vk::binding(2, 1)]] cbuffer VA : register(b2, space1) { int4 va[16]; float4 vkon[16]; };\n"
     "[[vk::binding(0, 0)]] ByteAddressBuffer RB : register(t0, space0);\n"
     "[[vk::binding(1, 0)]] StructuredBuffer<uint> IX : register(t1, space0);\n"
     /* Last frame's constants for this draw (gpu_vp_prev_consts): the same

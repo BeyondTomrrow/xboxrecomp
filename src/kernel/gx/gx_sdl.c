@@ -255,11 +255,68 @@ static void gx_log(void *ud, int cat, SDL_LogPriority pri, const char *msg)
     if (s_prev_log) s_prev_log(s_prev_log_ud, cat, pri, msg);
 }
 
+#ifndef XBOX_GX_PORTABLE
+/* Some driver installs leave a display adapter without its VulkanDriverName
+ * (seen with an NVIDIA 616.92 install on an RTX 2060 SUPER): the Vulkan loader
+ * then finds no driver although the driver's manifest sits next to its
+ * Direct3D driver in the DriverStore. Such manifests are handed to the loader
+ * through VK_ADD_DRIVER_FILES (added to, not replacing, the registered ones).
+ * Nothing on the system is changed. */
+static void gx_vk_find_unregistered_drivers(void)
+{
+    static const char cls[] = "SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}";
+    static const char *const manifests[] = { "nv-vk64.json", "amd-vulkan64.json", "igvk64.json" };
+    char found[4096] = "", name[64];
+    HKEY root;
+    DWORD i;
+    if (getenv("VK_DRIVER_FILES") || getenv("VK_ICD_FILENAMES") || getenv("VK_ADD_DRIVER_FILES"))
+        return;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, cls, 0, KEY_READ, &root) != ERROR_SUCCESS)
+        return;
+    for (i = 0; RegEnumKeyA(root, i, name, sizeof name) == ERROR_SUCCESS; i++) {
+        char umd[1024], dir[1024], path[1100];
+        DWORD n = sizeof umd, type, k;
+        HKEY a;
+        char *slash;
+        if (RegOpenKeyExA(root, name, 0, KEY_READ, &a) != ERROR_SUCCESS) continue;
+        if (RegQueryValueExA(a, "VulkanDriverName", NULL, NULL, NULL, NULL) == ERROR_SUCCESS ||
+            RegQueryValueExA(a, "UserModeDriverName", NULL, &type, (BYTE *)umd, &n) != ERROR_SUCCESS ||
+            (type != REG_MULTI_SZ && type != REG_SZ)) {
+            RegCloseKey(a);
+            continue;
+        }
+        RegCloseKey(a);
+        umd[sizeof umd - 1] = 0;
+        snprintf(dir, sizeof dir, "%s", umd);              /* first path of the list */
+        if (!(slash = strrchr(dir, '\\'))) continue;
+        *slash = 0;
+        for (k = 0; k < sizeof manifests / sizeof *manifests; k++) {
+            snprintf(path, sizeof path, "%s\\%s", dir, manifests[k]);
+            if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES && !strstr(found, path) &&
+                strlen(found) + strlen(path) + 2 < sizeof found) {
+                if (*found) strcat(found, ";");
+                strcat(found, path);
+            }
+        }
+    }
+    RegCloseKey(root);
+    if (*found) {
+        fprintf(stderr, "  [GX] Vulkan driver not registered by its install; using %s\n", found);
+        SetEnvironmentVariableA("VK_ADD_DRIVER_FILES", found);
+        _putenv_s("VK_ADD_DRIVER_FILES", found);
+    }
+}
+#endif
+
 static int gx_sdl_init(int backend)
 {
     SDL_PropertiesID p;
     if (!gx_dxc_available())
         return 0;
+#ifndef XBOX_GX_PORTABLE
+    if (backend == 1)
+        gx_vk_find_unregistered_drivers();
+#endif
     if (!SDL_WasInit(SDL_INIT_VIDEO) && !SDL_InitSubSystem(SDL_INIT_VIDEO)) {
         fprintf(stderr, "  [GX] SDL video init failed: %s\n", SDL_GetError());
         return 0;
