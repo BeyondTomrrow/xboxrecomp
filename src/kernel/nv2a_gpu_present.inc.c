@@ -899,7 +899,11 @@ static void menu_label(int item, char *name, char *val, size_t n)
                     snprintf(val, n, "%s%s", s_vs.framegen ? "FSR 3 (2x frames)" : "Off",
                              s_vs.framegen && !gxs_fsr_available() ? "  (Direct3D 12 only)" : ""); break;
     case MI_RESET:  strcpy(name, "Reset to defaults"); break;
+#ifdef __ANDROID__
+    case MI_CLOSE:  strcpy(name, "Close"); break;
+#else
     case MI_CLOSE:  strcpy(name, "Close  (F1 / Esc)"); break;
+#endif
     default:        name[0] = 0; break;
     }
 }
@@ -986,8 +990,20 @@ typedef struct XboxMenuPage {
     void (*activate)(int row);
     int (*busy)(void);
 } XboxMenuPage;
+#ifdef __ANDROID__
+static const int k_page_items[] = { MI_PRESET, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_FILTER,
+                                    MI_BRIGHT, MI_GAMMA, MI_CROP, MI_ANISO, MI_FPS, MI_LIMIT, MI_RESET, MI_CLOSE };
+#define PAGE_ITEMS ((int)(sizeof k_page_items / sizeof k_page_items[0]))
+static int page_item(int row) { return row >= 0 && row < PAGE_ITEMS ? k_page_items[row] : MI_COUNT; }
+static int video_page_count(void) { return PAGE_ITEMS; }
+#else
+static int page_item(int row) { return row; }
 static int video_page_count(void) { return MI_COUNT; }
-static const XboxMenuPage k_video_page = { "VIDEO SETTINGS", video_page_count, menu_label, menu_change, menu_activate, NULL };
+#endif
+static void video_page_label(int row, char *name, char *val, size_t n) { menu_label(page_item(row), name, val, n); }
+static void video_page_change(int row, int dir) { menu_change(page_item(row), dir); }
+static void video_page_activate(int row) { menu_activate(page_item(row)); }
+static const XboxMenuPage k_video_page = { "VIDEO SETTINGS", video_page_count, video_page_label, video_page_change, video_page_activate, NULL };
 #define MENU_MAX_PAGES 6
 static const XboxMenuPage *s_pages[MENU_MAX_PAGES] = { &k_video_page };
 static int s_npages = 1, s_menu_page;
@@ -1003,8 +1019,15 @@ static int menu_rows(void) { int n = menu_page()->count(); return n > 0 ? n : 1;
  * menu; its rows are these settings as indexed value lists. Called from the
  * game thread: changes mark the swap chain for re-applying on the next flip
  * and are saved at once. */
+#ifdef __ANDROID__
+/* A phone has one screen mode, one graphics API (Vulkan) and always syncs to
+ * the display; FSR, HDR10 output and ambient occlusion are Direct3D 12 only. */
+static const int k_vm_items[] = { MI_PRESET, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_FILTER,
+                                  MI_BRIGHT, MI_GAMMA, MI_CROP, MI_ANISO, MI_FPS, MI_LIMIT };
+#else
 static const int k_vm_items[] = { MI_PRESET, MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_AO, MI_HDR, MI_FILTER, MI_VSYNC,
                                   MI_BRIGHT, MI_GAMMA, MI_CROP, MI_ANISO, MI_FPS, MI_LIMIT, MI_API, MI_UPSCALE, MI_FRAMEGEN };
+#endif
 #define VM_COUNT ((int)(sizeof k_vm_items / sizeof k_vm_items[0]))
 static const int k_vm_aniso[] = { 1, 2, 4, 8, 16 };
 
@@ -1012,11 +1035,15 @@ int xbox_VideoSettingCount(void) { return VM_COUNT; }
 
 const char *xbox_VideoSettingName(int i)
 {
-    static const char *names[] = { "Graphics Preset", "Display Mode", "Resolution", "Widescreen", "Aspect Ratio", "Render Scale", "Dynamic Resolution",
-                                   "Lighting & Materials", "Post-Processing", "Sharpening", "Ambient Occlusion", "HDR Output",
-                                   "Upscaling Filter", "VSync", "Brightness", "Gamma",
-                                   "Overscan Crop", "Texture Filtering", "Show FPS", "Frame Rate Cap", "Graphics API", "Upscaling", "Frame Generation" };
-    return (i >= 0 && i < VM_COUNT) ? names[i] : "";
+    static const char *names[MI_COUNT] = {
+        [MI_PRESET] = "Graphics Preset", [MI_MODE] = "Display Mode", [MI_RES] = "Resolution", [MI_WIDE] = "Widescreen",
+        [MI_ASPECT] = "Aspect Ratio", [MI_SCALE] = "Render Scale", [MI_DYNRES] = "Dynamic Resolution",
+        [MI_LIGHTING] = "Lighting & Materials", [MI_POST] = "Post-Processing", [MI_SHARPEN] = "Sharpening",
+        [MI_AO] = "Ambient Occlusion", [MI_HDR] = "HDR Output", [MI_FILTER] = "Upscaling Filter", [MI_VSYNC] = "VSync",
+        [MI_BRIGHT] = "Brightness", [MI_GAMMA] = "Gamma", [MI_CROP] = "Overscan Crop", [MI_ANISO] = "Texture Filtering",
+        [MI_FPS] = "Show FPS", [MI_LIMIT] = "Frame Rate Cap", [MI_API] = "Graphics API", [MI_UPSCALE] = "Upscaling",
+        [MI_FRAMEGEN] = "Frame Generation" };
+    return (i >= 0 && i < VM_COUNT && names[k_vm_items[i]]) ? names[k_vm_items[i]] : "";
 }
 
 int xbox_VideoSettingIsToggle(int i)
@@ -1192,6 +1219,10 @@ void xbox_VideoSettingsLoad(void)
     static LONG once;
     if (!InterlockedExchange(&once, 1)) {
         vs_load();
+#ifdef __ANDROID__
+        /* not offered on a phone (see k_vm_items) */
+        s_vs.vsync = 1; s_vs.hdr = 0; s_vs.ao = 0; s_vs.upscaler = 0; s_vs.framegen = 0; s_vs.renderer = 1;
+#endif
         res_build();
     }
 }

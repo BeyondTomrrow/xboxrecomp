@@ -966,6 +966,7 @@ static SDL_Mutex *s_job_lock;
 static SDL_Condition *s_job_cond;
 static volatile LONG s_jobs_inflight;   /* queued or compiling */
 static int s_async_pipes = -1;
+static volatile LONG s_pipe_skips;      /* draws dropped since the last Present */
 
 static int pipe_job_worker(void *arg)
 {
@@ -1203,7 +1204,7 @@ static SDL_GPUGraphicsPipeline *pipe_get(GxShader *vs, GxShader *ps, D3D11_PRIMI
         SDL_GPUGraphicsPipeline *p = NULL;
         int from_job = 0;
         if (pipe_async_on()) {
-            int got = 0, freej = -1;
+            int got = 0, freej = -1, wait = 4;
             SDL_LockMutex(s_job_lock);
             for (i = 0; i < PIPE_JOBS; i++) {
                 GxPipeJob *j = &s_jobs[i];
@@ -1225,10 +1226,27 @@ static SDL_GPUGraphicsPipeline *pipe_get(GxShader *vs, GxShader *ps, D3D11_PRIMI
                 InterlockedIncrement(&s_jobs_inflight);
                 SDL_SignalCondition(s_job_cond);
                 got = -1;
+                wait = 0;                           /* just queued: worth a short wait */
+            }
+            /* A pipeline already in the disk cache is ready in a few ms:
+             * wait that long rather than drop the draw (once, when queued). */
+            for (; got < 0 && wait < 4; wait++) {
+                SDL_UnlockMutex(s_job_lock);
+                SDL_Delay(1);
+                SDL_LockMutex(s_job_lock);
+                for (i = 0; i < PIPE_JOBS; i++) {
+                    GxPipeJob *j = &s_jobs[i];
+                    if (j->state == 3 && j->h == h && !memcmp(&j->k, &k, sizeof k)) {
+                        p = j->p; j->state = 0; got = 1;
+                        break;
+                    }
+                }
             }
             SDL_UnlockMutex(s_job_lock);
-            if (got < 0)
+            if (got < 0) {
+                InterlockedIncrement(&s_pipe_skips);  /* Present holds the last full frame */
                 return NULL;                        /* draw skipped until it is ready */
+            }
             if (got > 0) {
                 if (!p) return NULL;
                 from_job = 1;
@@ -2117,6 +2135,22 @@ static void flush_locked(int submit)
 
 static GxSwap *s_swap;
 
+#ifdef __ANDROID__
+#include <dlfcn.h>
+/* The game runs at 60 frames a second; a 120 Hz phone screen left at 120
+ * refreshes twice per frame for nothing. Asking for 60 lets the display
+ * drop its rate (Android 11+; a no-op before). */
+static void android_frame_rate_hint(SDL_Window *w)
+{
+    typedef int32_t (*SetFrameRate)(void *win, float fps, int8_t compat);
+    void *aw = SDL_GetPointerProperty(SDL_GetWindowProperties(w), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL);
+    void *lib = dlopen("libandroid.so", RTLD_NOW);
+    SetFrameRate fn = lib ? (SetFrameRate)dlsym(lib, "ANativeWindow_setFrameRate") : NULL;
+    if (aw && fn)
+        fprintf(stderr, "  [GX] display asked for 60 Hz: %s\n", fn(aw, 60.0f, 0 /* DEFAULT */) == 0 ? "ok" : "refused");
+}
+#endif
+
 static int gx_presenter(void *window, int letterbox)
 {
     (void)letterbox;
@@ -2124,6 +2158,9 @@ static int gx_presenter(void *window, int letterbox)
         if (SDL_ClaimWindowForGPUDevice(G.dev, (SDL_Window *)window)) {
             G.win = (SDL_Window *)window;
             InterlockedExchange(&G.claimed, 1);
+#ifdef __ANDROID__
+            android_frame_rate_hint(G.win);
+#endif
             fprintf(stderr, "  [GX] window claimed for %s (HDR10 %s, extended linear %s)\n", gx_backend_name(),
                     SDL_WindowSupportsGPUSwapchainComposition(G.dev, G.win, SDL_GPU_SWAPCHAINCOMPOSITION_HDR10_ST2084) ? "yes" : "no",
                     SDL_WindowSupportsGPUSwapchainComposition(G.dev, G.win, SDL_GPU_SWAPCHAINCOMPOSITION_HDR_EXTENDED_LINEAR) ? "yes" : "no");
@@ -2432,6 +2469,20 @@ HRESULT gxs_IDXGISwapChain1_Present(void *s, UINT sync, UINT flags)
     static double interval;                     /* real frames, ms (smoothed) */
     pacer_wait();
     if (!G.win || !sw->bb) { flush(1); return S_OK; }
+    /* A frame missing draws whose pipelines are still compiling is not
+     * shown: the screen keeps the last full frame instead of flashing
+     * half-drawn ones. Never for more than about 2 seconds in a row. */
+    {
+        static int held, shown;
+        if (InterlockedExchange(&s_pipe_skips, 0) && shown && held < 120) {
+            held++;
+            flush(1);
+            return S_OK;
+        }
+        if (held) fprintf(stderr, "  [GX] held the last frame for %d frames while pipelines compiled\n", held);
+        held = 0;
+        shown = 1;
+    }
     EnterCriticalSection(&G.submit_lock);
     {
         int hdr = g_gx_hdr_wanted && gxs_hdr_supported();
