@@ -118,6 +118,57 @@ static DWORD xbox_share_to_win32(ULONG Share)
     return result;
 }
 
+/* Host paths of open directory handles. A UWP app cannot ask Windows for a
+ * handle's path (GetFinalPathNameByHandleW fails with access denied for every
+ * name type: it needs the folders above LocalState), so save directories
+ * listed as empty and every save failed (2026-10-31). The path the directory
+ * was opened with is kept here instead. */
+#define MAX_DIR_PATHS 128
+static struct { HANDLE h; WCHAR path[MAX_PATH]; } s_dir_paths[MAX_DIR_PATHS];
+static SRWLOCK s_dir_paths_lock = SRWLOCK_INIT;
+
+static void dir_path_remember(HANDLE h, const WCHAR *path)
+{
+    int slot = -1;
+    AcquireSRWLockExclusive(&s_dir_paths_lock);
+    for (int i = 0; i < MAX_DIR_PATHS; i++) {   /* a reused handle value replaces its entry */
+        if (s_dir_paths[i].h == h) { slot = i; break; }
+        if (!s_dir_paths[i].h && slot < 0) slot = i;
+    }
+    if (slot >= 0) {
+        s_dir_paths[slot].h = h;
+        wcsncpy_s(s_dir_paths[slot].path, MAX_PATH, path, _TRUNCATE);
+    }
+    ReleaseSRWLockExclusive(&s_dir_paths_lock);
+}
+
+static void dir_path_forget(HANDLE h)
+{
+    AcquireSRWLockExclusive(&s_dir_paths_lock);
+    for (int i = 0; i < MAX_DIR_PATHS; i++)
+        if (s_dir_paths[i].h == h) s_dir_paths[i].h = NULL;
+    ReleaseSRWLockExclusive(&s_dir_paths_lock);
+}
+
+/* GetFinalPathNameByHandleW, or the remembered path of a directory handle. */
+static DWORD handle_path(HANDLE h, WCHAR *buf, DWORD n, DWORD flags)
+{
+    DWORD used = GetFinalPathNameByHandleW(h, buf, n, flags);
+    if (used && used < n)
+        return used;
+    used = 0;
+    AcquireSRWLockShared(&s_dir_paths_lock);
+    for (int i = 0; i < MAX_DIR_PATHS; i++) {
+        if (s_dir_paths[i].h == h) {
+            size_t len = wcslen(s_dir_paths[i].path);
+            if (len < n) { wcscpy_s(buf, n, s_dir_paths[i].path); used = (DWORD)len; }
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&s_dir_paths_lock);
+    return used;
+}
+
 /* Translate an Xbox OBJECT_ATTRIBUTES path to a Win32 wide path */
 static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
                                WCHAR* win_path, DWORD buf_size)
@@ -128,7 +179,7 @@ static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
     if (ObjectAttributes->RootDirectory && xbox_path[0] != '\\' &&
         !(xbox_path[0] && xbox_path[1] == ':')) {
         /* XDeleteSaveGame opens each child relative to its save directory. */
-        DWORD used = GetFinalPathNameByHandleW(ObjectAttributes->RootDirectory,
+        DWORD used = handle_path(ObjectAttributes->RootDirectory,
             win_path, buf_size, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
         if (!used || used >= buf_size || used + 1 >= buf_size) return FALSE;
         if (win_path[used - 1] != L'\\') win_path[used++] = L'\\';
@@ -247,6 +298,8 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     *FileHandle = h;
     if (!(CreateOptions & XBOX_FILE_DIRECTORY_FILE))
         xbox_overlay_attach(h, win_path);
+    else
+        dir_path_remember(h, win_path);
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_SUCCESS;
         IoStatusBlock->Information = (CreateDisposition == XBOX_FILE_CREATE) ? 2 : 1;
@@ -708,7 +761,7 @@ static BOOL host_volume_space(HANDLE h, ULONGLONG *free_out, ULONGLONG *total_ou
     DWORD n = 0;
 
     if (h && h != INVALID_HANDLE_VALUE)
-        n = GetFinalPathNameByHandleW(h, path, MAX_PATH,
+        n = handle_path(h, path, MAX_PATH,
                                       FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
     if (n && n < MAX_PATH) {
         if (path[n - 1] != L'\\' && n + 1 < MAX_PATH) { path[n++] = L'\\'; path[n] = 0; }
@@ -847,6 +900,7 @@ static BOOL s_dir_cs_init = FALSE;
  * reuses: a later directory could continue another one's listing. */
 void xbox_release_dir_context(HANDLE FileHandle)
 {
+    dir_path_forget(FileHandle);
     if (!s_dir_cs_init || !FileHandle) return;
     EnterCriticalSection(&s_dir_cs);
     for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
@@ -913,9 +967,10 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         }
         WCHAR search_path[MAX_PATH];
         WCHAR dir_path[MAX_PATH];
-        DWORD path_len = GetFinalPathNameByHandleW(FileHandle, dir_path, MAX_PATH,
+        DWORD path_len = handle_path(FileHandle, dir_path, MAX_PATH,
                                                    FILE_NAME_NORMALIZED);
         if (path_len == 0 || path_len >= MAX_PATH) {
+            fprintf(stderr, "  [FILE] directory listing: no path for handle %p (err %lu)\n", FileHandle, GetLastError());
             IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
             return STATUS_UNSUCCESSFUL;
         }
