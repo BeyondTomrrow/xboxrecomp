@@ -1211,7 +1211,48 @@ static int tex_upload_override(GpuTexture *e, const Texture *t, uint32_t tpal, u
     return 1;
 }
 
+static ID3D11ShaderResourceView *gpu_texture_lookup(int st, int cube);
+
+/* The intro movies decode into a ring of five 640x480 frame buffers, and the
+ * decoder fills a buffer with 0x86 bytes before it decodes the next frame
+ * into it. Read at the moment the draw is processed, a buffer can still be
+ * in that state, and each such frame flashed the screen solid grey (xemu
+ * shows the movie there). A frame that is nothing but the fill shows the
+ * last real frame of the same shape instead, as it already is on the GPU. */
+static int movie_frame_unfilled(const Texture *t)
+{
+    const uint8_t *gm = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t k, pitch = t->pitch ? t->pitch : t->width * 4;
+    for (k = 0; k < 32; k++) {
+        uint32_t row = t->height * (2 * k + 1) / 64, col = t->width * ((k * 7) % 32 + 1) / 34;
+        if (*(const uint32_t *)(gm + t->offset + row * pitch + col * 4) != 0x86868686u)
+            return 0;
+    }
+    return 1;
+}
+
 static ID3D11ShaderResourceView *gpu_texture(int st, int cube)
+{
+    static ID3D11ShaderResourceView *last;
+    static uint32_t last_w, last_h, last_fmt;
+    const Texture *t = st == 0 ? &s_gpu.tex : &s_stage[st];
+    ID3D11ShaderResourceView *v;
+    int movie = !cube && t->valid && t->width >= 320 && t->height >= 240 && t->width <= 4096 && t->height <= 4096
+             && (t->color == 0x12 || t->color == 0x1E);
+    if (movie && movie_frame_unfilled(t)) {
+        if (last && last_w == t->width && last_h == t->height && last_fmt == t->color) {
+            uint32_t k;
+            for (k = 0; k < GPU_MAX_TEXTURES; k++)          /* still in the cache, not recycled */
+                if (s_gpu11.texs[k].srv == last) return last;
+        }
+        return gpu_texture_lookup(st, cube);
+    }
+    v = gpu_texture_lookup(st, cube);
+    if (movie && v) { last = v; last_w = t->width; last_h = t->height; last_fmt = t->color; }
+    return v;
+}
+
+static ID3D11ShaderResourceView *gpu_texture_lookup(int st, int cube)
 {
     Texture *t = st == 0 ? &s_gpu.tex : &s_stage[st];
     uint32_t faces = cube ? 6u : 1u, face_bytes = cube ? gpu_cube_face_bytes(st, t) : 0u, f;

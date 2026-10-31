@@ -66,6 +66,7 @@ typedef int (*XboxHudCallback)(const XboxHudFrame *f, XboxHudImage *img);
 static XboxHudCallback s_hud_cb = NULL;
 
 void xbox_PresentSetHudCallback(XboxHudCallback cb) { s_hud_cb = cb; }
+void xbox_PresentSetTopHudCallback(XboxHudCallback cb) { (void)cb; }
 int  xbox_VideoFpsLimit(void) { return s_vs.fps_limit; }
 
 static void vs_load(void)

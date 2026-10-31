@@ -659,12 +659,10 @@ typedef int (*XboxHudCallback)(const XboxHudFrame *f, XboxHudImage *img);
 static void pr_present_shot(void);
 static void pr_frame_limit(void);
 static void pr_record(void);
-static XboxHudCallback s_hud_cb;
+static XboxHudCallback s_hud_cbs[2];   /* 0: the broadcast HUD; 1: drawn over it (Android touch controls) */
 static struct {
-    ID3D11Texture2D *tex;
-    ID3D11ShaderResourceView *srv;
+    struct { ID3D11Texture2D *tex; ID3D11ShaderResourceView *srv; int w, h; } layer[2];
     ID3D11BlendState *blend;
-    int w, h;
     /* Shared textures from the HTML host, opened once per handle. */
     struct { HANDLE handle; ID3D11Texture2D *tex; ID3D11ShaderResourceView *srv; IDXGIKeyedMutex *mutex; } sh[4];
     int sh_next;
@@ -702,15 +700,16 @@ static ID3D11ShaderResourceView *hud_shared_view(HANDLE h, IDXGIKeyedMutex **mut
     return s_hud.sh[i].srv;
 }
 
-void xbox_PresentSetHudCallback(XboxHudCallback cb) { s_hud_cb = cb; }
+void xbox_PresentSetHudCallback(XboxHudCallback cb) { s_hud_cbs[0] = cb; }
+void xbox_PresentSetTopHudCallback(XboxHudCallback cb) { s_hud_cbs[1] = cb; }
 
-static void pr_draw_hud(float gx, float gy, float gw, float gh)
+static void pr_draw_hud_layer(int l, float gx, float gy, float gw, float gh)
 {
     gpu_state_invalidate();     /* binds its own state: the next draw resends all */
     XboxHudFrame f;
     XboxHudImage img;
     D3D11_VIEWPORT vp;
-    if (!s_hud_cb)
+    if (!s_hud_cbs[l])
         return;
     {   /* NFL2K5_HUD_CPU=1: no shared texture (diagnosis) */
         static int checked;
@@ -721,7 +720,7 @@ static void pr_draw_hud(float gx, float gy, float gw, float gh)
     memset(&img, 0, sizeof img);
     ID3D11ShaderResourceView *view;
     IDXGIKeyedMutex *lock = NULL;
-    if (!s_hud_cb(&f, &img) || !img.pixels || img.w <= 0 || img.h <= 0)
+    if (!s_hud_cbs[l](&f, &img) || !img.pixels || img.w <= 0 || img.h <= 0)
         return;
     if (!s_hud.blend) {
         D3D11_BLEND_DESC bld;
@@ -739,18 +738,18 @@ static void pr_draw_hud(float gx, float gy, float gw, float gh)
         if (!view || IDXGIKeyedMutex_AcquireSync(lock, 0, 4) != S_OK)
             return;                     /* this frame without it; next uses pixels or retries */
     } else {
-    if (!s_hud.tex || s_hud.w != img.w || s_hud.h != img.h) {
+    if (!s_hud.layer[l].tex || s_hud.layer[l].w != img.w || s_hud.layer[l].h != img.h) {
         D3D11_TEXTURE2D_DESC td;
-        if (s_hud.srv) { ID3D11ShaderResourceView_Release(s_hud.srv); s_hud.srv = NULL; }
-        if (s_hud.tex) { ID3D11Texture2D_Release(s_hud.tex); s_hud.tex = NULL; }
+        if (s_hud.layer[l].srv) { ID3D11ShaderResourceView_Release(s_hud.layer[l].srv); s_hud.layer[l].srv = NULL; }
+        if (s_hud.layer[l].tex) { ID3D11Texture2D_Release(s_hud.layer[l].tex); s_hud.layer[l].tex = NULL; }
         memset(&td, 0, sizeof td);
         td.Width = (UINT)img.w; td.Height = (UINT)img.h; td.MipLevels = 1; td.ArraySize = 1;
         td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        if (FAILED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, NULL, &s_hud.tex)) ||
-            FAILED(ID3D11Device_CreateShaderResourceView(s_gpu11.dev, (ID3D11Resource *)s_hud.tex, NULL, &s_hud.srv)))
+        if (FAILED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, NULL, &s_hud.layer[l].tex)) ||
+            FAILED(ID3D11Device_CreateShaderResourceView(s_gpu11.dev, (ID3D11Resource *)s_hud.layer[l].tex, NULL, &s_hud.layer[l].srv)))
             return;
-        s_hud.w = img.w; s_hud.h = img.h;
+        s_hud.layer[l].w = img.w; s_hud.layer[l].h = img.h;
         img.changed = 1;
         img.dirty_y0 = img.dirty_y1 = 0;           /* a new texture: all of it */
     }
@@ -777,14 +776,14 @@ static void pr_draw_hud(float gx, float gy, float gw, float gh)
             }
             {
                 D3D11_BOX box = { 0, (UINT)y0, 0, (UINT)img.w, (UINT)end, 1 };
-                ID3D11DeviceContext_UpdateSubresource(s_gpu11.ctx, (ID3D11Resource *)s_hud.tex, 0, &box,
+                ID3D11DeviceContext_UpdateSubresource(s_gpu11.ctx, (ID3D11Resource *)s_hud.layer[l].tex, 0, &box,
                                                       (const uint8_t *)img.pixels + (size_t)y0 * (size_t)img.stride,
                                                       (UINT)img.stride, 0);
             }
             y0 = end;
         }
     }
-    view = s_hud.srv;
+    view = s_hud.layer[l].srv;
     }
     vp.TopLeftX = (float)img.x; vp.TopLeftY = (float)img.y;
     vp.Width = (float)(img.dw > 0 ? img.dw : img.w); vp.Height = (float)(img.dh > 0 ? img.dh : img.h);
@@ -800,6 +799,12 @@ static void pr_draw_hud(float gx, float gy, float gw, float gh)
         ID3D11DeviceContext_PSSetShaderResources(s_gpu11.ctx, 0, 1, &none);
         IDXGIKeyedMutex_ReleaseSync(lock, 0);
     }
+}
+
+static void pr_draw_hud(float gx, float gy, float gw, float gh)
+{
+    pr_draw_hud_layer(0, gx, gy, gw, gh);
+    pr_draw_hud_layer(1, gx, gy, gw, gh);
 }
 
 /* ---- the settings page -------------------------------------------------- */
