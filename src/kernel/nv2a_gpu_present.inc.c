@@ -33,10 +33,11 @@ static HWND xbox_GetNativeHwnd(void)
 {
     SDL_Window *win = (SDL_Window *)xbox_FramebufferWindowHwnd();
     if (!win) return NULL;
-#ifndef _WIN32
+#if !defined(_WIN32) || defined(NFL2K5_UWP)
     /* No Win32 window: only SDL_GPU presents here, and the presenter uses
      * the handle as the window's identity (Android/Linux showed nothing,
-     * the swap chain waiting forever for an HWND, 2026-10-30). */
+     * the swap chain waiting forever for an HWND, 2026-10-30). The UWP
+     * build is the same: its SDL window is the dummy driver's. */
     return (HWND)win;
 #else
     return (HWND)SDL_GetPointerProperty(
