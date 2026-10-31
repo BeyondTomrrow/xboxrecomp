@@ -2750,6 +2750,20 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                         m + 1, (unsigned)XBOX_TILED_BASE);
                 continue;
             }
+            /* Same for the contiguous window, mapped above. With 128 MB of
+             * RAM (mod packs) mirror 16 lands exactly on 0x80000000. On
+             * Windows the view then simply fails; on POSIX the VirtualFree
+             * below unmapped the window first and the mirror took its place,
+             * so contiguous memory aliased guest RAM 0 (over the XBE image)
+             * and the tiled aperture no longer matched it. */
+            if (g_contig_memory &&
+                guest_lo < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE &&
+                (uint64_t)XBOX_CONTIG_BASE < guest_hi) {
+                fprintf(stderr, "  Mirror %d: skipped, overlaps the contiguous"
+                                " window at 0x%08X\n",
+                        m + 1, (unsigned)XBOX_CONTIG_BASE);
+                continue;
+            }
             /* Inside the reservation this hands back the slice we are about
              * to use; outside it (no reservation) this is a no-op on an
              * address we never held. */

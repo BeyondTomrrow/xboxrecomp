@@ -278,6 +278,7 @@ int xbox_overlay_path_size(const WCHAR *win_path, LONGLONG *size)
 #include <unistd.h>
 #include <pthread.h>
 #include <ctype.h>
+#include <dirent.h>
 #include "platform/win32_compat.h"
 
 typedef struct {
@@ -445,15 +446,51 @@ static void pread_all(int fd, void *buf, uint32_t n, uint64_t off)
     }
 }
 
+/* Open dir/rel matching each component of rel without regard to case. The
+ * pack's index names disc files the way Windows saw them ("vc_53450030/c")
+ * while an extracted disc can spell them otherwise ("vc_53450030/C"); on
+ * Windows the two are one file, on Linux and Android they are not. */
+static int ovl_open_nocase(const char *dir, const char *rel)
+{
+    char cur[1300], part[256];
+    snprintf(cur, sizeof cur, "%s", dir);
+    while (*rel) {
+        size_t n = strcspn(rel, "/");
+        DIR *d;
+        struct dirent *de;
+        int found = 0;
+        if (n == 0) { rel++; continue; }
+        if (n >= sizeof part) return -1;
+        memcpy(part, rel, n);
+        part[n] = 0;
+        rel += n;
+        if (!(d = opendir(cur))) return -1;
+        while ((de = readdir(d)) != NULL)
+            if (!strcasecmp(de->d_name, part)) {
+                size_t l = strlen(cur);
+                snprintf(cur + l, sizeof cur - l, "/%s", de->d_name);
+                found = 1;
+                break;
+            }
+        closedir(d);
+        if (!found) return -1;
+    }
+    return open(cur, O_RDONLY);
+}
+
+/* *slot: -1 not opened yet, -2 cannot be opened (reported once). */
 static int ovl_fd(int *slot, const char *a, const char *b)
 {
-    if (*slot < 0) {
+    if (*slot == -1) {
         char p[1300];
         pthread_mutex_lock(&s_lock);
-        if (*slot < 0) {
+        if (*slot == -1) {
+            int fd;
             snprintf(p, sizeof p, "%s/%s", a, b);
-            *slot = open(p, O_RDONLY);
-            if (*slot < 0) fprintf(stderr, "  [OVERLAY] cannot open %s\n", p);
+            fd = open(p, O_RDONLY);
+            if (fd < 0) fd = ovl_open_nocase(a, b);
+            if (fd < 0) fprintf(stderr, "  [OVERLAY] cannot open %s (its bytes read as zeros)\n", p);
+            *slot = fd < 0 ? -2 : fd;
         }
         pthread_mutex_unlock(&s_lock);
     }
