@@ -1239,7 +1239,9 @@ static ID3D11ShaderResourceView *gpu_texture(int st, int cube)
     ID3D11ShaderResourceView *v;
     int movie = !cube && t->valid && t->width >= 320 && t->height >= 240 && t->width <= 4096 && t->height <= 4096
              && (t->color == 0x12 || t->color == 0x1E);
-    if (movie && movie_frame_unfilled(t)) {
+    static int no_hold = -1;
+    if (no_hold < 0) no_hold = getenv("NFL2K5_NO_MOVIE_HOLD") != NULL;
+    if (movie && !no_hold && movie_frame_unfilled(t)) {
         if (last && last_w == t->width && last_h == t->height && last_fmt == t->color) {
             uint32_t k;
             for (k = 0; k < GPU_MAX_TEXTURES; k++)          /* still in the cache, not recycled */
