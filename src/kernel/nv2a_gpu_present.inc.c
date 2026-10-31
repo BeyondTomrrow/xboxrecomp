@@ -1030,6 +1030,16 @@ static const int k_page_items[] = { MI_PRESET, MI_WIDE, MI_ASPECT, MI_SCALE, MI_
 #define PAGE_ITEMS ((int)(sizeof k_page_items / sizeof k_page_items[0]))
 static int page_item(int row) { return row >= 0 && row < PAGE_ITEMS ? k_page_items[row] : MI_COUNT; }
 static int video_page_count(void) { return PAGE_ITEMS; }
+#elif defined(NFL2K5_UWP)
+/* A UWP app (PC or Xbox) has one window mode, its own size and one graphics
+ * API (Direct3D 12 through SDL_GPU): no display-mode, desktop-resolution or
+ * API rows. */
+static const int k_page_items[] = { MI_PRESET, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_AO,
+                                    MI_HDR, MI_FILTER, MI_VSYNC, MI_BRIGHT, MI_GAMMA, MI_CROP, MI_ANISO, MI_FPS, MI_LIMIT,
+                                    MI_UPSCALE, MI_FRAMEGEN, MI_RESET, MI_CLOSE };
+#define PAGE_ITEMS ((int)(sizeof k_page_items / sizeof k_page_items[0]))
+static int page_item(int row) { return row >= 0 && row < PAGE_ITEMS ? k_page_items[row] : MI_COUNT; }
+static int video_page_count(void) { return PAGE_ITEMS; }
 #else
 static int page_item(int row) { return row; }
 static int video_page_count(void) { return MI_COUNT; }
@@ -1058,6 +1068,9 @@ static int menu_rows(void) { int n = menu_page()->count(); return n > 0 ? n : 1;
  * the display; FSR, HDR10 output and ambient occlusion are Direct3D 12 only. */
 static const int k_vm_items[] = { MI_PRESET, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_FILTER,
                                   MI_BRIGHT, MI_GAMMA, MI_CROP, MI_ANISO, MI_FPS, MI_LIMIT };
+#elif defined(NFL2K5_UWP)
+static const int k_vm_items[] = { MI_PRESET, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_AO, MI_HDR, MI_FILTER, MI_VSYNC,
+                                  MI_BRIGHT, MI_GAMMA, MI_CROP, MI_ANISO, MI_FPS, MI_LIMIT, MI_UPSCALE, MI_FRAMEGEN };
 #else
 static const int k_vm_items[] = { MI_PRESET, MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_AO, MI_HDR, MI_FILTER, MI_VSYNC,
                                   MI_BRIGHT, MI_GAMMA, MI_CROP, MI_ANISO, MI_FPS, MI_LIMIT, MI_API, MI_UPSCALE, MI_FRAMEGEN };
