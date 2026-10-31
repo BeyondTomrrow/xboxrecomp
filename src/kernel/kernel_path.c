@@ -59,6 +59,12 @@ static const path_rule s_rules[] = {
      * (for enumeration) is covered too. */
     { "\\Device\\Harddisk0\\Partition1\\UDATA", 1, "\\UDATA",        "/UDATA"       },
     { "\\Device\\Harddisk0\\Partition1\\TDATA", 1, "\\TDATA",        "/TDATA"       },
+#ifdef NFL2K5_UWP
+    /* E:\CACHE (XOnline's LocalCacheNN.bin): written at boot, and a UWP app
+     * cannot write the game dir -- the title stopped after the intro movies
+     * (2026-10-31). With the saves there, in the X:/Y:/Z: cache folder. */
+    { "\\Device\\Harddisk0\\Partition1\\CACHE", 1, "\\Cache",        "/Cache"       },
+#endif
     { "\\Device\\Harddisk0\\Partition1\\",    0, NULL,         NULL          },
     /* The rest of the disk. Partition 0 is the whole raw device, 2 holds
      * system data, and 3-5 are the per-title caches behind X:, Y: and Z:.
