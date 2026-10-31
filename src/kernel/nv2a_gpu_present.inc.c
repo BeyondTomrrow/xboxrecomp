@@ -834,6 +834,7 @@ void (*g_xbox_fps_limit_changed)(void);
  * Saver: 1x internal resolution
  * and 30 FPS, applied over the saved settings without changing them. */
 volatile int g_xbox_battery_saver;             /* Options > Phone Settings (src/platform/android) */
+volatile int g_xbox_heat_level;                /* Android heat control: 1 = 1x, 2 = also 30 FPS */
 static int vs_battery_mode(void)
 {
     static int b = -1;
@@ -841,7 +842,7 @@ static int vs_battery_mode(void)
         const char *m = getenv("NFL2K5_GAME_MODE");
         b = m && !strcmp(m, "battery");
     }
-    return b || g_xbox_battery_saver;
+    return b || g_xbox_battery_saver || g_xbox_heat_level >= 2;
 }
 int xbox_VideoFpsLimit(void) { return vs_battery_mode() ? 30 : s_vs.fps_limit; }
 static void fps_limit_changed(void) { if (g_xbox_fps_limit_changed) g_xbox_fps_limit_changed(); }
@@ -1727,10 +1728,10 @@ static int pr_present(uint32_t guest)
         return 0;
     if (InterlockedExchange(&s_vs_dirty, 0))
         pr_apply_mode();
-    g_render_scale = vs_battery_mode() ? 1u : (uint32_t)s_vs.scale;     /* surfaces follow on their next use */
+    g_render_scale = vs_battery_mode() || g_xbox_heat_level ? 1u : (uint32_t)s_vs.scale;     /* surfaces follow on their next use */
     g_want_motion = ((s_vs.upscaler || s_vs.framegen) && gxs_fsr_available()) || env_cached("RECOMP_FORCE_MV");
     g_want_mv = g_want_motion || s_vs.ao > 0;   /* the depth copy also feeds ambient occlusion */
-    if (s_vs.dynres && !vs_battery_mode())
+    if (s_vs.dynres && !vs_battery_mode() && !g_xbox_heat_level)
         g_render_scale = pr_dynres_scale();
     g_gx_hdr_wanted = s_vs.hdr;                /* gx/gx_sdl.c switches the swap chain */
     if (env_cached("RECOMP_SCALE_CYCLE")) {
