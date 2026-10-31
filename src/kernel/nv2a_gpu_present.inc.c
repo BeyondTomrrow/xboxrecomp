@@ -830,8 +830,10 @@ static const int k_fps_limits[] = { 30, 60, 120, 0, -1 };
  * camera change. */
 void (*g_xbox_fps_limit_changed)(void);
 /* Android 12+ Game Mode "battery" (Samsung Game Booster's battery setting;
- * NFL2K5_GAME_MODE from android/app NFL2K5Activity): 1x internal resolution
+ * NFL2K5_GAME_MODE from android/app NFL2K5Activity) or the game's own Battery
+ * Saver: 1x internal resolution
  * and 30 FPS, applied over the saved settings without changing them. */
+volatile int g_xbox_battery_saver;             /* Options > Phone Settings (src/platform/android) */
 static int vs_battery_mode(void)
 {
     static int b = -1;
@@ -839,7 +841,7 @@ static int vs_battery_mode(void)
         const char *m = getenv("NFL2K5_GAME_MODE");
         b = m && !strcmp(m, "battery");
     }
-    return b;
+    return b || g_xbox_battery_saver;
 }
 int xbox_VideoFpsLimit(void) { return vs_battery_mode() ? 30 : s_vs.fps_limit; }
 static void fps_limit_changed(void) { if (g_xbox_fps_limit_changed) g_xbox_fps_limit_changed(); }

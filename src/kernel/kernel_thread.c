@@ -11,6 +11,9 @@
  *   - Thread priorities use NT KPRIORITY increments
  */
 
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 #include "kernel.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,6 +34,9 @@ typedef struct _XBOX_THREAD_START_INFO {
 
 static DWORD WINAPI xbox_thread_wrapper(LPVOID lpParameter)
 {
+#if defined(__linux__)
+    prctl(PR_SET_NAME, "guest", 0, 0, 0);   /* named in the Android [CPU] report */
+#endif
     XBOX_THREAD_START_INFO info = *(XBOX_THREAD_START_INFO*)lpParameter;
 
     /* Free the start info before calling the routine - the routine may

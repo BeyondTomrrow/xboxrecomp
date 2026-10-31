@@ -19,6 +19,9 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 #include "apu_state.h"
 #include "apu.h"
 #include "apu_xaudio2.h"
@@ -594,6 +597,9 @@ int64_t g_apu_stall_total_us;          /* ISR waits in all (the [APUSLOW] lines)
 
 static void *mcpx_apu_frame_thread(void *arg)
 {
+#if defined(__linux__)
+    prctl(PR_SET_NAME, "apu_frame", 0, 0, 0);   /* named in the Android [CPU] report */
+#endif
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
     /* Above the game's and the renderer's threads: the pipeline is short work
      * between waits, and a normal-priority audio thread lost 100-300 ms to busy

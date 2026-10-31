@@ -6,6 +6,9 @@
  * plus a trace of every register access, because what the driver does after
  * that decides how the rest gets built.
  */
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 #include "ohci.h"
 #include "../platform/mmio_decode.h"
 #include "../kernel/xbox_memory_layout.h"
@@ -763,6 +766,9 @@ static void ohci_reset(OhciController *hc, uint32_t base, int index)
  */
 static DWORD WINAPI ohci_thread(LPVOID unused)
 {
+#if defined(__linux__)
+    prctl(PR_SET_NAME, "usb_ohci", 0, 0, 0);   /* named in the Android [CPU] report */
+#endif
     /* This thread calls recompiled code, so it needs what any thread running
      * recompiled code needs: its own TIB. The guest register set is already
      * thread-local and the ISR gets a worker stack, but fs:[0] is the SEH

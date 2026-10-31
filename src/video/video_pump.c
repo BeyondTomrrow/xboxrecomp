@@ -11,6 +11,9 @@
  */
 #if defined(_WIN32)
 #define COBJMACROS
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
@@ -58,6 +61,9 @@ static HWND vp_create_window(void)
 
 static DWORD WINAPI vp_thread(LPVOID unused)
 {
+#if defined(__linux__)
+    prctl(PR_SET_NAME, "video_pump", 0, 0, 0);   /* named in the Android [CPU] report */
+#endif
     IDirect3D8 *d3d;
     IDirect3DDevice8 *dev = NULL;
     D3DPRESENT_PARAMETERS pp;

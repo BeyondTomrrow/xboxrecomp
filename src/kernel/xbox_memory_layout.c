@@ -15,6 +15,9 @@
  * 4. Set memory protection (read-only for .rdata)
  */
 
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 #include "xbox_memory_layout.h"
 #include "kernel.h"
 #include "recomp_icall_feedback.h"
@@ -1114,6 +1117,9 @@ static void pb_profile_sample(LONGLONG ticks)
 
 static DWORD WINAPI pb_exec_thread(LPVOID param)
 {
+#if defined(__linux__)
+    prctl(PR_SET_NAME, "pb_poll", 0, 0, 0);   /* named in the Android [CPU] report */
+#endif
     volatile uint32_t *regs = (volatile uint32_t *)param;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
         /* This poller only exists for titles/submission paths without a
@@ -1172,6 +1178,9 @@ volatile LONG64 g_pb_exec_qpc, g_pb_qwait_qpc, g_pb_capture_qpc;
 
 static DWORD WINAPI pb_async_thread(LPVOID param)
 {
+#if defined(__linux__)
+    prctl(PR_SET_NAME, "gpu_render", 0, 0, 0);   /* named in the Android [CPU] report */
+#endif
     extern void nv2a_pb_exec_linear(const uint32_t *b, uint32_t n);
     (void)param;
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
@@ -1324,6 +1333,9 @@ void xbox_Nv2aKick(void)
 
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
+#if defined(__linux__)
+    prctl(PR_SET_NAME, "nv2a_ack", 0, 0, 0);   /* named in the Android [CPU] report */
+#endif
     volatile uint32_t *regs = (volatile uint32_t *)param;
     /* Rest between polls when nothing needed acknowledging (2026-10-29).
      * Polling with Sleep(0) alone kept a whole CPU core busy for the whole

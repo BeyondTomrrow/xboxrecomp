@@ -25,6 +25,9 @@
  *   different parameter layouts (pointer vs value), so each needs its own bridge.
  */
 
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 #include "kernel.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
@@ -777,6 +780,9 @@ static void bridge_run_thread_inline(recomp_func_t fn, uint32_t ctx1,
 
 static DWORD WINAPI bridge_thread_main(LPVOID param)
 {
+#if defined(__linux__)
+    prctl(PR_SET_NAME, "xbox_bridge", 0, 0, 0);   /* named in the Android [CPU] report */
+#endif
     struct bridge_thread_start *s = (struct bridge_thread_start *)param;
     recomp_func_t fn = s->fn;
     uint32_t ctx1 = s->ctx1, ctx2 = s->ctx2;
@@ -2776,6 +2782,9 @@ static void bridge_KeInitializeTimerEx(void)
  */
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
+#if defined(__linux__)
+    prctl(PR_SET_NAME, "xbox_timer", 0, 0, 0);   /* named in the Android [CPU] report */
+#endif
     int slot = xbox_worker_stack_alloc();
 
     (void)unused;
