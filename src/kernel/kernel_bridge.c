@@ -1770,10 +1770,10 @@ static void bridge_KeWaitForSingleObject(void)
     HANDLE h;
 
     h = ke_shadow_lookup(object);
-    if (!h)
+    /* An untagged value in guest RAM is the dispatcher object's address, not a
+     * handle (bridge_resolve_handle would pass it through as one). */
+    if (!h && !(object >= 0x00010000u && object < XBOX_TOTAL_RAM))
         h = bridge_resolve_handle(object);
-    if (!h)
-        h = XBOX_TO_NATIVE(object);
 
     /* An infinite host wait must periodically return to guest context so host
      * timer completions can drain from the DPC queue. Finite guest timeouts
@@ -1786,6 +1786,15 @@ static void bridge_KeWaitForSingleObject(void)
         BRIDGE_MEM32(object + 4) != 0) {
         BRIDGE_MEM32(object + 4) = 0;
         g_eax = 0;
+        return;
+    }
+    /* No host object behind it: the wait used to go to the OS with the guest
+     * address as the handle and fail (WAIT_FAILED -> STATUS_UNSUCCESSFUL).
+     * Same result without the call -- a UWP process has strict handle checks,
+     * where an invalid handle ends the process (0xC0000008, 2026-10-31). */
+    if (!h) {
+        xbox_bridge_drain_guest_dpcs();   /* as the failed wait's loop did */
+        g_eax = (uint32_t)STATUS_UNSUCCESSFUL;
         return;
     }
     dpc_slice.QuadPart = -100000; /* 10 ms in 100 ns units */
