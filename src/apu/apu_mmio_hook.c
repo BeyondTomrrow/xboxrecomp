@@ -25,6 +25,10 @@ static int g_apu_mmio_decode_fail = 0;
 #if defined(_WIN32)
 #include <windows.h>
 #include "apu_env.h"
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#define __builtin_popcount(x) ((int)__popcnt(x))   /* GCC builtin; MSVC has none */
+#endif
 typedef PCONTEXT ApuCpuContext;
 
 static uint64_t *ctx_reg64(ApuCpuContext ctx, int reg)

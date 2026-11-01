@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "kernel_pack.h"
 
 typedef struct {
     uint64_t dst;
@@ -157,10 +158,16 @@ static HANDLE ovl_open(const WCHAR *path)
                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 }
 
-/* Positional read of exactly n bytes (zeros past the end). */
+/* Positional read of exactly n bytes (zeros past the end). A retail file can
+ * be in the data pack (kernel_pack.c). */
 static int pread_all(HANDLE h, void *buf, uint32_t n, uint64_t off)
 {
     uint8_t *p = (uint8_t *)buf;
+    uint32_t pgot;
+    if (xbox_pack_pread(h, buf, n, off, &pgot)) {
+        if (pgot < n) memset(p + pgot, 0, n - pgot);
+        return 1;
+    }
     while (n) {
         OVERLAPPED ov;
         DWORD got = 0;
@@ -193,6 +200,7 @@ static HANDLE ovl_base(uint32_t fi)
         WCHAR p[MAX_PATH];
         _snwprintf(p, MAX_PATH, L"%s\\%s", s_disc, f->rel);
         f->base = ovl_open(p);
+        if (f->base == INVALID_HANDLE_VALUE) f->base = xbox_pack_open(p);
     }
     return f->base;
 }

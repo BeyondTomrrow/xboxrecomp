@@ -16,6 +16,7 @@
 
 #define _GNU_SOURCE   /* FNM_CASEFOLD */
 #include "kernel.h"
+#include "kernel_pack.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -267,6 +268,15 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
             xbox_share_to_win32(ShareAccess), NULL,
             xbox_disposition_to_win32(CreateDisposition), flags_and_attrs, NULL);
+        /* The data folder packed into one .xbpak (kernel_pack.c): a file that
+         * is not on disk is read from the pack, when it holds it. */
+        if (h == INVALID_HANDLE_VALUE && xbox_pack_active() &&
+            (CreateDisposition == XBOX_FILE_OPEN || CreateDisposition == XBOX_FILE_OPEN_IF)) {
+            DWORD err = GetLastError();
+            HANDLE ph = xbox_pack_open(win_path);
+            if (ph != INVALID_HANDLE_VALUE) h = ph;
+            else SetLastError(err);
+        }
     }
 
     if (h == INVALID_HANDLE_VALUE) {
@@ -464,6 +474,16 @@ static NTSTATUS xbox_NtReadFile_impl(
             if (Event) SetEvent(Event);
             return STATUS_SUCCESS;
         }
+        if (xbox_pack_read(FileHandle, Buffer, Length, ByteOffset, &got)) {
+            IoStatusBlock->Information = got;
+            if (got == 0 && Length > 0) {
+                IoStatusBlock->Status = STATUS_END_OF_FILE;
+                return STATUS_END_OF_FILE;
+            }
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            if (Event) SetEvent(Event);
+            return STATUS_SUCCESS;
+        }
     }
 
     if (ByteOffset && ByteOffset->QuadPart >= 0) {
@@ -537,6 +557,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
         xbox_release_dir_context(Handle);
         xbox_overlay_detach(Handle);
+        xbox_pack_close(Handle);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
@@ -588,6 +609,8 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
             info->AllocationSize.QuadPart = ((LONGLONG)fi.nFileSizeHigh << 32) | fi.nFileSizeLow;
             info->AllocationSize.QuadPart = (info->AllocationSize.QuadPart + 4095) & ~4095LL;
             info->EndOfFile.QuadPart = ((LONGLONG)fi.nFileSizeHigh << 32) | fi.nFileSizeLow;
+            if (xbox_pack_size(FileHandle, &info->EndOfFile.QuadPart))
+                info->AllocationSize.QuadPart = (info->EndOfFile.QuadPart + 4095) & ~4095LL;
             if (xbox_overlay_size(FileHandle, &info->EndOfFile.QuadPart))
                 info->AllocationSize.QuadPart = (info->EndOfFile.QuadPart + 4095) & ~4095LL;
             info->NumberOfLinks = fi.nNumberOfLinks;
@@ -621,6 +644,7 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
             info->LastWriteTime.HighPart  = fi.ftLastWriteTime.dwHighDateTime;
             info->ChangeTime = info->LastWriteTime;
             info->EndOfFile.QuadPart = ((LONGLONG)fi.nFileSizeHigh << 32) | fi.nFileSizeLow;
+            xbox_pack_size(FileHandle, &info->EndOfFile.QuadPart);
             xbox_overlay_size(FileHandle, &info->EndOfFile.QuadPart);
             info->AllocationSize.QuadPart = (info->EndOfFile.QuadPart + 4095) & ~4095LL;
             info->FileAttributes = fi.dwFileAttributes;
@@ -860,9 +884,18 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
 
     if (!GetFileAttributesExW(win_path, GetFileExInfoStandard, &fad)) {
         DWORD err = GetLastError();
-        if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)
+        LONGLONG psize;
+        if (xbox_pack_path_size(win_path, &psize)) {
+            /* in the data pack (kernel_pack.c) */
+            memset(&fad, 0, sizeof fad);
+            fad.dwFileAttributes = FILE_ATTRIBUTE_READONLY;
+            fad.nFileSizeHigh = (DWORD)((ULONGLONG)psize >> 32);
+            fad.nFileSizeLow = (DWORD)psize;
+        } else if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
             return STATUS_OBJECT_NAME_NOT_FOUND;
-        return STATUS_UNSUCCESSFUL;
+        } else {
+            return STATUS_UNSUCCESSFUL;
+        }
     }
 
     FileInformation->CreationTime.LowPart    = fad.ftCreationTime.dwLowDateTime;

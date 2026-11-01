@@ -11,6 +11,7 @@ set(KERNEL_SOURCES
     kernel_memory.c
     kernel_file.c
     kernel_overlay.c
+    kernel_pack.c
     kernel_thread.c
     xbox_ggl.c
     kernel_sync.c
@@ -49,8 +50,22 @@ if(XBOXRECOMP_GX_PORTABLE AND NOT WIN32)
     list(APPEND KERNEL_SOURCES gx/gx_sdl.c gx/gx_glslang.cpp gx/gx_portable.c)
 endif()
 
+# Data packs (kernel_pack.c) decompress with zstd (BSD); the consuming project
+# vendors it. Without it, packs are not read.
+get_filename_component(_xbox_zstd_default "${CMAKE_CURRENT_SOURCE_DIR}/../../../zstd" ABSOLUTE)
+set(XBOXRECOMP_ZSTD_DIR "${_xbox_zstd_default}" CACHE PATH "zstd source folder (zstd.h, common/, decompress/)")
+if(WIN32 AND EXISTS "${XBOXRECOMP_ZSTD_DIR}/zstd.h")
+    file(GLOB _xbox_zstd_src "${XBOXRECOMP_ZSTD_DIR}/common/*.c" "${XBOXRECOMP_ZSTD_DIR}/decompress/*.c")
+    list(APPEND KERNEL_SOURCES ${_xbox_zstd_src})
+    set(_xbox_have_zstd ON)
+endif()
+
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
 target_link_libraries(xbox_kernel PUBLIC SDL3::SDL3)
+if(_xbox_have_zstd)
+    target_include_directories(xbox_kernel PRIVATE "${XBOXRECOMP_ZSTD_DIR}" "${XBOXRECOMP_ZSTD_DIR}/common")
+    target_compile_definitions(xbox_kernel PRIVATE XBOX_HAVE_ZSTD=1 ZSTD_DISABLE_ASM=1 ZSTD_MULTITHREAD=0)
+endif()
 if(XBOXRECOMP_GX_PORTABLE AND NOT WIN32)
     target_compile_definitions(xbox_kernel PRIVATE XBOX_GX_PORTABLE=1)
     target_include_directories(xbox_kernel PRIVATE ${XBOXRECOMP_DX_HEADERS} ${CMAKE_CURRENT_SOURCE_DIR}/gx/portable)
