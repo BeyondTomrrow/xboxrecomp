@@ -137,6 +137,13 @@ static struct {
     unsigned frames;
 } s_st;
 
+/* Time the render thread spent blocked on the GPU (submissions that wait for
+ * a free frame, swap-chain acquires), in microseconds since the start. The
+ * Android dynamic resolution reads it: phones give no GPU busy counter, and a
+ * GPU that is behind shows up here first. */
+static volatile LONGLONG s_gpu_wait_us;
+LONGLONG gxs_gpu_wait_total_us(void) { return s_gpu_wait_us; }
+
 static double qpc_ms(void)
 {
     static LARGE_INTEGER f;
@@ -2178,7 +2185,9 @@ static void flush_locked(int submit)
         GxFence *fence = NULL;
         double ts = qpc_ms();
         SDL_GPUFence *f = SDL_SubmitGPUCommandBufferAndAcquireFence(s_cb);
-        s_st.submit_ms += qpc_ms() - ts;
+        ts = qpc_ms() - ts;
+        s_st.submit_ms += ts;
+        InterlockedAdd64(&s_gpu_wait_us, (LONGLONG)(ts * 1000.0));
         s_st.submits++;
         s_cb = NULL;
         if (f) {
@@ -2650,7 +2659,9 @@ HRESULT gxs_IDXGISwapChain1_Present(void *s, UINT sync, UINT flags)
     {
         double ta = qpc_ms();
         if (!(s_cb && SDL_WaitAndAcquireGPUSwapchainTexture(s_cb, G.win, &sct, &w, &h))) sct = NULL;
-        s_st.acquire_ms += qpc_ms() - ta;
+        ta = qpc_ms() - ta;
+        s_st.acquire_ms += ta;
+        InterlockedAdd64(&s_gpu_wait_us, (LONGLONG)(ta * 1000.0));
     }
     if (sct) {
         GxTex *first = pair ? sw->bb2 : sw->bb;

@@ -14,8 +14,11 @@ int xbox_pack_active(void);
 /* What the pack left out (XBPAK_DROP_*), 0 without a pack. */
 unsigned xbox_pack_drop_flags(void);
 
+/* Handle-based reads. On POSIX hosts the Windows types come from kernel.h,
+ * included before this header; there the functions are stubs (no packs). */
 #if defined(_WIN32)
 #include <windows.h>
+#endif
 /* A handle reading the packed file a host path names, or INVALID_HANDLE_VALUE. */
 HANDLE xbox_pack_open(const WCHAR *win_path);
 void xbox_pack_close(HANDLE h);
@@ -25,7 +28,6 @@ int xbox_pack_pread(HANDLE h, void *buf, uint32_t len, uint64_t pos, uint32_t *g
 int xbox_pack_size(HANDLE h, LONGLONG *size);
 int xbox_pack_path_size(const WCHAR *win_path, LONGLONG *size);
 void xbox_pack_stats(char *buf, size_t n);
-#endif
 
 #ifdef __cplusplus
 }

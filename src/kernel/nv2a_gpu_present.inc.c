@@ -1,4 +1,4 @@
-/* ── Presentation and video settings (2026-09-26) ────────────────────────
+/* â”€â”€ Presentation and video settings (2026-09-26) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
  *
  * Included into nv2a_gpu_d3d11.inc.c.
  *
@@ -840,7 +840,7 @@ void (*g_xbox_fps_limit_changed)(void);
  * Saver: 1x internal resolution
  * and 30 FPS, applied over the saved settings without changing them. */
 volatile int g_xbox_battery_saver;             /* Options > Phone Settings (src/platform/android) */
-volatile int g_xbox_heat_level;                /* Android heat control: 1 = 1x, 2 = also 30 FPS */
+volatile int g_xbox_heat_level;                /* Android heat control: 1 = half the scale ceiling, 2 = 1x and 30 FPS */
 static int vs_battery_mode(void)
 {
     static int b = -1;
@@ -1488,7 +1488,7 @@ static void pr_build_overlay(void)
 static void pr_build_overlay(void) { }   /* GDI text: Windows only (Android has no F1 menu) */
 #endif
 
-/* ── Toast: a short banner in the bottom-left corner ──────────────────
+/* â”€â”€ Toast: a short banner in the bottom-left corner â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
  * xbox_PresentToast(header, line1, line2, ms): "NOW PLAYING" for the local
  * music library, drawn in the style of the game's own panels. Any thread may
  * call it; the presenter rebuilds the texture when the text changes. */
@@ -1731,11 +1731,24 @@ static int pr_present(uint32_t guest)
         return 0;
     if (InterlockedExchange(&s_vs_dirty, 0))
         pr_apply_mode();
+#ifdef __ANDROID__
+    g_render_scale = vs_battery_mode() ? 1u : (uint32_t)s_vs.scale;     /* surfaces follow on their next use */
+#else
     g_render_scale = vs_battery_mode() || g_xbox_heat_level ? 1u : (uint32_t)s_vs.scale;     /* surfaces follow on their next use */
+#endif
     g_want_motion = ((s_vs.upscaler || s_vs.framegen) && gxs_fsr_available()) || env_cached("RECOMP_FORCE_MV");
     g_want_mv = g_want_motion || s_vs.ao > 0;   /* the depth copy also feeds ambient occlusion */
+#ifdef __ANDROID__
+    /* Phones: always automatic (they heat up and slow down; a fixed scale
+     * cannot hold), with the chosen scale as the ceiling; Heat Control's
+     * first step halves that ceiling (pr_dynres_scale). NFL2K5_DYNRES=0 keeps
+     * the fixed scale for tests. */
+    if (!vs_battery_mode() && !(getenv("NFL2K5_DYNRES") && getenv("NFL2K5_DYNRES")[0] == '0'))
+        g_render_scale = pr_dynres_scale();
+#else
     if (s_vs.dynres && !vs_battery_mode() && !g_xbox_heat_level)
         g_render_scale = pr_dynres_scale();
+#endif
     g_gx_hdr_wanted = s_vs.hdr;                /* gx/gx_sdl.c switches the swap chain */
     if (env_cached("RECOMP_SCALE_CYCLE")) {
         /* test only: switch between 9x and 12x every N seconds (leak hunting) */
@@ -2034,6 +2047,81 @@ static int pr_present(uint32_t guest)
  * second to the next, and every step rebuilds the render targets, so going
  * up waits for four quiet readings in a row and for 10 s after a step down,
  * doubled (to 2 min) each time a step up had to be taken back. */
+#ifndef _WIN32
+/* Android and Linux (2026-11-01): no GPU busy counter here (s_gpuctr is Windows-only); phones (s_gpuctr never
+ * reads), so the desktop rules below never stepped down and a phone stayed at
+ * the chosen scale: an S22+ at 4x played at 23-35 FPS while the render thread
+ * waited 13-28 ms a frame for the GPU, and fell further as it heated up.
+ * Here the signal is that wait (gxs_gpu_wait_total_us: submissions that block
+ * for a free frame plus swap-chain acquires) and the frame time, both
+ * averaged over about a second. The chosen scale is the ceiling; Heat
+ * Control's first step halves it instead of dropping straight to 1x. */
+LONGLONG gxs_gpu_wait_total_us(void) __attribute__((weak));   /* gx/gx_sdl.c, when built in */
+extern volatile int g_xbox_heat_level;
+static uint32_t pr_dynres_scale(void)
+{
+    static uint32_t cur, learned = 16;
+    static LONGLONG win_t0, last_wait, last_down, last_up, last_step;
+    static float hold = 20.0f;
+    static unsigned frames, quiet;
+    static double wait_sum;
+    LARGE_INTEGER now;
+    LONGLONG w = gxs_gpu_wait_total_us ? gxs_gpu_wait_total_us() : 0;
+    float f = s_perf.freq.QuadPart ? (float)s_perf.freq.QuadPart : 1.0f;
+    float budget = 1000.0f / (xbox_VideoFpsLimit() == 30 ? 30.0f : 60.0f);
+    uint32_t top = (uint32_t)s_vs.scale;
+    if (g_xbox_heat_level >= 1 && top > 1) top = (top + 1) / 2;
+    if (top > learned) top = learned;
+    if (top < 1) top = 1;
+    QueryPerformanceCounter(&now);
+    if (!cur) { cur = top; win_t0 = now.QuadPart; last_wait = w; return cur; }
+    if (cur > top) {                                  /* the ceiling came down (heat, menu) */
+        cur = top;
+        last_step = last_down = now.QuadPart;
+        fprintf(stderr, "  [DYNRES] ceiling %ux (heat level %d)\n", cur, g_xbox_heat_level);
+        return cur;
+    }
+    wait_sum += (double)(w - last_wait) / 1000.0;
+    last_wait = w;
+    frames++;
+    if ((float)(now.QuadPart - win_t0) < f) return cur;   /* a one-second window */
+    {
+        float ft = (float)(now.QuadPart - win_t0) * 1000.0f / f / (float)frames;   /* ms per presented frame */
+        float gw = (float)(wait_sum / frames);                                      /* GPU wait per frame */
+        int settling = (float)(now.QuadPart - last_step) < 2.0f * f;              /* a rebuild hitch inflates both */
+        win_t0 = now.QuadPart;
+        frames = 0;
+        wait_sum = 0.0;
+        if (settling) return cur;
+        if (cur > 1 && ft > budget * 1.08f && gw > 3.0f) {
+            /* GPU-bound and late: one step to the size that fits (cost goes
+             * with the pixel count), at most halving */
+            uint32_t to = (uint32_t)((float)cur * sqrtf(budget / ft) * 0.95f);
+            if (to < cur / 2) to = cur / 2;
+            if (to >= cur) to = cur - 1;
+            if (to < 1) to = 1;
+            if (last_up && (float)(now.QuadPart - last_up) < 30.0f * f) {
+                hold = hold * 2.0f > 120.0f ? 120.0f : hold * 2.0f;   /* went up too far: wait longer */
+                if (cur - 1 < learned) learned = cur - 1 ? cur - 1 : 1;
+            }
+            cur = to;
+            last_step = last_down = now.QuadPart;
+            quiet = 0;
+            fprintf(stderr, "  [DYNRES] %.1f ms frames, GPU wait %.1f ms: internal resolution %ux\n", ft, gw, cur);
+        } else if (cur < top) {
+            /* on time with the GPU waiting almost never: room for one more step */
+            quiet = ft <= budget * 1.03f && gw < 1.0f ? quiet + 1 : 0;
+            if (quiet >= 6 && (float)(now.QuadPart - last_down) >= hold * f) {
+                cur++;
+                last_step = last_up = now.QuadPart;
+                quiet = 0;
+                fprintf(stderr, "  [DYNRES] %.1f ms frames, GPU wait %.1f ms: internal resolution %ux\n", ft, gw, cur);
+            }
+        }
+    }
+    return cur;
+}
+#else
 static uint32_t pr_dynres_scale(void)
 {
     static uint32_t cur;
@@ -2140,6 +2228,7 @@ static uint32_t pr_dynres_scale(void)
     }
     return cur;
 }
+#endif
 
 /* Frame-rate cap (video settings): hold each presented frame until its
  * slot on an even 1/limit grid. The guest lock is dropped for the wait so

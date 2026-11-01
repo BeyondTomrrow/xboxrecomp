@@ -13,6 +13,9 @@
  * loads (~50-90 ms each on a desktop CPU); dense data (audio, read at random
  * during play) is stored raw or in 256 KB blocks (~1 ms).
  */
+#if !defined(_WIN32)
+#include "kernel.h"          /* the Windows types the stubs below use */
+#endif
 #include "kernel_pack.h"
 
 #if defined(_WIN32) && defined(XBOX_HAVE_ZSTD)
@@ -369,7 +372,6 @@ void xbox_pack_stats(char *buf, size_t n)
 int xbox_pack_load(const char *game_dir) { (void)game_dir; return 0; }
 int xbox_pack_active(void) { return 0; }
 unsigned xbox_pack_drop_flags(void) { return 0; }
-#ifdef _WIN32
 HANDLE xbox_pack_open(const WCHAR *win_path) { (void)win_path; return INVALID_HANDLE_VALUE; }
 void xbox_pack_close(HANDLE h) { (void)h; }
 int xbox_pack_read(HANDLE h, void *buf, ULONG len, const LARGE_INTEGER *off, ULONG *got)
@@ -379,5 +381,4 @@ int xbox_pack_pread(HANDLE h, void *buf, uint32_t len, uint64_t pos, uint32_t *g
 int xbox_pack_size(HANDLE h, LONGLONG *size) { (void)h; (void)size; return 0; }
 int xbox_pack_path_size(const WCHAR *win_path, LONGLONG *size) { (void)win_path; (void)size; return 0; }
 void xbox_pack_stats(char *buf, size_t n) { if (n) buf[0] = 0; }
-#endif
 #endif
