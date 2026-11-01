@@ -371,11 +371,26 @@ void xbox_bridge_end_title_tick(void)
  * emit that pulse only at a bridge boundary already executing on the guest
  * thread.  This avoids corrupting TLS registers or the guest stack from a
  * Windows timer callback. */
+/* Set by a gen patch (BOOT_MOVIE_BEGIN/END, tools/apply-gen-patches.py)
+ * while the boot intro loop plays a movie. The pulse stays pending and runs
+ * once the movie ends: a frontend callback presents frames
+ * (sub_00028F40 -> sub_00028DE0) and, run on the scheduler thread beside the
+ * movie thread's own frame loop, left one of them spinning in BlockOnFence
+ * for good -- the intro froze on its first or fourth movie, on every
+ * renderer, depending on timing (2026-10-31). NFL2K5_MOVIE_SCHED=1 restores
+ * the old behaviour for comparison. */
+volatile long g_xbox_boot_movie_active;
+
 static void bridge_dispatch_scheduler_tick(void)
 {
     recomp_func_t scheduler;
     uint32_t save_eax, save_ecx, save_edx, save_esp;
     uint32_t save_ebx, save_esi, save_edi, save_ebp, save_seh_ebp;
+    static int movie_sched = -1;
+
+    if (movie_sched < 0) movie_sched = getenv("NFL2K5_MOVIE_SCHED") != NULL;
+    if (g_xbox_boot_movie_active && !movie_sched)
+        return;
 
     /* Do not consume the initial 16 ms slot before the title has populated
      * B04D20/B04D24.  Early boot drains DPCs too, but there is no work for
