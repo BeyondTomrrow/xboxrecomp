@@ -91,9 +91,21 @@ static inline uint64_t muldiv64(uint64_t a, uint32_t b, uint32_t c) {
     /* For our use case (timer math), overflow is unlikely */
     return (uint64_t)(((double)a * b) / c);
 }
-#else
+#elif defined(__SIZEOF_INT128__)
 static inline uint64_t muldiv64(uint64_t a, uint32_t b, uint32_t c) {
     return (uint64_t)(((unsigned __int128)a * b) / c);
+}
+#else
+/* 32-bit hosts (armv7): no __int128. Split a into 32-bit halves, as QEMU's
+ * own fallback does; exact while the quotient fits in 64 bits. */
+static inline uint64_t muldiv64(uint64_t a, uint32_t b, uint32_t c) {
+    uint64_t hi = (a >> 32) * b, lo = (a & 0xFFFFFFFFu) * (uint64_t)b;
+    uint64_t q_hi, r_hi;
+    hi += lo >> 32;
+    lo &= 0xFFFFFFFFu;
+    q_hi = hi / c;
+    r_hi = hi % c;
+    return (q_hi << 32) + (((r_hi << 32) | lo) / c);
 }
 #endif
 

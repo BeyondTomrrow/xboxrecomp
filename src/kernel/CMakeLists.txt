@@ -54,7 +54,7 @@ endif()
 # vendors it. Without it, packs are not read.
 get_filename_component(_xbox_zstd_default "${CMAKE_CURRENT_SOURCE_DIR}/../../../zstd" ABSOLUTE)
 set(XBOXRECOMP_ZSTD_DIR "${_xbox_zstd_default}" CACHE PATH "zstd source folder (zstd.h, common/, decompress/)")
-if(WIN32 AND EXISTS "${XBOXRECOMP_ZSTD_DIR}/zstd.h")
+if(EXISTS "${XBOXRECOMP_ZSTD_DIR}/zstd.h")
     file(GLOB _xbox_zstd_src "${XBOXRECOMP_ZSTD_DIR}/common/*.c" "${XBOXRECOMP_ZSTD_DIR}/decompress/*.c")
     list(APPEND KERNEL_SOURCES ${_xbox_zstd_src})
     set(_xbox_have_zstd ON)

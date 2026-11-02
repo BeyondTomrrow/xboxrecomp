@@ -15,7 +15,7 @@ int xbox_pack_active(void);
 unsigned xbox_pack_drop_flags(void);
 
 /* Handle-based reads. On POSIX hosts the Windows types come from kernel.h,
- * included before this header; there the functions are stubs (no packs). */
+ * included before this header (win32_compat). Stubs when built without zstd. */
 #if defined(_WIN32)
 #include <windows.h>
 #endif

@@ -14,18 +14,41 @@
  * during play) is stored raw or in 256 KB blocks (~1 ms).
  */
 #if !defined(_WIN32)
-#include "kernel.h"          /* the Windows types the stubs below use */
+#include "kernel.h"          /* the Windows types (win32_compat on POSIX hosts) */
 #endif
 #include "kernel_pack.h"
 
-#if defined(_WIN32) && defined(XBOX_HAVE_ZSTD)
+#if defined(XBOX_HAVE_ZSTD)
+#if defined(_WIN32)
 #include <windows.h>
+#else
+#include <unistd.h>          /* pread */
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "zstd.h"
 #include "xbpak_format.h"
+
+/* Paths here are Xbox-style WCHAR (16-bit) on every host; POSIX wchar_t is
+ * 32-bit, so the C library's wide string functions do not apply there. */
+static size_t w16len(const WCHAR *s) { size_t n = 0; while (s[n]) n++; return n; }
+static int w16icmp(const WCHAR *a, const WCHAR *b)
+{
+    for (;; a++, b++) {
+        WCHAR x = *a, y = *b;
+        if (x >= 'A' && x <= 'Z') x = (WCHAR)(x + 32);
+        if (y >= 'A' && y <= 'Z') y = (WCHAR)(y + 32);
+        if (x != y || !x) return (int)x - (int)y;
+    }
+}
+#ifndef _WIN32
+#define InterlockedIncrement64(p) InterlockedAdd64((p), 1)
+#ifndef FILE_FLAG_RANDOM_ACCESS
+#define FILE_FLAG_RANDOM_ACCESS 0x10000000u   /* a hint; win32_compat ignores it */
+#endif
+#endif
 
 typedef struct {
     WCHAR rel[64];                  /* "vc_53450030\3" */
@@ -66,13 +89,22 @@ static ULONGLONG s_load_ms;
 static int pread_all(HANDLE h, void *buf, uint32_t n, uint64_t off)
 {
     uint8_t *p = (uint8_t *)buf;
+#ifndef _WIN32
+    int fd = w32_handle_fd(h);
+    if (fd < 0) return 0;
+#endif
     while (n) {
+#ifdef _WIN32
         OVERLAPPED ov;
         DWORD got = 0;
         memset(&ov, 0, sizeof ov);
         ov.Offset = (DWORD)off; ov.OffsetHigh = (DWORD)(off >> 32);
         if (!ReadFile(h, p, n, &got, &ov) || !got) return 0;
-        p += got; n -= got; off += got;
+#else
+        ssize_t got = pread(fd, p, n, (off_t)off);   /* positional: threads share s_pak */
+        if (got <= 0) return 0;
+#endif
+        p += got; n -= (uint32_t)got; off += (uint64_t)got;
     }
     return 1;
 }
@@ -85,8 +117,10 @@ int xbox_pack_load(const char *game_dir)
     const char *mb = getenv("NFL2K5_XBPAK_CACHE_MB");
     if (s_pfiles) return 1;
     if (getenv("NFL2K5_NO_XBPAK")) return 0;
-    snprintf(path, sizeof path, "%s\\vc_53450030.xbpak", game_dir);
+    snprintf(path, sizeof path, "%s/vc_53450030.xbpak", game_dir);
+#ifdef _WIN32
     for (char *c = path; *c; c++) if (*c == '/') *c = '\\';
+#endif
     MultiByteToWideChar(CP_UTF8, 0, path, -1, s_pak_path, MAX_PATH);
     s_pak = CreateFileW(s_pak_path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS, NULL);
     if (s_pak == INVALID_HANDLE_VALUE) return 0;
@@ -109,22 +143,27 @@ int xbox_pack_load(const char *game_dir)
         uint32_t nd;
         char name[64];
         if (q + 2 > end) goto bad;
-        nl = *(uint16_t *)q; q += 2;
+        /* memcpy: the index is packed, and 32-bit ARM faults on unaligned
+         * 64-bit loads */
+        memcpy(&nl, q, 2); q += 2;
         if (nl >= sizeof name || q + nl + 32 > end) goto bad;
         memcpy(name, q, nl); name[nl] = 0; q += nl;
         for (char *c = name; *c; c++) if (*c == '/') *c = '\\';
         MultiByteToWideChar(CP_UTF8, 0, name, -1, s_pfiles[i].rel, 64);
-        s_pfiles[i].size = *(uint64_t *)q; q += 8;
+        memcpy(&s_pfiles[i].size, q, 8); q += 8;
         q += 8;                                         /* xxh64: checked by the tool */
-        s_pfiles[i].first_block = *(uint32_t *)q; q += 4;
-        s_pfiles[i].nblocks = *(uint32_t *)q; q += 4;
-        nd = *(uint32_t *)q; q += 4;
+        memcpy(&s_pfiles[i].first_block, q, 4); q += 4;
+        memcpy(&s_pfiles[i].nblocks, q, 4); q += 4;
+        memcpy(&nd, q, 4); q += 4;
         if (q + (size_t)nd * 20 > end) goto bad;
         q += (size_t)nd * 20;                           /* dropped ranges: the header flags say what */
         if ((uint64_t)s_pfiles[i].first_block + s_pfiles[i].nblocks > s_hdr.nblocks) goto bad;
     }
     if (q + (size_t)s_hdr.nblocks * sizeof(XbpakBlock) > end) goto bad;
-    s_blocks = (XbpakBlock *)q;
+    /* an aligned copy (see above); the index buffer itself stays allocated */
+    s_blocks = (XbpakBlock *)malloc((size_t)s_hdr.nblocks * sizeof(XbpakBlock));
+    if (!s_blocks) goto bad;
+    memcpy(s_blocks, q, (size_t)s_hdr.nblocks * sizeof(XbpakBlock));
     s_drop_flags = s_hdr.drop_flags;
     /* 256 MB: sixteen 16 MB regions. At 96 MB a game's scene loads unpacked
      * almost half their regions twice (63 unpacks of 35 regions, PC test). */
@@ -159,11 +198,22 @@ static int pak_find(const WCHAR *win_path)
     size_t lp;
     uint32_t i;
     if (!s_pfiles || !win_path) return -1;
-    lp = wcslen(win_path);
+    lp = w16len(win_path);
     for (i = 0; i < s_hdr.nfiles; i++) {
-        size_t lr = wcslen(s_pfiles[i].rel);
-        if (lp > lr && (win_path[lp - lr - 1] == L'\\' || win_path[lp - lr - 1] == L'/')
-                && !_wcsicmp(win_path + lp - lr, s_pfiles[i].rel))
+        size_t lr = w16len(s_pfiles[i].rel);
+        size_t k;
+        int same = lp > lr && (win_path[lp - lr - 1] == '\\' || win_path[lp - lr - 1] == '/');
+        /* "vc_53450030\3" also matches ".../vc_53450030/3" on POSIX hosts */
+        for (k = 0; same && k < lr; k++) {
+            WCHAR a = win_path[lp - lr + k], b = s_pfiles[i].rel[k];
+            if (a == '/') a = '\\';
+            if (b == '/') b = '\\';
+            if (a != b) {
+                WCHAR one[2] = { a, 0 }, two[2] = { b, 0 };
+                same = !w16icmp(one, two);
+            }
+        }
+        if (same)
             return (int)i;
     }
     return -1;
@@ -368,7 +418,7 @@ void xbox_pack_stats(char *buf, size_t n)
              s_cache_bytes / 1048576.0);
 }
 #else
-/* No packs on this host (POSIX hosts, or built without zstd). */
+/* No packs: built without zstd. */
 int xbox_pack_load(const char *game_dir) { (void)game_dir; return 0; }
 int xbox_pack_active(void) { return 0; }
 unsigned xbox_pack_drop_flags(void) { return 0; }
