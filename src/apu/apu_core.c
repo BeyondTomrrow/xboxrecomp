@@ -595,6 +595,8 @@ unsigned g_apu_dg_stall_n, g_apu_dg_silent_vp;
 unsigned long g_apu_silent_vp_total;   /* the same, never reset (RECOMP_APU_PITCH_LOG) */
 int64_t g_apu_stall_total_us;          /* ISR waits in all (the [APUSLOW] lines) */
 
+static void apu_let_writers_in(MCPXAPUState *d);
+
 static void *mcpx_apu_frame_thread(void *arg)
 {
 #if defined(__linux__)
@@ -714,6 +716,7 @@ static void *mcpx_apu_frame_thread(void *arg)
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
         }
+        apu_let_writers_in(d);
     }
 
     qemu_mutex_unlock(&d->lock);
@@ -871,29 +874,145 @@ void mcpx_apu_dispatch_mmio(MCPXAPUState *d, hwaddr addr, uint64_t val,
  * addr is offset from APU base (0xFE800000)
  * ============================================================ */
 
+static void apu_q_flush_for_read(MCPXAPUState *d);
+
 uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
 {
     if (!d) return 0;
     if (addr >= 0x20000 && addr < 0x30000) {
         return mcpx_apu_vp_read(d, addr - 0x20000, size);
     } else if (addr < 0x20000) {
+        apu_q_flush_for_read(d);   /* queued voice commands first (mcpx_apu_mmio_write) */
         return mcpx_apu_read(d, (hwaddr)addr, size);
     }
     return 0;
 }
 
+/* Voice commands (the VP method FIFO, 0x20000-0x2FFFF) from the title's
+ * threads. The frame thread processes voices holding d->lock for bursts of
+ * up to 8 pipeline frames, so a write used to wait for the rest of the burst:
+ * in SOFTDRINK play DirectSound sends 20-50 thousand of them a second, the
+ * game thread spent up to a third of its time waiting for the lock and frames
+ * ran late (2026-11-02). Now a writer that finds the lock taken queues the
+ * command and goes on; whoever holds the lock next runs the queue first --
+ * the frame thread between frames, or the next writer. Commands still never
+ * land mid-frame and still run in order. Main-register writes (interrupts,
+ * control) stay synchronous, and run the queue first. RECOMP_APU_SYNC_WRITES=1
+ * makes every write wait for the lock again. */
+typedef struct { uint32_t addr, val, size; } ApuQueued;
+#define APU_QUEUE_LEN 16384u
+static ApuQueued g_apu_q[APU_QUEUE_LEN];
+static volatile LONG g_apu_q_head, g_apu_q_tail;    /* head: next to run; tail: next free */
+static CRITICAL_SECTION g_apu_q_cs;
+static volatile LONG g_apu_q_init;
+static volatile LONGLONG g_apu_mmio_wait_us, g_apu_mmio_writes, g_apu_mmio_queued, g_apu_mmio_slow, g_apu_mmio_full, g_apu_read_flush_us;
+
+static void apu_q_init(void)
+{
+    if (g_apu_q_init == 2) return;
+    if (InterlockedCompareExchange(&g_apu_q_init, 1, 0) == 0) {
+        InitializeCriticalSection(&g_apu_q_cs);
+        InterlockedExchange(&g_apu_q_init, 2);
+    }
+    while (g_apu_q_init != 2) SwitchToThread();
+}
+
+/* Run the queued commands. The caller holds d->lock. */
+static void apu_q_drain(MCPXAPUState *d)
+{
+    ApuQueued batch[256];
+    if (g_apu_q_init != 2 || g_apu_q_head == g_apu_q_tail) return;
+    for (;;) {
+        unsigned n = 0;
+        EnterCriticalSection(&g_apu_q_cs);
+        while (n < 256 && g_apu_q_head != g_apu_q_tail) {
+            batch[n++] = g_apu_q[g_apu_q_head];
+            g_apu_q_head = (g_apu_q_head + 1) & (APU_QUEUE_LEN - 1);
+        }
+        LeaveCriticalSection(&g_apu_q_cs);
+        if (!n) return;
+        for (unsigned i = 0; i < n; i++)
+            mcpx_apu_dispatch_mmio(d, (hwaddr)batch[i].addr, batch[i].val, batch[i].size, true);
+    }
+}
+
 void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned int size)
 {
+    static int sync = -1;
+    LARGE_INTEGER a, b, f;
     if (!d) return;
+    if (sync < 0) sync = getenv("RECOMP_APU_SYNC_WRITES") != NULL;
+    apu_q_init();
+    InterlockedAdd64(&g_apu_mmio_writes, 1);
+    if (!sync && addr >= 0x20000 && addr < 0x30000) {
+        if (TryEnterCriticalSection(&d->lock.cs)) {
+            apu_q_drain(d);
+            mcpx_apu_dispatch_mmio(d, (hwaddr)addr, val, size, true);
+            qemu_mutex_unlock(&d->lock);
+            return;
+        }
+        EnterCriticalSection(&g_apu_q_cs);
+        if (((g_apu_q_tail + 1) & (APU_QUEUE_LEN - 1)) != g_apu_q_head) {
+            ApuQueued *e = &g_apu_q[g_apu_q_tail];
+            e->addr = (uint32_t)addr; e->val = (uint32_t)val; e->size = size;
+            g_apu_q_tail = (g_apu_q_tail + 1) & (APU_QUEUE_LEN - 1);
+            LeaveCriticalSection(&g_apu_q_cs);
+            InterlockedAdd64(&g_apu_mmio_queued, 1);
+            return;
+        }
+        LeaveCriticalSection(&g_apu_q_cs);   /* full: wait for the lock below */
+        InterlockedAdd64(&g_apu_mmio_full, 1);
+    }
     /* Serialise with the frame thread, which processes voices holding
      * d->lock (as xemu does). Unlocked, the title's voice commands (set
      * position, start, pause/resume, buffer pointers) landed mid-frame and
      * were overwritten by the voice processor: NFL 2K5's music streamer saw
      * its positions jump and restarted the song every 1-5 s, and announcer
      * lines were cut (2026-10-01). The lock is a recursive critical section. */
+    QueryPerformanceCounter(&a);
     qemu_mutex_lock(&d->lock);
+    QueryPerformanceCounter(&b);
+    QueryPerformanceFrequency(&f);
+    {
+        LONGLONG us = (b.QuadPart - a.QuadPart) * 1000000 / f.QuadPart;
+        InterlockedAdd64(&g_apu_mmio_wait_us, us);
+        if (us > 1000) InterlockedAdd64(&g_apu_mmio_slow, 1);
+    }
+    apu_q_drain(d);
     mcpx_apu_dispatch_mmio(d, (hwaddr)addr, val, size, true);
     qemu_mutex_unlock(&d->lock);
+}
+
+/* Frame thread, holding d->lock between pipeline frames. */
+static void apu_let_writers_in(MCPXAPUState *d)
+{
+    apu_q_drain(d);
+}
+
+/* A main-register read after queued voice commands sees their effects. */
+static void apu_q_flush_for_read(MCPXAPUState *d)
+{
+    LARGE_INTEGER a, b, f;
+    if (g_apu_q_init != 2 || g_apu_q_head == g_apu_q_tail) return;
+    QueryPerformanceCounter(&a);
+    qemu_mutex_lock(&d->lock);
+    apu_q_drain(d);
+    qemu_mutex_unlock(&d->lock);
+    QueryPerformanceCounter(&b);
+    QueryPerformanceFrequency(&f);
+    InterlockedAdd64(&g_apu_read_flush_us, (b.QuadPart - a.QuadPart) * 1000000 / f.QuadPart);
+}
+
+void mcpx_apu_lock_report(void)
+{
+    static LONGLONG w0, n0, s0, q0, f0, r0;
+    LONGLONG w = g_apu_mmio_wait_us, n = g_apu_mmio_writes, s = g_apu_mmio_slow, q = g_apu_mmio_queued;
+    LONGLONG fu = g_apu_mmio_full, r = g_apu_read_flush_us;
+    fprintf(stderr, "[APULOCK] %lld register writes (%lld queued, %lld with the queue full), waited %.1f ms in all "
+            "for the APU lock (%lld over 1 ms), reads waited %.1f ms\n",
+            (long long)(n - n0), (long long)(q - q0), (long long)(fu - f0), (w - w0) / 1000.0,
+            (long long)(s - s0), (r - r0) / 1000.0);
+    w0 = w; n0 = n; s0 = s; q0 = q; f0 = fu; r0 = r;
 }
 
 /* ============================================================

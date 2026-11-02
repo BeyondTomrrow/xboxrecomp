@@ -537,6 +537,10 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
         if (now - last >= 10000) {
             fprintf(stderr, "[AUDIO] submits=%lu dropped=%lu underruns=%lu low_queue=%lu submit_failures=%lu queued_ms=%.1f\n",
                     subs, drops, starves, low_queue, g_xa2_submit_failures, qframes / 48.0);
+            {
+                extern void mcpx_apu_lock_report(void);   /* apu_core.c */
+                mcpx_apu_lock_report();
+            }
             last = now;
         }
     }
