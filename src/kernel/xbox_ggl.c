@@ -168,6 +168,9 @@ static LONGLONG qpc_now(void)
     return v.QuadPart;
 }
 
+/* Set by the interpreter: prints the guest address it is running. */
+void (*g_ggl_stall_report)(void);
+
 static DWORD WINAPI ggl_watchdog(LPVOID unused)
 {
     DWORD reported = 0;
@@ -199,6 +202,7 @@ static DWORD WINAPI ggl_watchdog(LPVOID unused)
                             g_owner, g_waiters, g_best_waiting_prio, g_owner_last_site);
                     fflush(stderr);
                     if (g_owner) ggl_report_owner_pc(g_owner);
+                    if (g_ggl_stall_report) g_ggl_stall_report();
                     WakeAllConditionVariable(&g_turn);
                 }
             } else {
