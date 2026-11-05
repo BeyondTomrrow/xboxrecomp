@@ -101,6 +101,8 @@ static unsigned fb_scancode_to_vk(SDL_Scancode sc) {
         case SDL_SCANCODE_UP: return 0x26u;
         case SDL_SCANCODE_RIGHT: return 0x27u;
         case SDL_SCANCODE_DOWN: return 0x28u;
+        case SDL_SCANCODE_PAGEUP: return 0x21u;
+        case SDL_SCANCODE_PAGEDOWN: return 0x22u;
         default: return 0u;
     }
 }
