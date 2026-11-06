@@ -1041,6 +1041,13 @@ static const int k_page_items[] = { MI_PRESET, MI_WIDE, MI_ASPECT, MI_SCALE, MI_
 #define PAGE_ITEMS ((int)(sizeof k_page_items / sizeof k_page_items[0]))
 static int page_item(int row) { return row >= 0 && row < PAGE_ITEMS ? k_page_items[row] : MI_COUNT; }
 static int video_page_count(void) { return PAGE_ITEMS; }
+#elif defined(XBOX_GX_PORTABLE)
+/* Desktop Linux: one graphics API (Vulkan); FSR and HDR10 output are not built. */
+static const int k_page_items[] = { MI_PRESET, MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_AO,
+                                    MI_FILTER, MI_VSYNC, MI_BRIGHT, MI_GAMMA, MI_CROP, MI_ANISO, MI_FPS, MI_LIMIT, MI_RESET, MI_CLOSE };
+#define PAGE_ITEMS ((int)(sizeof k_page_items / sizeof k_page_items[0]))
+static int page_item(int row) { return row >= 0 && row < PAGE_ITEMS ? k_page_items[row] : MI_COUNT; }
+static int video_page_count(void) { return PAGE_ITEMS; }
 #else
 static int page_item(int row) { return row; }
 static int video_page_count(void) { return MI_COUNT; }
@@ -1072,6 +1079,9 @@ static const int k_vm_items[] = { MI_PRESET, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DY
 #elif defined(NFL2K5_UWP)
 static const int k_vm_items[] = { MI_PRESET, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_AO, MI_HDR, MI_FILTER, MI_VSYNC,
                                   MI_BRIGHT, MI_GAMMA, MI_CROP, MI_ANISO, MI_FPS, MI_LIMIT, MI_UPSCALE, MI_FRAMEGEN };
+#elif defined(XBOX_GX_PORTABLE)
+static const int k_vm_items[] = { MI_PRESET, MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_AO, MI_FILTER, MI_VSYNC,
+                                  MI_BRIGHT, MI_GAMMA, MI_CROP, MI_ANISO, MI_FPS, MI_LIMIT };
 #else
 static const int k_vm_items[] = { MI_PRESET, MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_AO, MI_HDR, MI_FILTER, MI_VSYNC,
                                   MI_BRIGHT, MI_GAMMA, MI_CROP, MI_ANISO, MI_FPS, MI_LIMIT, MI_API, MI_UPSCALE, MI_FRAMEGEN };
@@ -1271,6 +1281,9 @@ void xbox_VideoSettingsLoad(void)
 #ifdef __ANDROID__
         /* not offered on a phone (see k_vm_items) */
         s_vs.vsync = 1; s_vs.hdr = 0; s_vs.ao = 0; s_vs.upscaler = 0; s_vs.framegen = 0; s_vs.renderer = 1;
+#elif defined(XBOX_GX_PORTABLE)
+        /* not offered on Linux (see k_vm_items); an ini copied from Windows may ask */
+        s_vs.hdr = 0; s_vs.upscaler = 0; s_vs.framegen = 0; s_vs.renderer = 1;
 #endif
         res_build();
     }
