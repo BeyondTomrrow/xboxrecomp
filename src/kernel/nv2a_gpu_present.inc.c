@@ -1217,7 +1217,11 @@ void xbox_VideoSettingValueName(int i, int idx, char *buf, size_t n)
     case MI_MODE:   snprintf(buf, n, "%s", modes[v.mode % 3]); break;
     case MI_RES:    snprintf(buf, n, "%d x %d", v.res_w, v.res_h); break;
     case MI_ASPECT: snprintf(buf, n, "%s", aspects[v.aspect % 6]); break;
-    case MI_SCALE:  snprintf(buf, n, "%dx (%d x %d)", v.scale, 720 * v.scale, 480 * v.scale); break;
+    case MI_SCALE:
+        if (vs_scale_forced_low())
+            snprintf(buf, n, "%dx, now 1x: %s", v.scale, g_xbox_battery_saver ? "Battery Saver on" : "Heat Control");
+        else snprintf(buf, n, "%dx (%d x %d)", v.scale, 720 * v.scale, 480 * v.scale);
+        break;
     case MI_LIGHTING: snprintf(buf, n, "%s", lighting[v.lighting % 3]); break;
     case MI_POST:   snprintf(buf, n, "%s", k_post_presets[v.post % POST_PRESETS].name); break;
     case MI_SHARPEN: snprintf(buf, n, "%s", k_sharpen_names[v.sharpen & 3]); break;
@@ -1752,6 +1756,15 @@ static int pr_present(uint32_t guest)
         pr_apply_mode();
 #ifdef __ANDROID__
     g_render_scale = vs_scale_forced_low() ? 1u : (uint32_t)s_vs.scale;     /* surfaces follow on their next use */
+    {   /* never silently: a log line, and the frame limit applied at once (at
+         * start it only took effect at the next settings change) */
+        static int forced = -1;
+        if (forced != vs_scale_forced_low()) {
+            forced = vs_scale_forced_low();
+            if (forced) fprintf(stderr, "  [VIDEO] resolution held at 1x by %s\n", g_xbox_battery_saver ? "Battery Saver" : "Heat Control");
+            fps_limit_changed();
+        }
+    }
     if (g_render_scale > 1 && g_xbox_heat_level >= 1) g_render_scale = (g_render_scale + 1) / 2;   /* Heat Control is on */
 #else
     g_render_scale = vs_battery_mode() || g_xbox_heat_level ? 1u : (uint32_t)s_vs.scale;     /* surfaces follow on their next use */
@@ -2099,6 +2112,13 @@ static uint32_t pr_dynres_scale(void)
     if (top < 1) top = 1;
     QueryPerformanceCounter(&now);
     if (!cur) { cur = top; win_t0 = now.QuadPart; last_wait = w; return cur; }
+    {   /* no step during a boot movie: a step rebuilds the render targets on screen */
+        extern volatile long g_xbox_boot_movie_active;
+        if (g_xbox_boot_movie_active) {
+            win_t0 = now.QuadPart; last_wait = w; frames = 0; wait_sum = 0.0; slow = quiet = 0;
+            return cur;
+        }
+    }
     if (cur > top) {                                  /* the ceiling came down (heat, menu) */
         cur = top;
         last_step = last_down = now.QuadPart;
@@ -2426,9 +2446,35 @@ static void pr_luma(void)
     ID3D11Texture2D *bb = NULL;
     D3D11_TEXTURE2D_DESC td;
     int i;
-    if (off < 0) off = !(getenv("NFL2K5_PRESENT_LUMA") && *getenv("NFL2K5_PRESENT_LUMA"));
+    /* Android, without the variable: the boot movies only, into intro-luma.csv
+     * and a few intro-luma-*.bmp in the game folder, with a summary line in the
+     * log. The flash can only be measured where it is seen. */
+    static int movie_only, idle, shown, dark, dark_run, dark_longest, dark_blinks, jumps, repeats;
+    static uint32_t last_hash;
+    static char auto_prefix[MAX_PATH];
+    int save_limit;
+    if (off < 0) {
+        off = !(getenv("NFL2K5_PRESENT_LUMA") && *getenv("NFL2K5_PRESENT_LUMA"));
+#ifdef __ANDROID__
+        if (off) { off = 0; movie_only = 1; xbox_user_path("intro-luma", auto_prefix, sizeof auto_prefix); }
+#endif
+    }
     if (off) return;
-    prefix = getenv("NFL2K5_PRESENT_LUMA");
+    save_limit = movie_only ? 12 : 80;
+    if (movie_only) {
+        idle = g_xbox_boot_movie_active ? 0 : idle + 1;
+        if (!shown && !g_xbox_boot_movie_active) return;   /* the movies have not started */
+        if (idle > 600) {                                  /* ten seconds past the last one: done */
+            fprintf(stderr, "[MOVIE-STATS] on screen: %d frames, %d dark, %d dark flashes (runs of 6 or less), longest dark run %d, "
+                    "%d sudden brightness changes, %d repeated frames\n", shown, dark, dark_blinks, dark_longest, jumps, repeats);
+            if (csv) { fclose(csv); csv = NULL; }
+            for (i = 0; i < 3; i++) { if (ring[i]) ID3D11Texture2D_Release(ring[i]); ring[i] = NULL; }
+            free(prev); prev = NULL;
+            off = 1;
+            return;
+        }
+    }
+    prefix = movie_only ? auto_prefix : getenv("NFL2K5_PRESENT_LUMA");
     if (FAILED(IDXGISwapChain1_GetBuffer(s_pr.sc, 0, &IID_ID3D11Texture2D, (void **)&bb)))
         return;
     ID3D11Texture2D_GetDesc(bb, &td);
@@ -2480,14 +2526,25 @@ static void pr_luma(void)
                         stamp[slot], mean, n ? 100.0 * black / n : 0.0, hash, stamp_draws[slot], (int)g_xbox_boot_movie_active);
                 if ((stamp[slot] & 63) == 0) fflush(csv);
             }
-            if (last_mean >= 0.0 && fabs(mean - last_mean) > 12.0 && saved < 80) {
+            shown++;
+            if (n && black * 100u >= n * 90u) {
+                dark++; dark_run++;
+                if (dark_run > dark_longest) dark_longest = dark_run;
+            } else {
+                if (dark_run && dark_run <= 6) dark_blinks++;
+                dark_run = 0;
+            }
+            if (last_mean >= 0.0 && fabs(mean - last_mean) > 12.0) jumps++;
+            if (hash == last_hash) repeats++;
+            last_hash = hash;
+            if (last_mean >= 0.0 && fabs(mean - last_mean) > 12.0 && saved < save_limit) {
                 if (prev) pr_luma_bmp(prefix, prev_frame, prev, prev_pitch, rw, rh);
                 pr_luma_bmp(prefix, stamp[slot], d, m.RowPitch, rw, rh);
                 saved++;
             }
             last_mean = mean;
             if (!prev || prev_pitch != m.RowPitch) { free(prev); prev = (uint8_t *)malloc((size_t)m.RowPitch * rh); prev_pitch = m.RowPitch; }
-            if (prev && saved < 80) memcpy(prev, d, (size_t)m.RowPitch * rh);
+            if (prev && saved < save_limit) memcpy(prev, d, (size_t)m.RowPitch * rh);
             prev_frame = stamp[slot];
             ID3D11DeviceContext_Unmap(s_gpu11.ctx, (ID3D11Resource *)ring[slot], 0);
         }
