@@ -35,7 +35,11 @@ static inline uint64_t gx_portable_ticks(void)
 
 
 /* Win32 calls the renderer makes that the platform layer does not have */
+#if defined(__x86_64__) || defined(__i386__)
+#define YieldProcessor() __asm__ __volatile__("pause")
+#else
 #define YieldProcessor() __asm__ __volatile__("yield")
+#endif
 BOOL CreateDirectoryA(LPCSTR path, void *sa);
 typedef struct { DWORD dwNumberOfProcessors; } SYSTEM_INFO;
 void GetSystemInfo(SYSTEM_INFO *si);
