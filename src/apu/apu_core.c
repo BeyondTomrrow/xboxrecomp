@@ -78,6 +78,32 @@ int mcpx_apu_irq_line(void) { return g_apu_irq_line != 0; }
  * voice went idle (2026-10-01). */
 void (*g_apu_irq_wake)(void);
 
+/* How long a notifier waits for the line, and the line for the title's ISR to
+ * acknowledge it ([APULOCK] report). DirectSound's Stop spins on the game
+ * thread until that acknowledgement, so these are game-thread milliseconds. */
+volatile int64_t g_apu_irq_note_us;      /* when the pending notifier was raised (apu_vp.c) */
+static int64_t g_apu_irq_line_us;
+static volatile LONGLONG g_apu_note_n, g_apu_note_sum_us, g_apu_note_max_us, g_apu_ack_n, g_apu_ack_sum_us, g_apu_ack_max_us;
+
+/* RECOMP_APU_TRACE=<file>: QPC-stamped voice-stop events, to join with a
+ * stack sampler's timeline. */
+void apu_tr(char c, unsigned v)
+{
+    static int on = -1;
+    static FILE *f;
+    static unsigned n;
+    LARGE_INTEGER q;
+    if (on < 0) {
+        const char *p = getenv("RECOMP_APU_TRACE");
+        f = p ? fopen(p, "w") : NULL;
+        on = f != NULL;
+    }
+    if (!on) return;
+    QueryPerformanceCounter(&q);
+    fprintf(f, "%lld %c %x\n", (long long)q.QuadPart, c, v);
+    if ((++n & 255) == 0) fflush(f);
+}
+
 static void update_irq(MCPXAPUState *d)
 {
     if (d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
@@ -89,11 +115,42 @@ static void update_irq(MCPXAPUState *d)
         qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_GINTSTS);
         /* In standalone mode we don't raise a PCI IRQ; the game's kernel
          * stub will poll ISTS directly or we'll signal via a flag. */
-        if (InterlockedExchange(&g_apu_irq_line, 1) == 0 && g_apu_irq_wake)
-            g_apu_irq_wake();   /* run the title's ISR now, not at the next poll */
+        if (InterlockedExchange(&g_apu_irq_line, 1) == 0) {
+            int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+            g_apu_irq_line_us = now;
+            apu_tr('L', d->regs[NV_PAPU_ISTS]);
+            if (g_apu_irq_note_us) {
+                int64_t w = now - g_apu_irq_note_us;
+                g_apu_note_n++; g_apu_note_sum_us += w;
+                if (w > g_apu_note_max_us) g_apu_note_max_us = w;
+            }
+            if (g_apu_irq_wake)
+                g_apu_irq_wake();   /* run the title's ISR now, not at the next poll */
+        }
+        g_apu_irq_note_us = 0;
     } else {
         qatomic_and(&d->regs[NV_PAPU_ISTS], ~NV_PAPU_ISTS_GINTSTS);
-        InterlockedExchange(&g_apu_irq_line, 0);
+        if (InterlockedExchange(&g_apu_irq_line, 0) != 0) {
+            int64_t w = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - g_apu_irq_line_us;
+            apu_tr('A', 0);
+            g_apu_ack_n++; g_apu_ack_sum_us += w;
+            if (w > g_apu_ack_max_us) g_apu_ack_max_us = w;
+        }
+    }
+}
+
+/* A title write (or a queued one) that trapped the front end for a stopped
+ * voice raises the line at once (apu_vp.c: voice_idle_now). Other notifiers
+ * keep waiting for the end of the next pipeline frame: raising those early too
+ * doubled the interrupts and gained nothing (2026-11-06 A/B). The caller holds
+ * d->lock. */
+volatile int g_apu_raise_now;
+static void apu_raise_pending_irq(MCPXAPUState *d)
+{
+    if (g_apu_raise_now) {
+        g_apu_raise_now = 0;
+        update_irq(d);
+        d->set_irq = false;
     }
 }
 
@@ -144,6 +201,7 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case NV_PAPU_FECTL:
     case NV_PAPU_SECTL:
+        if (addr == NV_PAPU_FECTL) apu_tr('U', (unsigned)val);
         qatomic_set(&d->regs[addr], (uint32_t)val);
         /* Starting the APU has to start the frame thread.
          *
@@ -505,8 +563,10 @@ static void throttle(MCPXAPUState *d)
     if (d->ep_frame_div % 8) {
         return;
     }
-    if (throttle_by_queue(d))
+    if (throttle_by_queue(d)) {
+        apu_tr('B', 0);
         return;
+    }
 
     int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 
@@ -930,10 +990,11 @@ static void apu_q_drain(MCPXAPUState *d)
             g_apu_q_head = (g_apu_q_head + 1) & (APU_QUEUE_LEN - 1);
         }
         LeaveCriticalSection(&g_apu_q_cs);
-        if (!n) return;
+        if (!n) break;
         for (unsigned i = 0; i < n; i++)
             mcpx_apu_dispatch_mmio(d, (hwaddr)batch[i].addr, batch[i].val, batch[i].size, true);
     }
+    apu_raise_pending_irq(d);
 }
 
 void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned int size)
@@ -948,6 +1009,7 @@ void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned 
         if (TryEnterCriticalSection(&d->lock.cs)) {
             apu_q_drain(d);
             mcpx_apu_dispatch_mmio(d, (hwaddr)addr, val, size, true);
+            apu_raise_pending_irq(d);
             qemu_mutex_unlock(&d->lock);
             return;
         }
@@ -980,6 +1042,7 @@ void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned 
     }
     apu_q_drain(d);
     mcpx_apu_dispatch_mmio(d, (hwaddr)addr, val, size, true);
+    apu_raise_pending_irq(d);
     qemu_mutex_unlock(&d->lock);
 }
 
@@ -1013,6 +1076,16 @@ void mcpx_apu_lock_report(void)
             (long long)(n - n0), (long long)(q - q0), (long long)(fu - f0), (w - w0) / 1000.0,
             (long long)(s - s0), (r - r0) / 1000.0);
     w0 = w; n0 = n; s0 = s; q0 = q; f0 = fu; r0 = r;
+    {
+        LONGLONG nn = g_apu_note_n, ns = g_apu_note_sum_us, an = g_apu_ack_n, as = g_apu_ack_sum_us;
+        static LONGLONG nn0, ns0, an0, as0;
+        fprintf(stderr, "[APUIRQ] %lld notifiers waited %.2f ms on average for the line (longest %.1f); "
+                "%lld acknowledgements took %.2f ms on average (longest %.1f)\n",
+                (long long)(nn - nn0), nn > nn0 ? (ns - ns0) / 1000.0 / (double)(nn - nn0) : 0.0, g_apu_note_max_us / 1000.0,
+                (long long)(an - an0), an > an0 ? (as - as0) / 1000.0 / (double)(an - an0) : 0.0, g_apu_ack_max_us / 1000.0);
+        nn0 = nn; ns0 = ns; an0 = an; as0 = as;
+        g_apu_note_max_us = g_apu_ack_max_us = 0;
+    }
 }
 
 /* ============================================================
