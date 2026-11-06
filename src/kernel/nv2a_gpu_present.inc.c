@@ -1514,6 +1514,13 @@ void xbox_PresentToast(const char *header, const char *line1, const char *line2,
     s_toast_until = GetTickCount() + ms;
     InterlockedIncrement(&s_toast_version);
     ReleaseSRWLockExclusive(&s_toast_lock);
+#ifdef __ANDROID__
+    {   /* the panel above is GDI text, Windows only: a pack install said nothing on a phone */
+        char text[400];
+        snprintf(text, sizeof text, "%s: %s %s", header ? header : "", line1 ? line1 : "", line2 ? line2 : "");
+        SDL_ShowAndroidToast(text, ms > 3000 ? 1 : 0, -1, 0, 0);
+    }
+#endif
 }
 
 #ifdef _WIN32
