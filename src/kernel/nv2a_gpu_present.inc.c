@@ -1498,8 +1498,87 @@ static void pr_build_overlay(void)
     DeleteDC(dc);
     s_pr.ovl_valid = 1;
 }
+#elif defined(__ANDROID__)
+static void pr_build_overlay(void) { }   /* Android has no F1 menu */
 #else
-static void pr_build_overlay(void) { }   /* GDI text: Windows only (Android has no F1 menu) */
+/* The same page without GDI, in the performance overlay's 5x7 font. F1 also
+ * blocks the game's input, so without a picture here the game looked frozen. */
+static void pt_fill(uint32_t *p, int W, int H, int x0, int y0, int w, int h, uint32_t c)
+{
+    int x, y;
+    for (y = y0; y < y0 + h && y < H; y++)
+        for (x = x0; x < x0 + w && x < W; x++)
+            if (x >= 0 && y >= 0) p[y * W + x] = c;
+}
+
+static int pt_width(const char *t, int s) { return (int)strlen(t) * 6 * s; }
+
+static void pt_text(uint32_t *p, int W, int H, int x, int y, int s, const char *t, int max_w, uint32_t c)
+{
+    int room = max_w / (6 * s), n = (int)strlen(t), i, cx, cy;
+    for (i = 0; i < n && i < room; i++, x += 6 * s) {
+        unsigned char ch = (unsigned char)t[i];
+        const uint8_t *g;
+        if (n > room && i >= room - 2) ch = '.';         /* the text does not fit */
+        if (ch < 0x20 || ch > 0x7E) ch = '?';
+        g = k_ph_font[ch - 0x20];
+        for (cx = 0; cx < 5; cx++)
+            for (cy = 0; cy < 8; cy++)
+                if (g[cx] & (1u << cy))
+                    pt_fill(p, W, H, x + cx * s, y + cy * s, s, s, c);
+    }
+}
+
+static void pt_upload(const uint32_t *bits, int W, int H, ID3D11Texture2D **tex, ID3D11ShaderResourceView **srv)
+{
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_SUBRESOURCE_DATA sd;
+    memset(&td, 0, sizeof td);
+    td.Width = W; td.Height = H; td.MipLevels = td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_IMMUTABLE; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    sd.pSysMem = bits; sd.SysMemPitch = W * 4; sd.SysMemSlicePitch = 0;
+    if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, &sd, tex)))
+        ID3D11Device_CreateShaderResourceView(s_gpu11.dev, (ID3D11Resource *)*tex, NULL, srv);
+}
+
+static void pr_build_overlay(void)
+{
+    const int W = 760, H = s_menu_open && 90 + menu_rows() * 32 + 80 > 560 ? 90 + menu_rows() * 32 + 80 : 560;
+    uint32_t *p = (uint32_t *)calloc((size_t)W * H, 4);
+    int i;
+    if (!p) return;
+    if (s_pr.ovl) { ID3D11Texture2D_Release(s_pr.ovl); s_pr.ovl = NULL; }
+    if (s_pr.ovl_srv) { ID3D11ShaderResourceView_Release(s_pr.ovl_srv); s_pr.ovl_srv = NULL; }
+    if (s_menu_open) {
+        pt_fill(p, W, H, 20, 20, W - 40, H - 40, 0xE6101626u);
+        pt_fill(p, W, H, 20, 20, W - 40, 54, 0xFFAA141Eu);
+        pt_text(p, W, H, 40, 36, 3, menu_page()->title, 400, 0xFFFFFFFFu);
+        if (s_npages > 1) {
+            char pg[48];
+            snprintf(pg, sizeof pg, "LB/RB page %d of %d", s_menu_page % s_npages + 1, s_npages);
+            pt_text(p, W, H, W - 40 - pt_width(pg, 2), 40, 2, pg, 300, 0xFFFFFFFFu);
+        }
+        for (i = 0; i < menu_rows(); i++) {
+            char name[64], val[96], v2[104];
+            int y = 90 + i * 32, vw;
+            uint32_t col = i == s_menu_sel ? 0xFFFFD23Cu : 0xFFE1E6F0u;
+            name[0] = val[0] = 0;
+            menu_page()->label(i, name, val, sizeof val);
+            if (i == s_menu_sel) pt_fill(p, W, H, 30, y - 2, W - 60, 32, 0xFF283C6Eu);
+            snprintf(v2, sizeof v2, i == s_menu_sel ? "< %s >" : "%s", val);
+            vw = val[0] ? pt_width(v2, 2) : 0;
+            if (vw > 340) vw = 340 / 12 * 12;
+            pt_text(p, W, H, 50, y + 7, 2, name, W - 100 - vw - 12, col);
+            if (val[0]) pt_text(p, W, H, W - 50 - vw, y + 7, 2, v2, vw, col);
+        }
+        pt_text(p, W, H, 50, H - 50, 2, "D-pad: choose   Left/Right: change   A: select", W - 100, 0xFF8C96AAu);
+    }
+    pt_upload(p, W, H, &s_pr.ovl, &s_pr.ovl_srv);
+    free(p);
+    s_pr.ovl_w = W; s_pr.ovl_h = H;
+    s_pr.ovl_valid = 1;
+}
 #endif
 
 /* â”€â”€ Toast: a short banner in the bottom-left corner â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -1603,8 +1682,29 @@ static void pr_build_toast(void)
     DeleteObject(fh); DeleteObject(ft); DeleteObject(fs);
     DeleteDC(dc);
 }
-#else
+#elif defined(__ANDROID__)
 static void pr_build_toast(void) { }   /* GDI text: Windows only */
+#else
+static void pr_build_toast(void)
+{
+    const int W = 640, H = 132;
+    uint32_t *p = (uint32_t *)calloc((size_t)W * H, 4);
+    char text[3][128];
+    if (!p) return;
+    AcquireSRWLockShared(&s_toast_lock);
+    memcpy(text, s_toast_text, sizeof text);
+    ReleaseSRWLockShared(&s_toast_lock);
+    if (s_pr.toast) { ID3D11Texture2D_Release(s_pr.toast); s_pr.toast = NULL; }
+    if (s_pr.toast_srv) { ID3D11ShaderResourceView_Release(s_pr.toast_srv); s_pr.toast_srv = NULL; }
+    pt_fill(p, W, H, 0, 0, W, H, 0xEB0E1422u);
+    pt_fill(p, W, H, 0, 0, W, 36, 0xFFAA141Eu);
+    pt_text(p, W, H, 16, 8, 3, text[0], W - 32, 0xFFFFFFFFu);
+    pt_text(p, W, H, 16, 50, 3, text[1], W - 32, 0xFFFFFFFFu);
+    pt_text(p, W, H, 16, 96, 2, text[2], W - 32, 0xFF78DC78u);
+    pt_upload(p, W, H, &s_pr.toast, &s_pr.toast_srv);
+    free(p);
+    s_pr.toast_w = W; s_pr.toast_h = H;
+}
 #endif
 
 /* Draw the toast while it is due, in the bottom-left corner. */
