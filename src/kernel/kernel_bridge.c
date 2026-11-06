@@ -2583,7 +2583,15 @@ static void kernel_vblank_tick(void)
                     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0),
                     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + 0x140u));
         n++;
-        fflush(stderr);
+        /* Not on every vblank: this thread holds the guest lock here, and a
+         * write to the log can block for 60+ ms, stalling the game thread
+         * (seen as "game thread lock wait"). main.c's flusher thread does it.
+         * RECOMP_VBLANK_FLUSH=1 brings the old behaviour back for comparison. */
+        {
+            static int every = -1;
+            if (every < 0) every = getenv("RECOMP_VBLANK_FLUSH") != NULL;
+            if (every || n <= 3) fflush(stderr);
+        }
     }
 #undef frequency
 #undef next_tick

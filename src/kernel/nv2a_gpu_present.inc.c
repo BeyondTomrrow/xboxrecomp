@@ -665,6 +665,7 @@ typedef struct { const void *pixels; int w, h, stride, x, y, changed, dw, dh; vo
 int xbox_hud_shared_failed;
 typedef int (*XboxHudCallback)(const XboxHudFrame *f, XboxHudImage *img);
 static void pr_present_shot(void);
+static void pr_luma(void);
 static void pr_frame_limit(void);
 static void pr_record(void);
 static XboxHudCallback s_hud_cbs[3];   /* 0: the broadcast HUD; 1: drawn over it (Android touch controls); 2: performance overlay */
@@ -866,7 +867,7 @@ static void preset_apply(VideoSettings *v, int p)
         { 2, 4, 0, 0, 0, 0 },     /* Low: 2x, no effects; Auto lowers it further if needed */
         { 3, 8, 1, 1, 0, 1 },     /* Medium */
         { 6, 16, 1, 1, 1, 1 },    /* High */
-        { 9, 16, 1, 1, 2, 2 },    /* Ultra */
+        { 9, 16, 1, 1, 1, 2 },    /* Ultra (ambient occlusion On: Strong leaves dark halos round players) */
     };
     if (p < 1 || p > 4) return;
     v->scale = k[p].scale; v->aniso = k[p].aniso; v->post = k[p].post; v->sharpen = k[p].sharpen;
@@ -2018,6 +2019,7 @@ static int pr_present(uint32_t guest)
     if (gen_rtv) ID3D11RenderTargetView_Release(gen_rtv);
     pr_present_shot();
     pr_record();
+    pr_luma();
     pr_frame_limit();
 
     {
@@ -2336,6 +2338,121 @@ static void pr_present_shot(void)
         if (f) fclose(f);
         free(line);
         ID3D11DeviceContext_Unmap(s_gpu11.ctx, (ID3D11Resource *)staging, 0);
+    }
+}
+
+/* NFL2K5_PRESENT_LUMA=<prefix>: one row per presented frame in <prefix>.csv
+ * (milliseconds, frame, mean brightness, share of black pixels, a hash of a
+ * sample grid: a repeated frame repeats its hash), read back through a ring so
+ * the GPU never waits; finds one-frame flashes a screenshot every second
+ * misses. A frame much darker or brighter than the last one is also saved as
+ * <prefix>-<frame>.bmp at a quarter size, with the one before it (first 80). */
+extern volatile long g_xbox_boot_movie_active;   /* kernel_bridge.c */
+static void pr_luma_bmp(const char *prefix, unsigned frame, const uint8_t *data, UINT pitch, UINT sw, UINT sh)
+{
+    UINT w = sw / 4, h = sh / 4, row = (w * 3 + 3) & ~3u, x, y;
+    uint32_t size = 54 + row * h;
+    uint8_t hdr[54] = { 'B', 'M' }, *line = (uint8_t *)calloc(1, row);
+    char path[512];
+    FILE *f;
+    snprintf(path, sizeof path, "%s-%06u.bmp", prefix, frame);
+    f = fopen(path, "wb");
+    if (f && line) {
+        int32_t nh = -(int32_t)h;
+        memcpy(hdr + 2, &size, 4); hdr[10] = 54; hdr[14] = 40;
+        memcpy(hdr + 18, &w, 4); memcpy(hdr + 22, &nh, 4); hdr[26] = 1; hdr[28] = 24;
+        fwrite(hdr, 1, 54, f);
+        for (y = 0; y < h; y++) {
+            const uint8_t *src = data + (size_t)y * 4 * pitch;
+            for (x = 0; x < w; x++) memcpy(line + x * 3, src + x * 16, 3);
+            fwrite(line, 1, row, f);
+        }
+    }
+    if (f) fclose(f);
+    free(line);
+}
+
+static void pr_luma(void)
+{
+    static ID3D11Texture2D *ring[3];
+    static int filled[3], slot, off = -1, saved;
+    static unsigned stamp[3], frame, stamp_draws[3], last_draws;
+    static UINT rw, rh;
+    static FILE *csv;
+    static double last_mean = -1.0;
+    static uint8_t *prev;
+    static UINT prev_pitch;
+    static unsigned prev_frame;
+    const char *prefix;
+    ID3D11Texture2D *bb = NULL;
+    D3D11_TEXTURE2D_DESC td;
+    int i;
+    if (off < 0) off = !(getenv("NFL2K5_PRESENT_LUMA") && *getenv("NFL2K5_PRESENT_LUMA"));
+    if (off) return;
+    prefix = getenv("NFL2K5_PRESENT_LUMA");
+    if (FAILED(IDXGISwapChain1_GetBuffer(s_pr.sc, 0, &IID_ID3D11Texture2D, (void **)&bb)))
+        return;
+    ID3D11Texture2D_GetDesc(bb, &td);
+    if (!ring[0] || rw != td.Width || rh != td.Height) {
+        for (i = 0; i < 3; i++) { if (ring[i]) ID3D11Texture2D_Release(ring[i]); ring[i] = NULL; filled[i] = 0; }
+        td.Usage = D3D11_USAGE_STAGING; td.BindFlags = 0; td.CPUAccessFlags = D3D11_CPU_ACCESS_READ; td.MiscFlags = 0;
+        for (i = 0; i < 3; i++) ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, NULL, &ring[i]);
+        rw = td.Width; rh = td.Height;
+        free(prev); prev = NULL;
+    }
+    if (!csv) {
+        char path[512];
+        snprintf(path, sizeof path, "%s.csv", prefix);
+        csv = fopen(path, "w");
+        if (csv) fputs("t_ms,frame,mean,black_pct,hash\n", csv);
+    }
+    frame++;
+    if (ring[slot]) {
+        ID3D11DeviceContext_CopyResource(s_gpu11.ctx, (ID3D11Resource *)ring[slot], (ID3D11Resource *)bb);
+        filled[slot] = 1;
+        stamp[slot] = frame;
+        stamp_draws[slot] = s_gpu11.draws - last_draws;
+        last_draws = s_gpu11.draws;
+    }
+    ID3D11Texture2D_Release(bb);
+    slot = (slot + 1) % 3;
+    if (filled[slot] && ring[slot]) {                    /* the copy from two frames ago */
+        D3D11_MAPPED_SUBRESOURCE m;
+        if (SUCCEEDED(ID3D11DeviceContext_Map(s_gpu11.ctx, (ID3D11Resource *)ring[slot], 0, D3D11_MAP_READ, 0, &m))) {
+            const uint8_t *d = (const uint8_t *)m.pData;
+            uint64_t sum = 0;
+            uint32_t hash = 2166136261u, n = 0, black = 0;
+            UINT x, y;
+            double mean;
+            for (y = rh / 96; y < rh; y += rh / 48) {
+                for (x = rw / 192; x < rw; x += rw / 96) {
+                    const uint8_t *p = d + (size_t)y * m.RowPitch + (size_t)x * 4;
+                    unsigned l = (p[0] + 2u * p[1] + p[2]) / 4u;
+                    sum += l; n++;
+                    if (l < 8) black++;
+                    hash = (hash ^ (p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16)) * 16777619u;
+                }
+            }
+            mean = n ? (double)sum / n : 0.0;
+            if (csv) {
+                LARGE_INTEGER q, f;
+                QueryPerformanceCounter(&q); QueryPerformanceFrequency(&f);
+                fprintf(csv, "%.1f,%u,%.2f,%.1f,%08X,%u,%d\n", (double)q.QuadPart * 1000.0 / (double)f.QuadPart,
+                        stamp[slot], mean, n ? 100.0 * black / n : 0.0, hash, stamp_draws[slot], (int)g_xbox_boot_movie_active);
+                if ((stamp[slot] & 63) == 0) fflush(csv);
+            }
+            if (last_mean >= 0.0 && fabs(mean - last_mean) > 12.0 && saved < 80) {
+                if (prev) pr_luma_bmp(prefix, prev_frame, prev, prev_pitch, rw, rh);
+                pr_luma_bmp(prefix, stamp[slot], d, m.RowPitch, rw, rh);
+                saved++;
+            }
+            last_mean = mean;
+            if (!prev || prev_pitch != m.RowPitch) { free(prev); prev = (uint8_t *)malloc((size_t)m.RowPitch * rh); prev_pitch = m.RowPitch; }
+            if (prev && saved < 80) memcpy(prev, d, (size_t)m.RowPitch * rh);
+            prev_frame = stamp[slot];
+            ID3D11DeviceContext_Unmap(s_gpu11.ctx, (ID3D11Resource *)ring[slot], 0);
+        }
+        filled[slot] = 0;
     }
 }
 

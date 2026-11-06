@@ -46,6 +46,7 @@ static XBOX_THREAD_LOCAL int t_depth;
  * actually spinning.  The last kernel return site only identifies the most
  * recent service call and can be far from the bad generated branch. */
 #ifdef _WIN32
+static LONG symbols_ready;
 static void ggl_report_owner_pc(DWORD tid)
 {
     HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
@@ -56,7 +57,6 @@ static void ggl_report_owner_pc(DWORD tid)
     SYMBOL_INFO *symbol = (SYMBOL_INFO *)storage;
     IMAGEHLP_LINE64 line;
     DWORD line_displacement = 0;
-    static LONG symbols_ready;
     if (!thread) return;
     if (SuspendThread(thread) == (DWORD)-1) { CloseHandle(thread); return; }
     memset(&context, 0, sizeof(context));
@@ -93,7 +93,64 @@ static void ggl_report_owner_pc(DWORD tid)
     }
     fflush(stderr);
 }
+
+/* RECOMP_GGL_LONGWAIT_MS: the owner's host call stack, while the main thread
+ * waits (diagnostics; the per-frame "game thread lock wait" says how long,
+ * not where the owner is). */
+static void ggl_report_owner_stack(DWORD tid, LONGLONG waited_ms)
+{
+    HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                               THREAD_QUERY_INFORMATION, FALSE, tid);
+    CONTEXT context;
+    DWORD64 pcs[14];
+    int n = 0, i;
+    char storage[sizeof(SYMBOL_INFO) + MAX_SYM_NAME];
+    SYMBOL_INFO *symbol = (SYMBOL_INFO *)storage;
+    char line[1400];
+    size_t len;
+    if (!thread) return;
+    if (InterlockedCompareExchange(&symbols_ready, 1, 0) == 0) {
+        SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME);
+        SymInitialize(GetCurrentProcess(), NULL, TRUE);
+    }
+    if (SuspendThread(thread) == (DWORD)-1) { CloseHandle(thread); return; }
+    memset(&context, 0, sizeof(context));
+    context.ContextFlags = CONTEXT_FULL;
+    if (GetThreadContext(thread, &context)) {
+        /* Unwind while it is suspended without allocating (it may hold the
+         * heap lock); symbols are looked up after it runs again. */
+        while (n < 14 && context.Rip) {
+            DWORD64 base = 0, frame = 0;
+            PVOID handler_data = NULL;
+            PRUNTIME_FUNCTION fe;
+            pcs[n++] = context.Rip;
+            fe = RtlLookupFunctionEntry(context.Rip, &base, NULL);
+            if (!fe) {                         /* leaf: return address at [rsp] */
+                context.Rip = *(DWORD64 *)(uintptr_t)context.Rsp;
+                context.Rsp += 8;
+            } else {
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, context.Rip, fe, &context, &handler_data, &frame, NULL);
+            }
+        }
+    }
+    ResumeThread(thread);
+    CloseHandle(thread);
+    if (!n) return;
+    len = (size_t)snprintf(line, sizeof line, "  [GGL] main thread waiting %lld ms; owner %lu at:", waited_ms, (unsigned long)tid);
+    for (i = 0; i < n && len < sizeof line - 90; i++) {
+        DWORD64 d = 0;
+        memset(storage, 0, sizeof(storage));
+        symbol->SizeOfStruct = sizeof(*symbol);
+        symbol->MaxNameLen = MAX_SYM_NAME;
+        if (SymFromAddr(GetCurrentProcess(), pcs[i], &d, symbol))
+            len += (size_t)snprintf(line + len, sizeof line - len, " %.60s", symbol->Name);
+        else
+            len += (size_t)snprintf(line + len, sizeof line - len, " %p", (void *)(uintptr_t)pcs[i]);
+    }
+    fprintf(stderr, "%s\n", line);
+}
 #else
+static void ggl_report_owner_stack(DWORD tid, LONGLONG waited_ms) { (void)tid; (void)waited_ms; }
 static void ggl_report_owner_pc(DWORD tid)
 {
     /* No portable way to sample another thread's PC; the watchdog's guest
@@ -201,7 +258,7 @@ static DWORD WINAPI ggl_watchdog(LPVOID unused)
                                     "best waiting prio=%ld last kernel call returned to guest 0x%08X\n",
                             g_owner, g_waiters, g_best_waiting_prio, g_owner_last_site);
                     fflush(stderr);
-                    if (g_owner) ggl_report_owner_pc(g_owner);
+                    if (g_owner) { ggl_report_owner_pc(g_owner); ggl_report_owner_stack(g_owner, 10000); }
                     if (g_ggl_stall_report) g_ggl_stall_report();
                     WakeAllConditionVariable(&g_turn);
                 }
@@ -221,6 +278,8 @@ static DWORD WINAPI ggl_watchdog(LPVOID unused)
                     owner, ms, g_owner_last_site, g_waiters);
             fflush(stderr);
             reported = owner;
+            ggl_report_owner_stack(owner, ms);
+            if (g_ggl_stall_report) g_ggl_stall_report();
         }
     }
     return 0;   /* not reached */
@@ -315,6 +374,27 @@ static void ggl_acquire_raw(void)
                         }
                     }
                     continue;
+                }
+                {
+                    static int longwait = -1;
+                    static volatile LONG lw_reports;
+                    if (longwait < 0) {
+                        const char *v = getenv("RECOMP_GGL_LONGWAIT_MS");
+                        longwait = v ? atoi(v) : 0;
+                    }
+                    if (longwait > 0 && t_prio < 100) {
+                        if (!SleepConditionVariableSRW(&g_turn, &g_lock, 15, 0)) {
+                            LONGLONG ms = (qpc_now() - asked) * 1000 / g_qpc_freq;
+                            DWORD o = g_owner;
+                            if (ms >= longwait && o && o != tid && tid == xbox_ggl_main_tid()
+                                    && InterlockedIncrement(&lw_reports) <= 2000) {
+                                ReleaseSRWLockExclusive(&g_lock);
+                                ggl_report_owner_stack(o, ms);
+                                AcquireSRWLockExclusive(&g_lock);
+                            }
+                        }
+                        continue;
+                    }
                 }
                 SleepConditionVariableSRW(&g_turn, &g_lock, INFINITE, 0);
             }
