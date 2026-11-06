@@ -1279,11 +1279,18 @@ void xbox_VideoSettingsLoad(void)
 static void menu_key(unsigned vk)
 {
     if (vk == VK_F1) {
+#ifdef __ANDROID__
+        /* Nothing draws this menu here (pr_build_overlay is Windows only):
+         * opening it only blocked the game's input behind an invisible page.
+         * Its settings are in the game's Options on Android. */
+        return;
+#else
         LONG open = !s_menu_open;
         InterlockedExchange(&s_menu_open, open);
         InterlockedExchange(&g_xbox_input_blocked, open);
         s_pr.ovl_valid = 0;
         return;
+#endif
     }
     if (vk == VK_F2) {                                              /* next broadcast presentation */
         extern int nfl2k5_pres_values(int what);
@@ -2072,6 +2079,15 @@ static uint32_t pr_dynres_scale(void)
     float f = s_perf.freq.QuadPart ? (float)s_perf.freq.QuadPart : 1.0f;
     float budget = 1000.0f / (xbox_VideoFpsLimit() == 30 ? 30.0f : 60.0f);
     uint32_t top = (uint32_t)s_vs.scale;
+#ifdef __ANDROID__
+    /* No more lines than the screen can show, to the nearest step (480 lines
+     * a step): 4x on a 1080-line screen drew four times the pixels of 2x and
+     * threw them away when scaling down. */
+    if (s_pr.bb_h) {
+        uint32_t fit = (s_pr.bb_h + 240u) / 480u;
+        if (top > fit) top = fit ? fit : 1;
+    }
+#endif
     if (g_xbox_heat_level >= 1 && top > 1) top = (top + 1) / 2;
     if (top > learned) top = learned;
     if (top < 1) top = 1;
@@ -2112,7 +2128,16 @@ static uint32_t pr_dynres_scale(void)
             fprintf(stderr, "  [DYNRES] %.1f ms frames, GPU wait %.1f ms: internal resolution %ux\n", ft, gw, cur);
         } else if (cur < top) {
             /* on time with the GPU waiting almost never: room for one more step */
+#ifdef __ANDROID__
+            /* The wait cannot say "idle" here: a frame that is on time waits
+             * for the swap chain, and Adreno's submit costs several ms with
+             * the GPU idle, so one early drop stayed down for the whole run.
+             * Being on time is the test; `learned` and `hold` stop a step
+             * that proves too high from being tried again and again. */
+            quiet = ft <= budget * 1.03f ? quiet + 1 : 0;
+#else
             quiet = ft <= budget * 1.03f && gw < 1.0f ? quiet + 1 : 0;
+#endif
             if (quiet >= 6 && (float)(now.QuadPart - last_down) >= hold * f) {
                 cur++;
                 last_step = last_up = now.QuadPart;
