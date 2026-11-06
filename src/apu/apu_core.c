@@ -22,6 +22,9 @@
 #if defined(__linux__)
 #include <sys/prctl.h>
 #endif
+#ifdef __ANDROID__
+#include <sys/resource.h>
+#endif
 #include "apu_state.h"
 #include "apu.h"
 #include "apu_xaudio2.h"
@@ -609,6 +612,9 @@ static void *mcpx_apu_frame_thread(void *arg)
      * AUDIO-FIX-20261021 dropouts). RECOMP_APU_PRIORITY=0 leaves it normal. */
     if (!xa2_legacy() && (!getenv("RECOMP_APU_PRIORITY") || strcmp(getenv("RECOMP_APU_PRIORITY"), "0") != 0))
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#ifdef __ANDROID__
+    setpriority(PRIO_PROCESS, 0, -6);   /* POSIX SetThreadPriority only records the value */
+#endif
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
