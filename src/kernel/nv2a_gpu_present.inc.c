@@ -2079,23 +2079,25 @@ static uint32_t pr_dynres_scale(void)
     static uint32_t cur, learned = 16;
     static LONGLONG win_t0, last_wait, last_down, last_up, last_step;
     static float hold = 20.0f;
-    static unsigned frames, quiet;
+    static unsigned frames, quiet, slow, report;
     static double wait_sum;
     LARGE_INTEGER now;
     LONGLONG w = gxs_gpu_wait_total_us ? gxs_gpu_wait_total_us() : 0;
     float f = s_perf.freq.QuadPart ? (float)s_perf.freq.QuadPart : 1.0f;
     float budget = 1000.0f / (xbox_VideoFpsLimit() == 30 ? 30.0f : 60.0f);
     uint32_t top = (uint32_t)s_vs.scale;
-#ifdef __ANDROID__
-    /* No more lines than the screen can show, to the nearest step (480 lines
-     * a step): 4x on a 1080-line screen drew four times the pixels of 2x and
-     * threw them away when scaling down. */
-    if (s_pr.bb_h) {
-        uint32_t fit = (s_pr.bb_h + 240u) / 480u;
-        if (top > fit) top = fit ? fit : 1;
-    }
-#endif
     if (g_xbox_heat_level >= 1 && top > 1) top = (top + 1) / 2;
+#ifdef __ANDROID__
+    /* Render Scale is the ceiling. Normal play never goes under 2x: 1x stretched
+     * to a phone screen looks like a handheld port, and on an S22+ it bought no
+     * frames (2026-11-06: 1x still fell from 58 to 26 FPS, the CPU was the limit).
+     * 1x comes only from Render Scale 1x, Battery Saver or Heat Control's last
+     * step, which bypass this function (vs_battery_mode). */
+    uint32_t low = top < 2 ? top : 2;
+    if (learned < low) learned = low;
+#else
+    uint32_t low = 1;
+#endif
     if (top > learned) top = learned;
     if (top < 1) top = 1;
     QueryPerformanceCounter(&now);
@@ -2117,13 +2119,32 @@ static uint32_t pr_dynres_scale(void)
         win_t0 = now.QuadPart;
         frames = 0;
         wait_sum = 0.0;
+#ifdef __ANDROID__
+        if (++report >= 30) {                         /* the numbers behind the decisions below */
+            report = 0;
+            fprintf(stderr, "  [DYNRES] now %ux: %.1f ms frames, GPU wait %.1f ms
+", cur, ft, gw);
+        }
+#endif
         if (settling) return cur;
+#ifdef __ANDROID__
+        /* Only when the GPU is the limit. A late frame alone says nothing: the
+         * game thread is often what is late, with the wait still at 5-9 ms of a
+         * 20 ms frame (Adreno's submit costs that with the GPU idle). A really
+         * GPU-bound frame here waits 13-28 ms. Three windows in a row, and not
+         * a loading screen (a 680 ms "frame" once dropped straight to 1x). */
+        slow = ft > budget * 1.08f && ft < 100.0f && gw >= budget * 0.72f ? slow + 1 : 0;
+        if (cur > low && slow >= 3) {
+            slow = 0;
+#else
         if (cur > 1 && ft > budget * 1.08f && gw > 3.0f) {
+#endif
             /* GPU-bound and late: one step to the size that fits (cost goes
              * with the pixel count), at most halving */
             uint32_t to = (uint32_t)((float)cur * sqrtf(budget / ft) * 0.95f);
             if (to < cur / 2) to = cur / 2;
             if (to >= cur) to = cur - 1;
+            if (to < low) to = low;
             if (to < 1) to = 1;
             if (last_up && (float)(now.QuadPart - last_up) < 30.0f * f) {
                 hold = hold * 2.0f > 120.0f ? 120.0f : hold * 2.0f;   /* went up too far: wait longer */
@@ -2136,12 +2157,11 @@ static uint32_t pr_dynres_scale(void)
         } else if (cur < top) {
             /* on time with the GPU waiting almost never: room for one more step */
 #ifdef __ANDROID__
-            /* The wait cannot say "idle" here: a frame that is on time waits
-             * for the swap chain, and Adreno's submit costs several ms with
-             * the GPU idle, so one early drop stayed down for the whole run.
-             * Being on time is the test; `learned` and `hold` stop a step
-             * that proves too high from being tried again and again. */
-            quiet = ft <= budget * 1.03f ? quiet + 1 : 0;
+            /* Room to climb: on time (such a frame waits for the swap chain, so
+             * its wait proves nothing), or late with the GPU not what it is
+             * waiting for. `learned` and `hold` stop a step that proves too
+             * high from being tried again and again. */
+            quiet = ft <= budget * 1.03f || gw < budget * 0.4f ? quiet + 1 : 0;
 #else
             quiet = ft <= budget * 1.03f && gw < 1.0f ? quiet + 1 : 0;
 #endif
