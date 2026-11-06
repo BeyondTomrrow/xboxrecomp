@@ -79,6 +79,10 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
 
     qatomic_or(&d->regs[NV_PAPU_ISTS],
                NV_PAPU_ISTS_FEVINTSTS | NV_PAPU_ISTS_FENINTSTS);
+    {
+        extern volatile int64_t g_apu_irq_note_us;   /* apu_core.c: the [APUIRQ] report */
+        if (!d->set_irq) g_apu_irq_note_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    }
     d->set_irq = true;
 }
 
@@ -182,8 +186,11 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
  * Voice off / lock
  * ============================================================ */
 
+void apu_tr(char c, unsigned v);          /* apu_core.c: RECOMP_APU_TRACE */
+
 static void voice_off(MCPXAPUState *d, uint16_t v)
 {
+    apu_tr('V', v);
     voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 0);
 
@@ -196,6 +203,39 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
         notifier += d->vp.ssl[v].ssl_index;
     }
     set_notify_status(d, v, notifier, NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
+}
+
+static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument);
+
+/* The title stopped a voice: tell it the voice is idle now rather than when the
+ * next pipeline frame walks the voice list. DirectSound's Stop spins on the game
+ * thread until that trap has been serviced (sub_0003CAF0). The console's VP
+ * passes every 0.67 ms, but the frame thread runs 8 frames in a burst and sleeps
+ * 4-10 ms between bursts, so each stopped voice cost that long, one voice after
+ * another: 105 of the 107 frames over 33 ms in a sampled game were inside this
+ * spin (2026-11-06). Same call the frame makes; only for a voice on a list, as
+ * the frame only finds those, and not over a trap still being serviced (the
+ * title reads which voice from FEDECPARAM); the frame then does it as before.
+ * The caller holds d->lock, between frames. RECOMP_APU_LATE_IDLE=1: the frame only. */
+static void voice_idle_now(MCPXAPUState *d, uint16_t v)
+{
+    extern volatile int g_apu_raise_now;     /* apu_core.c */
+    static int late = -1;
+    if (late < 0) late = getenv("RECOMP_APU_LATE_IDLE") != NULL;
+    if (late || (d->regs[NV_PAPU_FECTL] & (NV_PAPU_FECTL_FEMETHMODE_TRAPPED | NV_PAPU_FECTL_FEMETHMODE_HALTED)))
+        return;
+    for (int list = 0; list < 3; list++) {
+        uint16_t c = (uint16_t)d->regs[voice_list_regs[list].top];
+        for (int i = 0; c != 0xFFFF && i < MCPX_HW_MAX_VOICES; i++) {
+            if (c == v) {
+                fe_method(d, SE2FE_IDLE_VOICE, v);
+                if (d->set_irq) g_apu_raise_now = 1;
+                return;
+            }
+            c = (uint16_t)voice_get_mask(d, c, NV_PAVS_VOICE_TAR_PITCH_LINK,
+                                         NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+        }
+    }
 }
 
 static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
@@ -371,6 +411,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case NV1BA0_PIO_VOICE_RELEASE: {
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
+        apu_tr('R', selected_handle);
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
         if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
@@ -397,11 +438,13 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     }
 
     case NV1BA0_PIO_VOICE_OFF:
+        apu_tr('O', argument & NV1BA0_PIO_VOICE_OFF_HANDLE);
         if (getenv("RECOMP_APU_VOICE_LOG"))
             fprintf(stderr, "[VOICE] %03X OFF at cbo %06X (t=%lu)\n", argument & NV1BA0_PIO_VOICE_OFF_HANDLE,
                     voice_get_mask(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_OFF_HANDLE), NV_PAVS_VOICE_PAR_OFFSET,
                                    NV_PAVS_VOICE_PAR_OFFSET_CBO), GetTickCount());
         voice_off(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_OFF_HANDLE));
+        voice_idle_now(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_OFF_HANDLE));
         break;
 
     case NV1BA0_PIO_VOICE_PAUSE:
@@ -712,6 +755,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             d->regs[NV_PAPU_FECTL] |= NV_PAPU_FECTL_FEMETHMODE_TRAPPED;
             d->regs[NV_PAPU_FECTL] &= ~NV_PAPU_FECTL_FETRAPREASON;
             d->regs[NV_PAPU_FECTL] |= NV_PAPU_FECTL_FETRAPREASON_REQUESTED;
+            apu_tr('I', argument);
             d->set_irq = true;
         }
         break;
