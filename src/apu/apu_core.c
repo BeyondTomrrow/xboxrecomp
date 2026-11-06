@@ -148,9 +148,17 @@ volatile int g_apu_raise_now;
 static void apu_raise_pending_irq(MCPXAPUState *d)
 {
     if (g_apu_raise_now) {
+        static int nowake = -1;
+        if (nowake < 0) nowake = getenv("RECOMP_APU_NO_IDLE_WAKE") != NULL;
         g_apu_raise_now = 0;
         update_irq(d);
         d->set_irq = false;
+        /* The line is a level and update_irq only wakes the ISR thread on its
+         * rising edge: with the line still high from an earlier notifier, this
+         * trap waited 8 ms at the median for the next vblank deadline, against
+         * 0.04 ms on a rising edge (2026-11-06 trace), with the title spinning. */
+        if (!nowake && g_apu_irq_line && g_apu_irq_wake)
+            g_apu_irq_wake();
     }
 }
 

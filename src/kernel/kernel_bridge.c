@@ -9995,8 +9995,82 @@ void xbox_kernel_set_ordinal_remap(const unsigned short *map, int count)
     g_ordinal_remap_count = count;
 }
 
+#if defined(_WIN32)
+/* Logging never waits for a disk. Guest threads print and flush stderr while
+ * holding the guest lock, and a log write that stalled on the disk stalled
+ * every guest thread with it: in all 17 waits over 30 ms in a sampled game the
+ * lock's owner was in WriteFile under fflush, or queued for the stream behind
+ * one (2026-11-06). stderr's descriptor becomes a pipe; this thread alone
+ * writes the real file (session.log, or wherever stderr was redirected).
+ * RECOMP_LOG_SYNC=1 or NFL2K5_LOG_UNBUFFERED=1 keep direct writes. */
+#include <io.h>
+#include <fcntl.h>
+static HANDLE s_log_r, s_log_out;
+static volatile LONG s_log_busy;
+static LPTOP_LEVEL_EXCEPTION_FILTER s_log_prev_filter;
+
+static DWORD WINAPI log_writer_thread(LPVOID unused)
+{
+    static char buf[1 << 16];
+    (void)unused;
+    for (;;) {
+        DWORD n = 0, w = 0;
+        if (!ReadFile(s_log_r, buf, sizeof buf, &n, NULL) || !n) return 0;
+        InterlockedExchange(&s_log_busy, 1);
+        WriteFile(s_log_out, buf, n, &w, NULL);
+        InterlockedExchange(&s_log_busy, 0);
+    }
+}
+
+/* The lines already printed reach the file before the process goes. */
+static void log_drain(void)
+{
+    DWORD t0 = GetTickCount(), avail = 1;
+    fflush(stderr);
+    while (GetTickCount() - t0 < 1000) {
+        if (!PeekNamedPipe(s_log_r, NULL, 0, NULL, &avail, NULL)) break;
+        if (!avail && !s_log_busy) break;
+        Sleep(1);
+    }
+}
+
+static LONG WINAPI log_crash_filter(EXCEPTION_POINTERS *ep)
+{
+    LONG r = s_log_prev_filter ? s_log_prev_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
+    log_drain();
+    return r;
+}
+
+static void log_writer_start(void)
+{
+    HANDLE w = NULL, h;
+    int fd, wfd;
+    if (getenv("RECOMP_LOG_SYNC") || getenv("NFL2K5_LOG_UNBUFFERED")) return;
+    fd = _fileno(stderr);
+    if (fd < 0 || (intptr_t)(h = (HANDLE)_get_osfhandle(fd)) <= 0) return;
+    fflush(stderr);
+    if (!DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &s_log_out, 0, FALSE, DUPLICATE_SAME_ACCESS)) return;
+    if (!CreatePipe(&s_log_r, &w, NULL, 8u << 20)) { CloseHandle(s_log_out); return; }
+    wfd = _open_osfhandle((intptr_t)w, _O_WRONLY | _O_BINARY);
+    if (wfd < 0 || _dup2(wfd, fd) != 0) {
+        if (wfd >= 0) _close(wfd); else CloseHandle(w);
+        CloseHandle(s_log_r); CloseHandle(s_log_out);
+        return;
+    }
+    _close(wfd);
+    _setmode(fd, _O_TEXT);               /* the line endings stderr had */
+    CloseHandle(CreateThread(NULL, 0, log_writer_thread, NULL, 0, NULL));
+    s_log_prev_filter = SetUnhandledExceptionFilter(log_crash_filter);
+    atexit(log_drain);
+}
+#else
+static void log_writer_start(void) {}
+#endif
+
 void xbox_kernel_bridge_init(void)
 {
+    log_writer_start();
+
     int i;
     int resolved = 0;
     int bridged = 0;
