@@ -1003,6 +1003,15 @@ static void apu_q_drain(MCPXAPUState *d)
     apu_raise_pending_irq(d);
 }
 
+/* Threads blocked on d->lock from outside the frame thread (apu_let_writers_in). */
+static volatile LONG g_apu_lock_waiters;
+static void apu_lock_outside(MCPXAPUState *d)
+{
+    InterlockedIncrement(&g_apu_lock_waiters);
+    qemu_mutex_lock(&d->lock);
+    InterlockedDecrement(&g_apu_lock_waiters);
+}
+
 void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned int size)
 {
     static int sync = -1;
@@ -1038,7 +1047,7 @@ void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned 
      * its positions jump and restarted the song every 1-5 s, and announcer
      * lines were cut (2026-10-01). The lock is a recursive critical section. */
     QueryPerformanceCounter(&a);
-    qemu_mutex_lock(&d->lock);
+    apu_lock_outside(d);
     QueryPerformanceCounter(&b);
     QueryPerformanceFrequency(&f);
     {
@@ -1052,10 +1061,19 @@ void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned 
     qemu_mutex_unlock(&d->lock);
 }
 
-/* Frame thread, holding d->lock between pipeline frames. */
+/* Frame thread, holding d->lock between pipeline frames. While the pipeline
+ * keeps up it also lets go in its throttle wait; on a machine too slow for real
+ * time it never reaches that wait, so a thread blocked on the lock (a main
+ * register write holding the guest lock) waited for as long as the game ran. */
 static void apu_let_writers_in(MCPXAPUState *d)
 {
     apu_q_drain(d);
+    if (g_apu_lock_waiters) {
+        int spins = 0;
+        qemu_mutex_unlock(&d->lock);
+        while (g_apu_lock_waiters && spins++ < 2000) SwitchToThread();
+        qemu_mutex_lock(&d->lock);
+    }
 }
 
 /* A main-register read after queued voice commands sees their effects. */
@@ -1064,7 +1082,7 @@ static void apu_q_flush_for_read(MCPXAPUState *d)
     LARGE_INTEGER a, b, f;
     if (g_apu_q_init != 2 || g_apu_q_head == g_apu_q_tail) return;
     QueryPerformanceCounter(&a);
-    qemu_mutex_lock(&d->lock);
+    apu_lock_outside(d);
     apu_q_drain(d);
     qemu_mutex_unlock(&d->lock);
     QueryPerformanceCounter(&b);
