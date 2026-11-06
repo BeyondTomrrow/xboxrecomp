@@ -38,6 +38,7 @@
 #pragma comment(lib, "d3dcompiler.lib")
 #else
 #include "gx/gx_portable.h"
+#include <SDL3/SDL_messagebox.h>
 #endif
 
 typedef struct {
@@ -366,6 +367,14 @@ static int gpu_init(void)
     if (FAILED(hr)) {
         fprintf(stderr, "  [GPU11] D3D11CreateDevice failed 0x%08lX; staying on the software rasteriser\n",
                 (unsigned long)hr);
+#if defined(XBOX_GX_PORTABLE) && !defined(__ANDROID__)
+        /* Linux has no other renderer: say so instead of showing a black window */
+        fflush(stderr);
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "ESPN NFL 2K5",
+                                 "No working Vulkan driver was found. Install your GPU's Vulkan driver "
+                                 "and check it with: vulkaninfo --summary", NULL);
+        ExitProcess(1);
+#endif
         return 0;
     }
     hr = D3DCompile(k_gpu_hlsl, strlen(k_gpu_hlsl), "nv2a", NULL, NULL, "vs_main", "vs_4_0", 0, 0, &vsb, &err);
