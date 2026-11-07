@@ -85,13 +85,10 @@ typedef struct {
 /* NFL 2K5 draws several full-screen backdrops only inside the 640-pixel
  * title-safe area of its 720-pixel scanout.  A CRT hid the remaining edge;
  * showing the full scanout exposes hard black strips beside the sky. */
-/* Highest internal resolution offered: a phone GPU runs out of memory and
- * time long before 16x (a player picked it and the game fell to 9 FPS). */
-#ifdef __ANDROID__
-#define VS_MAX_SCALE 4
-#else
+/* Highest internal resolution offered, the same everywhere: what the picture
+ * looks like is the player's choice (2026-11-06), also on a phone that cannot
+ * hold it. */
 #define VS_MAX_SCALE 16
-#endif
 static VideoSettings s_vs = { VM_BORDERLESS, 1920, 1080, AR_ORIGINAL, 3, SF_ENHANCED, 1, 100, 100, 0, 0, 8, 0, 1, 0, 0, 0, 0, 1, 1, 1, 0, 0 };
 static volatile LONG s_vs_dirty = 1;
 static uint32_t pr_dynres_scale(void);
@@ -192,8 +189,8 @@ static void vs_save(void)
                "upscaler = %d\n"
                "; framegen (Direct3D 12): 1 FSR 3 frame generation, a generated frame between each two\n"
                "framegen = %d\n"
-               "; dynres: 1 auto: the highest internal resolution (up to 16x) that holds the frame-rate cap;\n"
-               "; scale is only where it starts. 0 a fixed scale\n"
+               "; dynres: 1 auto: scale is the limit, lowered only while the GPU cannot keep up;\n"
+               "; 0 stays at scale\n"
                "dynres = %d\n"
                "; post: 0 off, 1 Broadcast, 2 Cinematic, 3 Vivid, 4 Night Game (bloom, highlight roll-off, grading)\n"
                "post = %d\n"
@@ -851,6 +848,10 @@ static int vs_battery_mode(void)
     }
     return b || g_xbox_battery_saver || g_xbox_heat_level >= 2;
 }
+/* The scale only follows what the player turned on: Battery Saver, or Heat
+ * Control at its last step. The system's battery Game Mode (above) caps the
+ * frame rate but leaves the picture alone. */
+static int vs_scale_forced_low(void) { return g_xbox_battery_saver || g_xbox_heat_level >= 2; }
 int xbox_VideoFpsLimit(void) { return vs_battery_mode() ? 30 : s_vs.fps_limit; }
 static void fps_limit_changed(void) { if (g_xbox_fps_limit_changed) g_xbox_fps_limit_changed(); }
 
@@ -902,8 +903,8 @@ static void menu_label(int item, char *name, char *val, size_t n)
     case MI_SCALE:  strcpy(name, "Internal resolution");
                     snprintf(val, n, "%dx  (%d x %d)", s_vs.scale, 720 * s_vs.scale, 480 * s_vs.scale); break;
     case MI_DYNRES: strcpy(name, "Dynamic resolution");
-                    if (s_vs.dynres) snprintf(val, n, "Auto, max for the cap  (now %ux)", g_render_scale);
-                    else snprintf(val, n, "Off"); break;
+                    if (s_vs.dynres) snprintf(val, n, "Auto, limit %dx  (now %ux)", s_vs.scale, g_render_scale);
+                    else snprintf(val, n, "Off, fixed at %dx", s_vs.scale); break;
     case MI_LIGHTING: strcpy(name, "Lighting and materials"); snprintf(val, n, "%s", lighting[s_vs.lighting % 3]); break;
     case MI_POST:   strcpy(name, "Post-processing"); snprintf(val, n, "%s", k_post_presets[s_vs.post % POST_PRESETS].name); break;
     case MI_SHARPEN: strcpy(name, "Sharpening"); snprintf(val, n, "%s", k_sharpen_names[s_vs.sharpen & 3]); break;
@@ -1216,7 +1217,11 @@ void xbox_VideoSettingValueName(int i, int idx, char *buf, size_t n)
     case MI_MODE:   snprintf(buf, n, "%s", modes[v.mode % 3]); break;
     case MI_RES:    snprintf(buf, n, "%d x %d", v.res_w, v.res_h); break;
     case MI_ASPECT: snprintf(buf, n, "%s", aspects[v.aspect % 6]); break;
-    case MI_SCALE:  snprintf(buf, n, "%dx (%d x %d)", v.scale, 720 * v.scale, 480 * v.scale); break;
+    case MI_SCALE:
+        if (vs_scale_forced_low())
+            snprintf(buf, n, "%dx, now 1x: %s", v.scale, g_xbox_battery_saver ? "Battery Saver on" : "Heat Control");
+        else snprintf(buf, n, "%dx (%d x %d)", v.scale, 720 * v.scale, 480 * v.scale);
+        break;
     case MI_LIGHTING: snprintf(buf, n, "%s", lighting[v.lighting % 3]); break;
     case MI_POST:   snprintf(buf, n, "%s", k_post_presets[v.post % POST_PRESETS].name); break;
     case MI_SHARPEN: snprintf(buf, n, "%s", k_sharpen_names[v.sharpen & 3]); break;
@@ -1236,7 +1241,10 @@ void xbox_VideoSettingValueName(int i, int idx, char *buf, size_t n)
                              strcmp(k_api_names[v.renderer % 3], gx_backend_name()) ? " (restart)" : ""); break;
     case MI_UPSCALE: snprintf(buf, n, "%s", k_upscaler_names[v.upscaler % 6]); break;
     case MI_FRAMEGEN: snprintf(buf, n, "%s", v.framegen ? "FSR 3 (2x)" : "Off"); break;
-    case MI_DYNRES: snprintf(buf, n, "%s", v.dynres ? "Auto (max for the cap)" : "Off"); break;
+    case MI_DYNRES:
+        if (idx) snprintf(buf, n, "Auto, limit %dx (now %ux)", v.scale, g_render_scale);
+        else snprintf(buf, n, "Off, fixed at %dx", v.scale);
+        break;
     }
 }
 
@@ -1279,11 +1287,18 @@ void xbox_VideoSettingsLoad(void)
 static void menu_key(unsigned vk)
 {
     if (vk == VK_F1) {
+#ifdef __ANDROID__
+        /* Nothing draws this menu here (pr_build_overlay is Windows only):
+         * opening it only blocked the game's input behind an invisible page.
+         * Its settings are in the game's Options on Android. */
+        return;
+#else
         LONG open = !s_menu_open;
         InterlockedExchange(&s_menu_open, open);
         InterlockedExchange(&g_xbox_input_blocked, open);
         s_pr.ovl_valid = 0;
         return;
+#endif
     }
     if (vk == VK_F2) {                                              /* next broadcast presentation */
         extern int nfl2k5_pres_values(int what);
@@ -1507,6 +1522,13 @@ void xbox_PresentToast(const char *header, const char *line1, const char *line2,
     s_toast_until = GetTickCount() + ms;
     InterlockedIncrement(&s_toast_version);
     ReleaseSRWLockExclusive(&s_toast_lock);
+#ifdef __ANDROID__
+    {   /* the panel above is GDI text, Windows only: a pack install said nothing on a phone */
+        char text[400];
+        snprintf(text, sizeof text, "%s: %s %s", header ? header : "", line1 ? line1 : "", line2 ? line2 : "");
+        SDL_ShowAndroidToast(text, ms > 3000 ? 1 : 0, -1, 0, 0);
+    }
+#endif
 }
 
 #ifdef _WIN32
@@ -1733,18 +1755,26 @@ static int pr_present(uint32_t guest)
     if (InterlockedExchange(&s_vs_dirty, 0))
         pr_apply_mode();
 #ifdef __ANDROID__
-    g_render_scale = vs_battery_mode() ? 1u : (uint32_t)s_vs.scale;     /* surfaces follow on their next use */
+    g_render_scale = vs_scale_forced_low() ? 1u : (uint32_t)s_vs.scale;     /* surfaces follow on their next use */
+    {   /* never silently: a log line, and the frame limit applied at once (at
+         * start it only took effect at the next settings change) */
+        static int forced = -1;
+        if (forced != vs_scale_forced_low()) {
+            forced = vs_scale_forced_low();
+            if (forced) fprintf(stderr, "  [VIDEO] resolution held at 1x by %s\n", g_xbox_battery_saver ? "Battery Saver" : "Heat Control");
+            fps_limit_changed();
+        }
+    }
+    if (g_render_scale > 1 && g_xbox_heat_level >= 1) g_render_scale = (g_render_scale + 1) / 2;   /* Heat Control is on */
 #else
     g_render_scale = vs_battery_mode() || g_xbox_heat_level ? 1u : (uint32_t)s_vs.scale;     /* surfaces follow on their next use */
 #endif
     g_want_motion = ((s_vs.upscaler || s_vs.framegen) && gxs_fsr_available()) || env_cached("RECOMP_FORCE_MV");
     g_want_mv = g_want_motion || s_vs.ao > 0;   /* the depth copy also feeds ambient occlusion */
 #ifdef __ANDROID__
-    /* Phones: always automatic (they heat up and slow down; a fixed scale
-     * cannot hold), with the chosen scale as the ceiling; Heat Control's
-     * first step halves that ceiling (pr_dynres_scale). NFL2K5_DYNRES=0 keeps
-     * the fixed scale for tests. */
-    if (!vs_battery_mode() && !(getenv("NFL2K5_DYNRES") && getenv("NFL2K5_DYNRES")[0] == '0'))
+    /* Dynamic Resolution as chosen in Options: Off stays at Render Scale, Auto
+     * has it as the limit (pr_dynres_scale). NFL2K5_DYNRES=0 is for tests. */
+    if (s_vs.dynres && !vs_scale_forced_low() && !(getenv("NFL2K5_DYNRES") && getenv("NFL2K5_DYNRES")[0] == '0'))
         g_render_scale = pr_dynres_scale();
 #else
     if (s_vs.dynres && !vs_battery_mode() && !g_xbox_heat_level)
@@ -2062,10 +2092,10 @@ LONGLONG gxs_gpu_wait_total_us(void) __attribute__((weak));   /* gx/gx_sdl.c, wh
 extern volatile int g_xbox_heat_level;
 static uint32_t pr_dynres_scale(void)
 {
-    static uint32_t cur, learned = 16;
+    static uint32_t cur;
     static LONGLONG win_t0, last_wait, last_down, last_up, last_step;
     static float hold = 20.0f;
-    static unsigned frames, quiet;
+    static unsigned frames, quiet, slow, report;
     static double wait_sum;
     LARGE_INTEGER now;
     LONGLONG w = gxs_gpu_wait_total_us ? gxs_gpu_wait_total_us() : 0;
@@ -2073,10 +2103,22 @@ static uint32_t pr_dynres_scale(void)
     float budget = 1000.0f / (xbox_VideoFpsLimit() == 30 ? 30.0f : 60.0f);
     uint32_t top = (uint32_t)s_vs.scale;
     if (g_xbox_heat_level >= 1 && top > 1) top = (top + 1) / 2;
-    if (top > learned) top = learned;
+    /* Render Scale is the limit. Normal play never goes under 2x: 1x stretched
+     * to a phone screen looks like a handheld port, and on an S22+ it bought no
+     * frames (2026-11-06: 1x still fell from 58 to 26 FPS, the CPU was the limit).
+     * 1x comes only from Render Scale 1x, Battery Saver or Heat Control's last
+     * step, which bypass this function (vs_scale_forced_low). */
+    uint32_t low = top < 2 ? top : 2;
     if (top < 1) top = 1;
     QueryPerformanceCounter(&now);
     if (!cur) { cur = top; win_t0 = now.QuadPart; last_wait = w; return cur; }
+    {   /* no step during a boot movie: a step rebuilds the render targets on screen */
+        extern volatile long g_xbox_boot_movie_active;
+        if (g_xbox_boot_movie_active) {
+            win_t0 = now.QuadPart; last_wait = w; frames = 0; wait_sum = 0.0; slow = quiet = 0;
+            return cur;
+        }
+    }
     if (cur > top) {                                  /* the ceiling came down (heat, menu) */
         cur = top;
         last_step = last_down = now.QuadPart;
@@ -2094,17 +2136,28 @@ static uint32_t pr_dynres_scale(void)
         win_t0 = now.QuadPart;
         frames = 0;
         wait_sum = 0.0;
+        if (++report >= 30) {                         /* the numbers behind the decisions below */
+            report = 0;
+            fprintf(stderr, "  [DYNRES] now %ux: %.1f ms frames, GPU wait %.1f ms\n", cur, ft, gw);
+        }
         if (settling) return cur;
-        if (cur > 1 && ft > budget * 1.08f && gw > 3.0f) {
+        /* Only when the GPU is the limit. A late frame alone says nothing: the
+         * game thread is often what is late, with the wait still at 5-9 ms of a
+         * 20 ms frame (Adreno's submit costs that with the GPU idle). A really
+         * GPU-bound frame here waits 13-28 ms. Three windows in a row, and not
+         * a loading screen (a 680 ms "frame" once dropped straight to 1x). */
+        slow = ft > budget * 1.08f && ft < 100.0f && gw >= budget * 0.72f ? slow + 1 : 0;
+        if (cur > low && slow >= 3) {
+            slow = 0;
             /* GPU-bound and late: one step to the size that fits (cost goes
              * with the pixel count), at most halving */
             uint32_t to = (uint32_t)((float)cur * sqrtf(budget / ft) * 0.95f);
             if (to < cur / 2) to = cur / 2;
             if (to >= cur) to = cur - 1;
+            if (to < low) to = low;
             if (to < 1) to = 1;
             if (last_up && (float)(now.QuadPart - last_up) < 30.0f * f) {
                 hold = hold * 2.0f > 120.0f ? 120.0f : hold * 2.0f;   /* went up too far: wait longer */
-                if (cur - 1 < learned) learned = cur - 1 ? cur - 1 : 1;
             }
             cur = to;
             last_step = last_down = now.QuadPart;
@@ -2112,7 +2165,11 @@ static uint32_t pr_dynres_scale(void)
             fprintf(stderr, "  [DYNRES] %.1f ms frames, GPU wait %.1f ms: internal resolution %ux\n", ft, gw, cur);
         } else if (cur < top) {
             /* on time with the GPU waiting almost never: room for one more step */
-            quiet = ft <= budget * 1.03f && gw < 1.0f ? quiet + 1 : 0;
+            /* Room to climb: on time (such a frame waits for the swap chain, so
+             * its wait proves nothing), or late with the GPU not what it is
+             * waiting for. `hold` keeps a step that proves too high from
+             * being tried again and again. */
+            quiet = ft <= budget * 1.03f || gw < budget * 0.4f ? quiet + 1 : 0;
             if (quiet >= 6 && (float)(now.QuadPart - last_down) >= hold * f) {
                 cur++;
                 last_step = last_up = now.QuadPart;
@@ -2132,10 +2189,12 @@ static uint32_t pr_dynres_scale(void)
     static int quiet, slow, waits;
     static float wait_sum;
     static uint32_t learned = 16;                   /* the most a heavy scene has held */
-    uint32_t top = learned;                         /* auto: as high as holds the cap */
+    /* Auto: the chosen scale is the limit, and it never climbs past it */
+    uint32_t top = learned < (uint32_t)s_vs.scale ? learned : (uint32_t)s_vs.scale;
     LARGE_INTEGER now;
     float util = s_gpuctr.util, f = s_perf.freq.QuadPart ? (float)s_perf.freq.QuadPart : 1.0f;
     if (!cur) cur = (uint32_t)s_vs.scale;           /* start from the chosen scale */
+    if (cur > (uint32_t)s_vs.scale) cur = (uint32_t)s_vs.scale;   /* the player just lowered it */
     /* Fast path, every frame: Present blocking means the GPU is behind. The
      * busy share is only read once a second, so a step from a light scene
      * (menus, at 16x) into play used to drop frames for 2-3 s before it
@@ -2387,9 +2446,35 @@ static void pr_luma(void)
     ID3D11Texture2D *bb = NULL;
     D3D11_TEXTURE2D_DESC td;
     int i;
-    if (off < 0) off = !(getenv("NFL2K5_PRESENT_LUMA") && *getenv("NFL2K5_PRESENT_LUMA"));
+    /* Android, without the variable: the boot movies only, into intro-luma.csv
+     * and a few intro-luma-*.bmp in the game folder, with a summary line in the
+     * log. The flash can only be measured where it is seen. */
+    static int movie_only, idle, shown, dark, dark_run, dark_longest, dark_blinks, jumps, repeats;
+    static uint32_t last_hash;
+    static char auto_prefix[MAX_PATH];
+    int save_limit;
+    if (off < 0) {
+        off = !(getenv("NFL2K5_PRESENT_LUMA") && *getenv("NFL2K5_PRESENT_LUMA"));
+#ifdef __ANDROID__
+        if (off) { off = 0; movie_only = 1; xbox_user_path("intro-luma", auto_prefix, sizeof auto_prefix); }
+#endif
+    }
     if (off) return;
-    prefix = getenv("NFL2K5_PRESENT_LUMA");
+    save_limit = movie_only ? 12 : 80;
+    if (movie_only) {
+        idle = g_xbox_boot_movie_active ? 0 : idle + 1;
+        if (!shown && !g_xbox_boot_movie_active) return;   /* the movies have not started */
+        if (idle > 600) {                                  /* ten seconds past the last one: done */
+            fprintf(stderr, "[MOVIE-STATS] on screen: %d frames, %d dark, %d dark flashes (runs of 6 or less), longest dark run %d, "
+                    "%d sudden brightness changes, %d repeated frames\n", shown, dark, dark_blinks, dark_longest, jumps, repeats);
+            if (csv) { fclose(csv); csv = NULL; }
+            for (i = 0; i < 3; i++) { if (ring[i]) ID3D11Texture2D_Release(ring[i]); ring[i] = NULL; }
+            free(prev); prev = NULL;
+            off = 1;
+            return;
+        }
+    }
+    prefix = movie_only ? auto_prefix : getenv("NFL2K5_PRESENT_LUMA");
     if (FAILED(IDXGISwapChain1_GetBuffer(s_pr.sc, 0, &IID_ID3D11Texture2D, (void **)&bb)))
         return;
     ID3D11Texture2D_GetDesc(bb, &td);
@@ -2441,14 +2526,25 @@ static void pr_luma(void)
                         stamp[slot], mean, n ? 100.0 * black / n : 0.0, hash, stamp_draws[slot], (int)g_xbox_boot_movie_active);
                 if ((stamp[slot] & 63) == 0) fflush(csv);
             }
-            if (last_mean >= 0.0 && fabs(mean - last_mean) > 12.0 && saved < 80) {
+            shown++;
+            if (n && black * 100u >= n * 90u) {
+                dark++; dark_run++;
+                if (dark_run > dark_longest) dark_longest = dark_run;
+            } else {
+                if (dark_run && dark_run <= 6) dark_blinks++;
+                dark_run = 0;
+            }
+            if (last_mean >= 0.0 && fabs(mean - last_mean) > 12.0) jumps++;
+            if (hash == last_hash) repeats++;
+            last_hash = hash;
+            if (last_mean >= 0.0 && fabs(mean - last_mean) > 12.0 && saved < save_limit) {
                 if (prev) pr_luma_bmp(prefix, prev_frame, prev, prev_pitch, rw, rh);
                 pr_luma_bmp(prefix, stamp[slot], d, m.RowPitch, rw, rh);
                 saved++;
             }
             last_mean = mean;
             if (!prev || prev_pitch != m.RowPitch) { free(prev); prev = (uint8_t *)malloc((size_t)m.RowPitch * rh); prev_pitch = m.RowPitch; }
-            if (prev && saved < 80) memcpy(prev, d, (size_t)m.RowPitch * rh);
+            if (prev && saved < save_limit) memcpy(prev, d, (size_t)m.RowPitch * rh);
             prev_frame = stamp[slot];
             ID3D11DeviceContext_Unmap(s_gpu11.ctx, (ID3D11Resource *)ring[slot], 0);
         }

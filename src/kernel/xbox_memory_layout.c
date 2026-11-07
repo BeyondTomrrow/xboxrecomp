@@ -28,6 +28,9 @@
 #endif
 #include <string.h>
 #include <setjmp.h>
+#ifdef __ANDROID__
+#include <sys/resource.h>
+#endif
 #if !defined(_WIN32)
 #include <unistd.h>   /* _exit */
 #if defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))
@@ -1184,6 +1187,11 @@ static DWORD WINAPI pb_async_thread(LPVOID param)
     extern void nv2a_pb_exec_linear(const uint32_t *b, uint32_t n);
     (void)param;
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+#ifdef __ANDROID__
+    /* SetThreadPriority only records the value on POSIX. Android lets an app
+     * raise its own threads (who 0 is this thread on Linux). */
+    setpriority(PRIO_PROCESS, 0, -6);
+#endif
     for (;;) {
         PbRec *r;
         LARGE_INTEGER t0 = { 0 }, t1;

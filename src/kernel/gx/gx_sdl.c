@@ -34,6 +34,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __ANDROID__
+#include <sys/resource.h>
+#endif
 #include <SDL3/SDL.h>
 #include "gx_d3d11.h"
 #include "gx_dxc.h"
@@ -142,6 +145,7 @@ static struct {
  * Android dynamic resolution reads it: phones give no GPU busy counter, and a
  * GPU that is behind shows up here first. */
 static volatile LONGLONG s_gpu_wait_us;
+volatile long g_gx_presented_frames;    /* reached the swap chain (the driver trial, src/nfl2k5_gpu_driver.c) */
 LONGLONG gxs_gpu_wait_total_us(void) { return s_gpu_wait_us; }
 
 static double qpc_ms(void)
@@ -1021,8 +1025,8 @@ typedef struct {
 static struct { GxPipeKey k; uint32_t h; SDL_GPUGraphicsPipeline *p; } s_pipes[PIPE_CACHE];
 static unsigned s_npipes;
 
-/* Background pipeline compiles (RECOMP_GX_ASYNC_PIPES; off by default; was on by default on
- * Android). Adreno's driver takes ~0.7 s per new pipeline, and compiling at
+/* Background pipeline compiles (RECOMP_GX_ASYNC_PIPES; on by default on Android, off
+ * elsewhere). Adreno's driver takes ~0.7 s per new pipeline, and compiling at
  * the draw froze the game for seconds whenever a scene first appeared. A
  * missing pipeline is queued for a worker and its draws are skipped until it
  * is ready -- an object pops in a few frames late instead of the game
@@ -1046,6 +1050,9 @@ static volatile LONG s_pipe_skips;      /* draws dropped since the last Present 
 static int pipe_job_worker(void *arg)
 {
     (void)arg;
+#ifdef __ANDROID__
+    setpriority(PRIO_PROCESS, 0, 5);    /* not the drawing thread's raised priority, which it inherits */
+#endif
     SDL_LockMutex(s_job_lock);
     for (;;) {
         GxPipeJob *j = NULL;
@@ -1077,11 +1084,18 @@ static int pipe_async_on(void)
 {
     if (s_async_pipes < 0) {
         const char *e = getenv("RECOMP_GX_ASYNC_PIPES");
-        /* Off by default everywhere, Android included, until the crash seen
-         * with it on (lavapipe, ARM64 VM, 4 of 4 runs as the menus load;
-         * none with it off) is understood. The disk pipeline cache keeps
-         * the compile stalls to a first run. RECOMP_GX_ASYNC_PIPES=1 for tests. */
+        /* On for Android: compiling at the draw stopped an S22+ for 16 s in
+         * one game even with the disk cache, 70 s without it, a stop of 0.3-1.6
+         * s for each new pipeline, in the middle of plays. Two logged runs on
+         * that phone with this on (Adreno) had no crash and about 0.3 ms of
+         * pipeline time per frame. Off elsewhere: lavapipe in the ARM64 VM
+         * crashed with it on in 4 of 4 runs as the menus load (reading freed
+         * heap in the driver's own threads, cause still open). 0/1 overrides. */
+#ifdef __ANDROID__
+        s_async_pipes = !e || *e != '0';
+#else
         s_async_pipes = e && *e == '1';
+#endif
         if (s_async_pipes) {
             s_job_lock = SDL_CreateMutex();
             s_job_cond = SDL_CreateCondition();
@@ -2665,6 +2679,7 @@ HRESULT gxs_IDXGISwapChain1_Present(void *s, UINT sync, UINT flags)
     }
     if (sct) {
         GxTex *first = pair ? sw->bb2 : sw->bb;
+        g_gx_presented_frames++;
         present_blit(s_cb, first->t, first->d.Width, first->d.Height, sct, w, h);
     }
     flush(1);
