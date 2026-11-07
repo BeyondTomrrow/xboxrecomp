@@ -145,6 +145,7 @@ static struct {
  * Android dynamic resolution reads it: phones give no GPU busy counter, and a
  * GPU that is behind shows up here first. */
 static volatile LONGLONG s_gpu_wait_us;
+volatile long g_gx_presented_frames;    /* reached the swap chain (the driver trial, src/nfl2k5_gpu_driver.c) */
 LONGLONG gxs_gpu_wait_total_us(void) { return s_gpu_wait_us; }
 
 static double qpc_ms(void)
@@ -2678,6 +2679,7 @@ HRESULT gxs_IDXGISwapChain1_Present(void *s, UINT sync, UINT flags)
     }
     if (sct) {
         GxTex *first = pair ? sw->bb2 : sw->bb;
+        g_gx_presented_frames++;
         present_blit(s_cb, first->t, first->d.Width, first->d.Height, sct, w, h);
     }
     flush(1);
