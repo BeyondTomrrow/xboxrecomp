@@ -355,6 +355,7 @@ static struct {
     uint32_t batches_textured, batches_no_uv, batches_no_tex;
     Texture tex;
 } s_gpu;
+static uint32_t s_tex_raw0;
 
 /* What each vertex attribute reads when the batch does not supply it as an
  * array: the last SET_VERTEX_DATA* value, or the last element of the last
@@ -4553,11 +4554,17 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param) {
             s_gpu.zeta_offset = param;
             break;
         case NV097_SET_COLOR_CLEAR_VALUE:
+            if (param == XBOX_HOSTSCENE_MAGIC) {   /* not a colour: a host scene goes here (xbox_hostscene.h) */
+                if (gpu_enabled()) gpu_host_scene();
+                break;
+            }
             s_gpu.clear_color = param;
             break;
         case NV097_CLEAR_SURFACE:
-            if (gpu_enabled() && gpu_clear(param))
+            if (gpu_enabled() && gpu_clear(param)) {
+                if (param & 0xF0u) gpu_host_scene_frame_start();   /* after the colour clear */
                 break;
+            }
             if (gpu_enabled())
                 gpu_cpu_access();
             clear_surface(param);
@@ -4581,7 +4588,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param) {
                 /* Three ways a batch can have arrived, and only one is in use at
                  * a time: vertices completed by SET_VERTEX4F, a payload written
                  * with INLINE_ARRAY, or indices into the title's own arrays. */
-                if (s_gpu.imm_count)
+                if (gpu_enabled() && gpu_host_scene_trigger(s_tex_raw0))
+                    ;   /* the trigger is dropped; the next frame starts with the host scene */
+                else if ((gpu_enabled() ? gpu_host_scene_frame_start() : (void)0), s_gpu.imm_count)
                     draw_immediate();
                 else if (s_gpu.inline_count)
                     draw_inline_array();
@@ -4688,6 +4697,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param) {
              * vertex array offset -- physical, and reachable only through the
              * contiguous window when it names contiguous memory. */
             s_gpu.tex.offset = dma_resolve(param);
+            s_tex_raw0 = param;                 /* the host scene matches the guest's own offset */
             record_tex_reg(method, param);
             break;
 
@@ -4732,8 +4742,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param) {
              * There is no scanout here to wait for, so that is now. */
             s_gpu.flip_read = s_gpu.flip_write;
             /* The surface drawn into up to here is a finished frame: show it. */
-            if (gpu_enabled())
+            if (gpu_enabled()) {
                 gpu_flip();
+                gpu_host_scene_flip();
+            }
             /* RECOMP_SHOT_PREFIX=<path prefix>: every RECOMP_SHOT_SECONDS (default
              * 30) write the finished frame as <prefix>-<n>.bmp, straight from the
              * surface -- works when the window is minimised or the screen is

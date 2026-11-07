@@ -2902,6 +2902,7 @@ static int gpu_clear_unlocked(uint32_t param)
 
 /* A frame is finished: bring the surface back to guest RAM for the window. */
 #include "nv2a_gpu_present.inc.c"
+#include "nv2a_gpu_hostscene.inc.c"   /* host-drawn 3D scenes at a pushbuffer marker */
 
 static void gpu_flip_unlocked(void)
 {
@@ -2963,6 +2964,13 @@ static int gpu_draw_batch(int flat2d)
     return r;
 }
 
+static int gpu_host_scene(void)
+{
+    int r;
+    gpu_lock(); r = gpu_host_scene_unlocked(); LeaveCriticalSection(&s_gpu_lock);
+    return r;
+}
+
 static int gpu_clear(uint32_t param)
 {
     int r;
@@ -2976,4 +2984,13 @@ static void gpu_flip(void)
 }
 #else
 #include "nv2a_gpu_sdl3.inc.c"
+#include "xbox_hostscene.h"
+/* The SDL3 presenter (Linux, macOS) has no host scene pass yet: the marker is ignored. */
+void xbox_HostSceneSet(const XboxHostScene *scene) { (void)scene; }
+int xbox_HostSceneDrawn(void) { return 0; }
+static int gpu_host_scene(void) { return 0; }
+void xbox_HostSceneTrigger(const uint32_t *offsets, int n) { (void)offsets; (void)n; }
+static int gpu_host_scene_trigger(uint32_t tex_offset) { (void)tex_offset; return 0; }
+static void gpu_host_scene_frame_start(void) {}
+static void gpu_host_scene_flip(void) {}
 #endif
