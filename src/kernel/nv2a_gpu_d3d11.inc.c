@@ -1945,6 +1945,8 @@ static ID3D11DepthStencilState *gpu_no_depth(void)
 
 /* The depth buffer's full-scale value (xemu pgraph_glsl_set_clip_range):
  * Z16 or Z24, integer or floating point (SET_CONTROL0 bit 12). */
+static int s_hs_done;                  /* nv2a_gpu_hostscene.inc.c: the host scene drew this frame */
+static float s_hs_guest_depthp[4];     /* the last depth-tested guest draw's depthp (host scenes share its depth) */
 static float gpu_zmax(void)
 {
     int z16 = ((s_gpu.format >> 4) & 0xF) == 1;
@@ -1992,6 +1994,15 @@ static void gpu_vertex(GpuVertex *o, const XfVert *x, uint32_t rw, uint32_t rh)
     o->pos[0] = nx * w; o->pos[1] = ny * w; o->pos[2] = nz * w; o->pos[3] = w;
     o->rawscreen[0] = vp_screen_coord(x->x) + (float)g_draw_ox; o->rawscreen[1] = vp_screen_coord(x->y);
     o->rawscreen[2] = x->z; o->rawscreen[3] = w;
+    /* RECOMP_HOSTSCENE_LOG: guest vertices drawn after a host scene this frame (the depth
+     * encoding the host scene has to match: w or z, in depth-buffer units over zmax) */
+    if (s_hs_done && env_cached("RECOMP_HOSTSCENE_LOG")) {
+        static int probe;
+        if (probe < 900 && (probe++ % 30) == 0)
+            fprintf(stderr, "[HSPROBE] scr %.1f %.1f z %.1f w %.4f zmax %.0f wbuf %u clip %.1f..%.1f\n",
+                    o->rawscreen[0], o->rawscreen[1], x->z, x->w, gpu_zmax(), (s_vp.control0 >> 16) & 1u,
+                    s_vp.clip_min, s_vp.clip_max);
+    }
     memcpy(o->d0, x->col, sizeof o->d0);
     memcpy(o->d1, x->spec, sizeof o->d1);
     /* As the program wrote them; the shader applies each stage's convention. */
@@ -2435,6 +2446,7 @@ static int gpu_draw_batch_unlocked_body(int flat2d)
     c.depthp[1] = gpu_zmax();
     c.depthp[2] = s_vp.clip_max > s_vp.clip_min ? s_vp.clip_min : 0.0f;
     c.depthp[3] = s_vp.clip_max > s_vp.clip_min ? s_vp.clip_max : c.depthp[1];
+    if (s_vp.depth_test) memcpy(s_hs_guest_depthp, c.depthp, sizeof s_hs_guest_depthp);
     c.depthfmt[0] = (s_vp.control0 & 0x1000u) ? 0u :
                    (((s_gpu.format >> 4) & 0xFu) == 1u ? 16u : 24u);
     /* Offset applies to filled polygons, not line-list play art. Shader
@@ -2971,6 +2983,12 @@ static int gpu_host_scene(void)
     return r;
 }
 
+static void hs_zprobe(void)
+{
+    if (!env_cached("RECOMP_HOSTSCENE_ZPROBE")) return;
+    gpu_lock(); hs_zprobe_unlocked(); LeaveCriticalSection(&s_gpu_lock);
+}
+
 static int gpu_clear(uint32_t param)
 {
     int r;
@@ -2985,11 +3003,15 @@ static void gpu_flip(void)
 #else
 #include "nv2a_gpu_sdl3.inc.c"
 #include "xbox_hostscene.h"
-/* The SDL3 presenter (Linux, macOS) has no host scene pass yet: the marker is ignored. */
+/* Only the fallback SDL3 presenter lands here (no gx: a non-Android build without
+ * XBOXRECOMP_GX_PORTABLE, e.g. macOS). Linux (linux/CMakeLists.txt forces GX_PORTABLE) and
+ * Android render through gx on SDL_GPU and get the real host scene pass above; these stubs
+ * only keep the fallback linking. */
 void xbox_HostSceneSet(const XboxHostScene *scene) { (void)scene; }
 int xbox_HostSceneDrawn(void) { return 0; }
 static int gpu_host_scene(void) { return 0; }
 void xbox_HostSceneTrigger(const uint32_t *offsets, int n) { (void)offsets; (void)n; }
+int xbox_HostMeshAdd(const float *pnu, int nverts, const uint32_t *rgba, int tw, int th, int mat) { (void)pnu; (void)nverts; (void)rgba; (void)tw; (void)th; (void)mat; return -1; }
 static int gpu_host_scene_trigger(uint32_t tex_offset) { (void)tex_offset; return 0; }
 static void gpu_host_scene_frame_start(void) {}
 static void gpu_host_scene_flip(void) {}
