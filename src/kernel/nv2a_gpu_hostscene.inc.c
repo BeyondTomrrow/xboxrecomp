@@ -69,12 +69,28 @@ static void gpu_host_scene_flip(void)
 }
 
 static const char k_hs_hlsl[] =
-"cbuffer C : register(b3) {\n"
-"  row_major float4x4 vp; float4 eye; float4 sky; float4 ground; float4 lpos[4]; float4 lcol[4]; float4 misc;\n"
+/* One buffer, declared once per stage: SDL_GPU (GX_SDL: Direct3D 12, Vulkan) wants vertex
+ * uniforms in space 1 and pixel uniforms in space 3; Direct3D 11 takes slots 3 and 4. */
+"#ifdef GX_SDL\n"
+"[[vk::binding(0, 1)]] cbuffer VPULL : register(b0, space1) { uint4 pull; float4 jit; };\n"
+"[[vk::binding(1, 1)]] cbuffer CV : register(b1, space1) { row_major float4x4 vp; };\n"
+"[[vk::binding(0, 3)]] cbuffer CP : register(b0, space3) {\n"
+"#else\n"
+"cbuffer CV : register(b3) { row_major float4x4 vp; };\n"
+"cbuffer CP : register(b4) {\n"
+"#endif\n"
+"  row_major float4x4 vp_unused; float4 eye; float4 sky; float4 ground; float4 lpos[4]; float4 lcol[4]; float4 misc;\n"
 "};\n"
 "struct VI { float3 p : POSITION; float3 n : NORMAL; float4 c : COLOR; float2 m : TEXCOORD; };\n"
 "struct VO { float4 pos : SV_Position; float3 w : TEXCOORD0; float3 n : TEXCOORD1; float4 c : COLOR; float2 m : TEXCOORD2; };\n"
-"VO vs_main(VI i) { VO o; o.pos = mul(float4(i.p, 1), vp); o.w = i.p; o.n = i.n; o.c = i.c; o.m = i.m; return o; }\n"
+"#ifdef GX_SDL\n"
+"struct HV { float3 p; float3 n; float4 c; float2 m; };\n"
+"[[vk::binding(0, 0)]] StructuredBuffer<HV> VB : register(t0, space0);\n"
+"VO vs_main(uint id : SV_VertexID) { HV i = VB[pull.x + id];\n"
+"#else\n"
+"VO vs_main(VI i) {\n"
+"#endif\n"
+"  VO o; o.pos = mul(float4(i.p, 1), vp); o.w = i.p; o.n = i.n; o.c = i.c; o.m = i.m; return o; }\n"
 "float h21(float2 p) { return frac(sin(dot(p, float2(127.1, 311.7))) * 43758.5453); }\n"
 "float4 ps_main(VO i) : SV_Target {\n"
 "  float3 n = normalize(i.n), v = normalize(eye.xyz - i.w), base = i.c.rgb;\n"
@@ -223,10 +239,10 @@ static void hs_matrix(const XboxHostScene *sc, float aspect, float out[16])
     for (i = 0; i < 3; i++) f[i] = sc->at[i] - sc->eye[i];
     len = sqrtf(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]); if (len <= 0) len = 1;
     for (i = 0; i < 3; i++) f[i] /= len;
-    r[0] = f[1] * 0 - f[2] * 1; r[1] = f[2] * 0 - f[0] * 0; r[2] = f[0] * 1 - f[1] * 0;   /* f x up */
+    r[0] = f[2]; r[1] = 0; r[2] = -f[0];                       /* up x f: left-handed, x to the right */
     len = sqrtf(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]); if (len <= 0) len = 1;
     for (i = 0; i < 3; i++) r[i] /= len;
-    u[0] = r[1] * f[2] - r[2] * f[1]; u[1] = r[2] * f[0] - r[0] * f[2]; u[2] = r[0] * f[1] - r[1] * f[0];
+    u[0] = f[1] * r[2] - f[2] * r[1]; u[1] = f[2] * r[0] - f[0] * r[2]; u[2] = f[0] * r[1] - f[1] * r[0];   /* f x r */
     memset(view, 0, sizeof view);
     for (i = 0; i < 3; i++) { view[i * 4 + 0] = r[i]; view[i * 4 + 1] = u[i]; view[i * 4 + 2] = f[i]; }
     view[12] = -(r[0] * sc->eye[0] + r[1] * sc->eye[1] + r[2] * sc->eye[2]);
@@ -290,6 +306,10 @@ static int gpu_host_scene_unlocked(void)
     ID3D11DeviceContext_OMSetRenderTargets(s_gpu11.ctx, 1, &s->rtv, s_hs.dsv);
     memset(&vp, 0, sizeof vp); vp.Width = (float)w; vp.Height = (float)h; vp.MaxDepth = 1.0f;
     ID3D11DeviceContext_RSSetViewports(s_gpu11.ctx, 1, &vp);
+    {   /* the whole surface: gx (SDL_GPU) applies the last scissor even with scissoring off */
+        D3D11_RECT sc = { 0, 0, (LONG)w, (LONG)h };
+        ID3D11DeviceContext_RSSetScissorRects(s_gpu11.ctx, 1, &sc);
+    }
     ID3D11DeviceContext_RSSetState(s_gpu11.ctx, s_hs.rs);
     ID3D11DeviceContext_OMSetDepthStencilState(s_gpu11.ctx, s_hs.dss, 0);
     ID3D11DeviceContext_OMSetBlendState(s_gpu11.ctx, s_hs.bs, NULL, 0xFFFFFFFFu);
@@ -299,8 +319,9 @@ static int gpu_host_scene_unlocked(void)
     ID3D11DeviceContext_VSSetShader(s_gpu11.ctx, s_hs.vs, NULL, 0);
     ID3D11DeviceContext_GSSetShader(s_gpu11.ctx, NULL, NULL, 0);
     ID3D11DeviceContext_PSSetShader(s_gpu11.ctx, s_hs.ps, NULL, 0);
-    ID3D11DeviceContext_VSSetConstantBuffers(s_gpu11.ctx, 3, 1, &s_hs.cb);
-    ID3D11DeviceContext_PSSetConstantBuffers(s_gpu11.ctx, 3, 1, &s_hs.cb);
+    if (g_gx_sg) gxs_set_pull2(s_hs.vb, NULL, 0, 0, 0.0f, (UINT)sizeof(HsVert));   /* gx pulls vertices */
+    ID3D11DeviceContext_VSSetConstantBuffers(s_gpu11.ctx, g_gx_sg ? 1 : 3, 1, &s_hs.cb);
+    ID3D11DeviceContext_PSSetConstantBuffers(s_gpu11.ctx, g_gx_sg ? 0 : 4, 1, &s_hs.cb);
     if (env_cached("RECOMP_HOSTSCENE_DEBUG")) {          /* test switch: is the marker's surface the one shown? */
         static const float magenta[4] = { 1, 0, 1, 1 };
         ID3D11DeviceContext_ClearRenderTargetView(s_gpu11.ctx, s->rtv, magenta);
