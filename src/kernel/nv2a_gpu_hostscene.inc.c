@@ -599,6 +599,19 @@ static void hs_zprobe_unlocked(void)
                 const float *p = (const float *)((const uint8_t *)map.pData + (size_t)y * map.RowPitch + (size_t)x * 8u);
                 fprintf(stderr, "%s%.6f", gx ? " " : " | ", *p);
             }
+        {   /* where the game drew anything this frame: the box of pixels nearer than the clear
+             * (with the host scene on its own depth, that is the game's own 3D only) */
+            UINT x, y, x0 = sw, y0 = sh, x1 = 0, y1 = 0, cnt = 0;
+            for (y = 0; y < sh; y += 2)
+                for (x = 0; x < sw; x += 2) {
+                    float v = *(const float *)((const uint8_t *)map.pData + (size_t)y * map.RowPitch + (size_t)x * 8u);
+                    if (v < 0.99999f && v > 0.05f) {
+                        if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+                        cnt++;
+                    }
+                }
+            fprintf(stderr, " | box %u %u %u %u n %u t %lu", x0, y0, x1, y1, cnt, (unsigned long)GetTickCount());
+        }
         fprintf(stderr, "\n");
         ID3D11DeviceContext_Unmap(s_gpu11.ctx, (ID3D11Resource *)st, 0);
     }
