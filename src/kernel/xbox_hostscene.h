@@ -18,6 +18,7 @@
 #define XBOX_HOSTSCENE_MESHES 96                  /* placed meshes per scene */
 #define XBOX_HOSTSCENE_SHADOWS 16                 /* soft contact shadows on the floor */
 #define HS_MESH_TRIPLANAR 0x10                    /* xbox_HostMeshAdd mat flag: texture by world position */
+#define HS_MESH_PANORAMA  0x20                    /* ... an equirectangular view, looked up by direction (windows) */
 
 enum { HS_MAT_MATTE, HS_MAT_WOOD, HS_MAT_TILE, HS_MAT_MIRROR, HS_MAT_EMISSIVE, HS_MAT_FABRIC, HS_MAT_GLASS, HS_MAT_SCREEN };
 

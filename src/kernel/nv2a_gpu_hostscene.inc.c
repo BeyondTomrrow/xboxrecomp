@@ -107,6 +107,11 @@ static const char k_hs_hlsl[] =
 "  float3 n = normalize(i.n), v = normalize(eye.xyz - i.w), base = i.c.rgb;\n"
 "  int mat = (int)(i.m.x + 0.5); float glow = i.m.y; float spec_k = 0.15, gloss = 24.0;\n"
 "  if (mat == 4) return float4(pow(base, 1.0/2.2), 1);\n"
+"  if (mat >= 40) {\n"                      /* the view out of a window: a panorama at infinity */
+"    float3 d = normalize(i.w - eye.xyz);\n"
+"    float2 q = float2(atan2(d.x, d.z) / 6.2831853 + 0.5 + i.c.a, acos(clamp(d.y, -1.0, 1.0)) / 3.1415927);\n"
+"    return float4(Tex.SampleLevel(Smp, q, 0).rgb, 1);\n"
+"  }\n"
 "  if (mat >= 8) {\n"
 "    float4 t;\n"
 "    if (mat >= 24) {\n"                       /* triplanar: the texture by world position */
@@ -203,7 +208,7 @@ int xbox_HostMeshAdd(const float *pnu, int nverts, const uint32_t *rgba, int tw,
     if (!m.pnu || !m.rgba) { free(m.pnu); free(m.rgba); return -1; }
     memcpy(m.pnu, pnu, sizeof(float) * 8 * (size_t)nverts);
     memcpy(m.rgba, rgba, sizeof(uint32_t) * (size_t)tw * (size_t)th);
-    m.nv = nverts; m.tw = tw; m.th = th; m.mat = (mat & 7) | (mat & HS_MESH_TRIPLANAR);
+    m.nv = nverts; m.tw = tw; m.th = th; m.mat = (mat & 7) | (mat & (HS_MESH_TRIPLANAR | HS_MESH_PANORAMA));
     AcquireSRWLockExclusive(&s_hs_lock);
     id = s_hs_nmesh;
     if (id < HS_MAX_MESHES) { s_hs_mesh[id] = m; s_hs_nmesh = id + 1; }
@@ -391,7 +396,10 @@ static int hs_meshes_build(const XboxHostScene *sc)
             l = sqrtf(nx * nx + ny * ny + nz * nz); if (l <= 0.0f) l = 1.0f;
             o->n[0] = nx / l; o->n[1] = ny / l; o->n[2] = nz / l;
             o->c[0] = o->c[1] = o->c[2] = o->c[3] = 1.0f;
-            o->m[0] = 8.0f + (float)(m->mat & 7) + ((m->mat & HS_MESH_TRIPLANAR) ? 16.0f : 0.0f); o->m[1] = 0.0f;
+            o->m[0] = 8.0f + (float)(m->mat & 7) + ((m->mat & HS_MESH_TRIPLANAR) ? 16.0f : 0.0f)
+                    + ((m->mat & HS_MESH_PANORAMA) ? 32.0f : 0.0f);
+            o->m[1] = 0.0f;
+            if (m->mat & HS_MESH_PANORAMA) o->c[3] = s[6];        /* a panorama turns by its first u */
             o->uv[0] = s[6]; o->uv[1] = s[7];
         }
     }
