@@ -15,7 +15,7 @@
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
-#define FB_TITLE          "ESPN NFL 2K5 - LINUX V0.5"
+#define FB_TITLE          "ESPN NFL 2K5"
 #define FB_GUEST_RAM_SIZE 0x04000000u
 
 enum {
@@ -292,7 +292,7 @@ static int SDLCALL fb_thread_sdl(void *data) {
     {
         const char *on = getenv("RECOMP_SDLGPU"), *pres = getenv("RECOMP_SDLGPU_PRESENT");
         int expect = on && *on && strcmp(on, "0") != 0 && !(pres && strcmp(pres, "0") == 0);
-#if defined(__ANDROID__)
+#if !defined(_WIN32)
         /* gx on Vulkan presents into this window: no SDL_Renderer (an EGL
          * surface) first, which the Vulkan swap chain would then replace */
         {
