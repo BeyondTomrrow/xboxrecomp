@@ -105,6 +105,7 @@ static const char k_hs_hlsl[] =
 "float h21(float2 p) { return frac(sin(dot(p, float2(127.1, 311.7))) * 43758.5453); }\n"
 "float4 shade_hs(VO i) {\n"
 "  float3 n = normalize(i.n), v = normalize(eye.xyz - i.w), base = i.c.rgb;\n"
+"  if (dot(n, v) < 0.0) n = -n;\n"   /* two-sided: a thin piece (poster, sign) is lit on the side we see */
 "  int mat = (int)(i.m.x + 0.5); float glow = i.m.y; float spec_k = 0.15, gloss = 24.0;\n"
 "  if (mat == 4) return float4(pow(base, 1.0/2.2), 1);\n"
 "  if (mat >= 40) {\n"                      /* the view out of a window: a panorama at infinity */
@@ -188,7 +189,7 @@ typedef struct { float p[3], n[3], c[4], m[2], uv[2]; } HsVert;
 /* Registered meshes: the game side's vertices (8 floats each) and texture, until the render
  * thread makes its texture; placed copies are transformed into one buffer when the placements
  * change. */
-#define HS_MAX_MESHES 128
+#define HS_MAX_MESHES 1024
 typedef struct {
     float *pnu; int nv, mat;
     uint32_t *rgba; int tw, th;

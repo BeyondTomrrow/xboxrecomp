@@ -15,7 +15,7 @@
 #define XBOX_HOSTSCENE_MAGIC  0x48534E31u   /* "HSN1" */
 #define XBOX_HOSTSCENE_BOXES  320
 #define XBOX_HOSTSCENE_LIGHTS 4
-#define XBOX_HOSTSCENE_MESHES 96                  /* placed meshes per scene */
+#define XBOX_HOSTSCENE_MESHES 256                 /* placed meshes per scene */
 #define XBOX_HOSTSCENE_SHADOWS 16                 /* soft contact shadows on the floor */
 #define HS_MESH_TRIPLANAR 0x10                    /* xbox_HostMeshAdd mat flag: texture by world position */
 #define HS_MESH_PANORAMA  0x20                    /* ... an equirectangular view, looked up by direction (windows) */
