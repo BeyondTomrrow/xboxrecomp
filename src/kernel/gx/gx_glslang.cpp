@@ -108,7 +108,7 @@ extern "C" int gx_dxc_compile(const char *src, size_t len, const char *entry, co
     sh.setStringsWithLengths(&text, &text_len, 1);
     sh.setEntryPoint(entry);
     sh.setSourceEntryPoint(entry);
-    sh.setPreamble("#define GX_SDL 1\n#define GX_SPIRV 1\n");
+    sh.setPreamble("#define GX_SDL 1\n#define GX_SPIRV 1\n#define GX_GLSLANG 1\n");
     sh.setEnvInput(glslang::EShSourceHlsl, stage, glslang::EShClientVulkan, 100);
     sh.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_0);
     sh.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_0);

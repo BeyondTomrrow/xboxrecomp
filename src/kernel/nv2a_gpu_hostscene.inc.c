@@ -96,8 +96,18 @@ static const char k_hs_hlsl[] =
 "struct VO { float4 pos : SV_Position; float3 w : TEXCOORD0; float3 n : TEXCOORD1; float4 c : COLOR; float2 m : TEXCOORD2; float2 uv : TEXCOORD3; };\n"
 "#ifdef GX_SDL\n"
 "struct HV { float3 p; float3 n; float4 c; float2 m; float2 uv; };\n"
+"#ifdef GX_GLSLANG\n"
+/* glslang lays a struct of float3s out as std430 (64-byte stride); the buffer holds packed 56-byte
+ * vertices (DXC reads them with -fvk-use-dx-layout). Fetch the 14 floats one by one. */
+"[[vk::binding(0, 0)]] StructuredBuffer<float> VBF : register(t0, space0);\n"
+"VO vs_main(uint id : SV_VertexID) { uint b = (pull.x + id) * 14u; HV i;\n"
+"  i.p = float3(VBF[b], VBF[b + 1u], VBF[b + 2u]); i.n = float3(VBF[b + 3u], VBF[b + 4u], VBF[b + 5u]);\n"
+"  i.c = float4(VBF[b + 6u], VBF[b + 7u], VBF[b + 8u], VBF[b + 9u]); i.m = float2(VBF[b + 10u], VBF[b + 11u]);\n"
+"  i.uv = float2(VBF[b + 12u], VBF[b + 13u]);\n"
+"#else\n"
 "[[vk::binding(0, 0)]] StructuredBuffer<HV> VB : register(t0, space0);\n"
 "VO vs_main(uint id : SV_VertexID) { HV i = VB[pull.x + id];\n"
+"#endif\n"
 "#else\n"
 "VO vs_main(VI i) {\n"
 "#endif\n"
