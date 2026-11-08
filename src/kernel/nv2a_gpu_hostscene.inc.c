@@ -508,7 +508,7 @@ static int gpu_host_scene_unlocked(void)
         if (zf && GetTickCount() >= next) {
             FILE *f;
             next = GetTickCount() + 300;
-            if (!fopen_s(&f, zf, "r") && f) { have = fscanf(f, "%f %f %f %f", &ov[0], &ov[1], &ov[2], &ov[3]) >= 1; fclose(f); }
+            if ((f = fopen(zf, "r")) != NULL) { have = fscanf(f, "%f %f %f %f", &ov[0], &ov[1], &ov[2], &ov[3]) >= 1; fclose(f); }
         }
         if (zf && have) {
             if (ov[0] == 0.0f) shared = 0;
