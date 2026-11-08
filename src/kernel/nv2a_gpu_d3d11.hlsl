@@ -23,9 +23,22 @@ struct PIn {
     nointerpolation float4 tri1 : TEXCOORD7;
     nointerpolation float4 tri2 : TEXCOORD8;
     nointerpolation float2 depthmeta : TEXCOORD9;
+#ifdef GX_SDL
+    // Motion vectors (Vulkan / Direct3D 12): this frame's and last frame's
+    // clip position of the same vertex (gpu_vp_translate runs the program
+    // with last frame's constants too); equal where nothing is known.
+    float4 mvc : TEXCOORD10;
+    float4 mvp : TEXCOORD11;
+    nointerpolation float react : TEXCOORD12;   // 1: a 2D draw (HUD, text): the upscaler keeps no history for it
+#endif
 };
 struct POut {
     float4 c : SV_Target;
+#ifdef GX_SDL
+    float2 mv : SV_Target1;     // UV offset from this pixel to where it was last frame
+    float  dz : SV_Target2;     // the depth again, readable (FSR 3 reads it; the depth buffer is not)
+    float  rx : SV_Target3;     // reactive mask (MAX-blended)
+#endif
     float  d : SV_Depth;
 };
 
@@ -38,10 +51,21 @@ PIn vs_main(VIn v)
     o.rawscreen = v.rawscreen;
     o.tri0 = o.tri1 = o.tri2 = 0;
     o.depthmeta = 0;
+#ifdef GX_SDL
+    o.mvc = o.mvp = v.pos;
+    o.react = 0;
+#endif
     return o;
 }
 
+// GX_SDL: compiled by DXC for Vulkan/Direct3D 12 through SDL_GPU (gx/gx_sdl.c),
+// which wants pixel-shader uniforms in space 3 and texture/sampler pairs in
+// space 2 (SDL_CreateGPUShader). Without it this is the Direct3D 11 source.
+#ifdef GX_SDL
+[[vk::binding(0, 3)]] cbuffer C : register(b0, space3) {
+#else
 cbuffer C : register(b0) {
+#endif
     uint4  stg[8];        // combiner stages: color icw, ocw, alpha icw, ocw
     float4 f0[8];
     float4 f1[8];
@@ -90,6 +114,7 @@ precise float triangle_area(float2 a, float2 b, float2 c)
 // Preserve the original Xbox triangle through host clipping. Reconstructing
 // its depth in the pixel shader avoids the host's different plane rounding
 // on equal-depth field/model overlays (xemu geom.c and psh.c).
+#ifndef GX_SDL
 [maxvertexcount(3)]
 void gs_main(triangle GIn v[3], inout TriangleStream<PIn> stream)
 {
@@ -124,13 +149,91 @@ void gs_main(triangle GIn v[3], inout TriangleStream<PIn> stream)
     }
     stream.RestartStrip();
 }
+#else
+// SDL_GPU has no geometry shaders: the vertex shader reads its whole triangle
+// from the vertex buffer (bound as a storage buffer) and computes what gs_main
+// does. pull.x: first vertex, pull.y: 1 to rebuild triangles (else lines and
+// 2D: no metadata, as without the geometry shader), pullf.x: depthp.x.
+struct GV {
+    float4 pos; float4 d0; float4 d1; float4 t0; float4 t1; float4 t2; float4 t3; float4 wz; float4 rawscreen;
+};
+[[vk::binding(0, 0)]] StructuredBuffer<GV> VB : register(t0, space0);
+[[vk::binding(0, 1)]] cbuffer VPULL : register(b0, space1) { uint4 pull; float4 jit; };
 
+PIn vs_pull(uint id : SV_VertexID)
+{
+    GV v = VB[pull.x + id];
+    PIn o;
+    o.pos = v.pos; o.d0 = v.d0; o.d1 = v.d1;
+    o.t0 = v.t0; o.t1 = v.t1; o.t2 = v.t2; o.t3 = v.t3;
+    o.wz = v.wz; o.rawscreen = v.rawscreen;
+    o.tri0 = o.tri1 = o.tri2 = 0;
+    o.depthmeta = 0;
+    o.mvc = o.mvp = v.pos;                  // built on the CPU: no history, no motion
+    o.react = pull.y != 0u ? 0.0 : 1.0;
+    if (pull.y != 0u) {
+        uint b = pull.x + (id / 3u) * 3u;
+        float4 p0 = VB[b].rawscreen, p1 = VB[b + 1u].rawscreen, p2 = VB[b + 2u].rawscreen;
+        precise float2 e1 = p1.xy - p0.xy, e2 = p2.xy - p0.xy;
+        precise float b1 = p1.z - p0.z, b2 = p2.z - p0.z;
+        if (asfloat(pull.z) != 0.0) {
+            b1 = (p0.w - p1.w) / (p1.w * p0.w);
+            b2 = (p0.w - p2.w) / (p2.w * p0.w);
+        }
+        precise float det = e1.x * e2.y - e1.y * e2.x;
+        precise float dx = (b1 * e2.y - b2 * e1.y) / det;
+        precise float dy = (b2 * e1.x - b1 * e2.x) / det;
+        float slope = max(abs(dx), abs(dy));
+        if (isnan(slope) || isinf(slope)) slope = 0;
+        float clipped = 0;
+        if (p0.w <= 0.0 || abs(p0.x) >= 1e6 || abs(p0.y) >= 1e6) clipped = 1;
+        if (p1.w <= 0.0 || abs(p1.x) >= 1e6 || abs(p1.y) >= 1e6) clipped = 1;
+        if (p2.w <= 0.0 || abs(p2.x) >= 1e6 || abs(p2.y) >= 1e6) clipped = 1;
+        o.tri0 = p0; o.tri1 = p1; o.tri2 = p2;
+        o.depthmeta = clipped != 0 ? float2(0, 0) : float2(slope, 1);
+        o.pos.xy += jit.xy * o.pos.w;           // FSR camera jitter (motion vectors stay unjittered)
+    }
+    return o;
+}
+#endif
+
+#ifdef GX_SDL
+// Each SDL sampler slot is a texture with its sampler (Vulkan: a combined
+// image sampler). The cube maps share the 2D stages' samplers: slots 4-7 pair
+// textures 4-7 with samplers 0-3, as below.
+//@GX_PAIRS ps_main 0:0 1:1 2:2 3:3 4:0 5:1 6:2 7:3
+[[vk::combinedImageSampler]][[vk::binding(0, 2)]] Texture2D   T0 : register(t0, space2);
+[[vk::combinedImageSampler]][[vk::binding(0, 2)]] SamplerState S0 : register(s0, space2);
+[[vk::combinedImageSampler]][[vk::binding(1, 2)]] Texture2D   T1 : register(t1, space2);
+[[vk::combinedImageSampler]][[vk::binding(1, 2)]] SamplerState S1 : register(s1, space2);
+[[vk::combinedImageSampler]][[vk::binding(2, 2)]] Texture2D   T2 : register(t2, space2);
+[[vk::combinedImageSampler]][[vk::binding(2, 2)]] SamplerState S2 : register(s2, space2);
+[[vk::combinedImageSampler]][[vk::binding(3, 2)]] Texture2D   T3 : register(t3, space2);
+[[vk::combinedImageSampler]][[vk::binding(3, 2)]] SamplerState S3 : register(s3, space2);
+[[vk::combinedImageSampler]][[vk::binding(4, 2)]] TextureCube Q0 : register(t4, space2);
+[[vk::combinedImageSampler]][[vk::binding(4, 2)]] SamplerState S4 : register(s4, space2);
+[[vk::combinedImageSampler]][[vk::binding(5, 2)]] TextureCube Q1 : register(t5, space2);
+[[vk::combinedImageSampler]][[vk::binding(5, 2)]] SamplerState S5 : register(s5, space2);
+[[vk::combinedImageSampler]][[vk::binding(6, 2)]] TextureCube Q2 : register(t6, space2);
+[[vk::combinedImageSampler]][[vk::binding(6, 2)]] SamplerState S6 : register(s6, space2);
+[[vk::combinedImageSampler]][[vk::binding(7, 2)]] TextureCube Q3 : register(t7, space2);
+[[vk::combinedImageSampler]][[vk::binding(7, 2)]] SamplerState S7 : register(s7, space2);
+#define CS0 S4
+#define CS1 S5
+#define CS2 S6
+#define CS3 S7
+#else
 Texture2D   T0 : register(t0); Texture2D   T1 : register(t1);
 Texture2D   T2 : register(t2); Texture2D   T3 : register(t3);
 TextureCube Q0 : register(t4); TextureCube Q1 : register(t5);
 TextureCube Q2 : register(t6); TextureCube Q3 : register(t7);
 SamplerState S0 : register(s0); SamplerState S1 : register(s1);
 SamplerState S2 : register(s2); SamplerState S3 : register(s3);
+#define CS0 S0
+#define CS1 S1
+#define CS2 S2
+#define CS3 S3
+#endif
 
 float4 tex2d(uint s, float2 uv)
 {
@@ -142,10 +245,10 @@ float4 tex2d(uint s, float2 uv)
 
 float4 texcube(uint s, float3 d)
 {
-    if (s == 0u) return Q0.Sample(S0, d);
-    if (s == 1u) return Q1.Sample(S1, d);
-    if (s == 2u) return Q2.Sample(S2, d);
-    return Q3.Sample(S3, d);
+    if (s == 0u) return Q0.Sample(CS0, d);
+    if (s == 1u) return Q1.Sample(CS1, d);
+    if (s == 2u) return Q2.Sample(CS2, d);
+    return Q3.Sample(CS3, d);
 }
 
 // A 2D lookup at coordinates given in the stage's convention: texels for a
@@ -266,8 +369,25 @@ POut ps_main(PIn i)
     // Floating Xbox depth keeps its fractional value.
     if (depthfmt.x != 0u) zd = floor(zd);
     r.d = zd / depthp.y;
+#ifdef GX_SDL
+    {
+        float2 cur = i.mvc.xy / i.mvc.w, prv = i.mvp.xy / i.mvp.w;
+        r.mv = (prv - cur) * float2(0.5, -0.5);
+        if (any(isnan(r.mv)) || any(isinf(r.mv)) || i.mvc.w <= 0.0 || i.mvp.w <= 0.0) r.mv = 0;
+        r.dz = r.d;
+        r.rx = i.react * saturate(r.c.a * 4.0);
+    }
+#endif
     return r;
 }
+
+// The previous stage's dot product. Stage 0 has none (its dot modes are
+// invalid there); DXIL refuses the out-of-range read Direct3D 11 tolerates.
+#ifdef GX_SDL
+#define DTPREV(s) ((s) == 0u ? 0u : (s) - 1u)
+#else
+#define DTPREV(s) (s - 1)
+#endif
 
 float4 shade(PIn i)
 {
@@ -294,12 +414,12 @@ float4 shade(PIn i)
         }
         else if (m == 0x09u) {                                                   // DOT_ST
             dt[s] = dot(pt.xyz, dotmapf(dotmap[s], prev));
-            t[s] = tex2dc(s, float2(dt[s - 1], dt[s]));
+            t[s] = tex2dc(s, float2(dt[DTPREV(s)], dt[s]));
         }
         else if (m == 0x0Bu) {                                                   // DOT_RFLCT_DIFF (stage 2)
             dt[s] = dot(pt.xyz, dotmapf(dotmap[s], prev));
             float dn = dot(T[3].xyz, dotmapf(dotmap[3], t[min(input[3], 3u)]));
-            t[s] = texdir(s, float3(dt[s - 1], dt[s], dn));
+            t[s] = texdir(s, float3(dt[DTPREV(s)], dt[s], dn));
         }
         else if (m == 0x0Cu) {                                                   // DOT_RFLCT_SPEC (stage 3)
             dt[s] = dot(pt.xyz, dotmapf(dotmap[s], prev));
@@ -385,7 +505,7 @@ float4 shade(PIn i)
         }
         o = saturate(o);
     }
-    if (show.x >= 1u && show.x <= 4u) return float4(t[show.x - 1u].rgb, 1.0);
+    if (show.x >= 1u && show.x <= 4u) return float4(t[(show.x - 1u) & 3u].rgb, 1.0);
     if (show.x == 5u) return float4(d0.rgb, 1.0);
     if (show.x == 6u) return float4(o.aaa, 1.0);
     if (alpha.x != 0u) {

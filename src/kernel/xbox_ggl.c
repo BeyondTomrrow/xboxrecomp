@@ -46,6 +46,7 @@ static XBOX_THREAD_LOCAL int t_depth;
  * actually spinning.  The last kernel return site only identifies the most
  * recent service call and can be far from the bad generated branch. */
 #ifdef _WIN32
+static LONG symbols_ready;
 static void ggl_report_owner_pc(DWORD tid)
 {
     HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
@@ -56,7 +57,6 @@ static void ggl_report_owner_pc(DWORD tid)
     SYMBOL_INFO *symbol = (SYMBOL_INFO *)storage;
     IMAGEHLP_LINE64 line;
     DWORD line_displacement = 0;
-    static LONG symbols_ready;
     if (!thread) return;
     if (SuspendThread(thread) == (DWORD)-1) { CloseHandle(thread); return; }
     memset(&context, 0, sizeof(context));
@@ -93,7 +93,64 @@ static void ggl_report_owner_pc(DWORD tid)
     }
     fflush(stderr);
 }
+
+/* RECOMP_GGL_LONGWAIT_MS: the owner's host call stack, while the main thread
+ * waits (diagnostics; the per-frame "game thread lock wait" says how long,
+ * not where the owner is). */
+static void ggl_report_owner_stack(DWORD tid, LONGLONG waited_ms)
+{
+    HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                               THREAD_QUERY_INFORMATION, FALSE, tid);
+    CONTEXT context;
+    DWORD64 pcs[14];
+    int n = 0, i;
+    char storage[sizeof(SYMBOL_INFO) + MAX_SYM_NAME];
+    SYMBOL_INFO *symbol = (SYMBOL_INFO *)storage;
+    char line[1400];
+    size_t len;
+    if (!thread) return;
+    if (InterlockedCompareExchange(&symbols_ready, 1, 0) == 0) {
+        SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME);
+        SymInitialize(GetCurrentProcess(), NULL, TRUE);
+    }
+    if (SuspendThread(thread) == (DWORD)-1) { CloseHandle(thread); return; }
+    memset(&context, 0, sizeof(context));
+    context.ContextFlags = CONTEXT_FULL;
+    if (GetThreadContext(thread, &context)) {
+        /* Unwind while it is suspended without allocating (it may hold the
+         * heap lock); symbols are looked up after it runs again. */
+        while (n < 14 && context.Rip) {
+            DWORD64 base = 0, frame = 0;
+            PVOID handler_data = NULL;
+            PRUNTIME_FUNCTION fe;
+            pcs[n++] = context.Rip;
+            fe = RtlLookupFunctionEntry(context.Rip, &base, NULL);
+            if (!fe) {                         /* leaf: return address at [rsp] */
+                context.Rip = *(DWORD64 *)(uintptr_t)context.Rsp;
+                context.Rsp += 8;
+            } else {
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, context.Rip, fe, &context, &handler_data, &frame, NULL);
+            }
+        }
+    }
+    ResumeThread(thread);
+    CloseHandle(thread);
+    if (!n) return;
+    len = (size_t)snprintf(line, sizeof line, "  [GGL] main thread waiting %lld ms; owner %lu at:", waited_ms, (unsigned long)tid);
+    for (i = 0; i < n && len < sizeof line - 90; i++) {
+        DWORD64 d = 0;
+        memset(storage, 0, sizeof(storage));
+        symbol->SizeOfStruct = sizeof(*symbol);
+        symbol->MaxNameLen = MAX_SYM_NAME;
+        if (SymFromAddr(GetCurrentProcess(), pcs[i], &d, symbol))
+            len += (size_t)snprintf(line + len, sizeof line - len, " %.60s", symbol->Name);
+        else
+            len += (size_t)snprintf(line + len, sizeof line - len, " %p", (void *)(uintptr_t)pcs[i]);
+    }
+    fprintf(stderr, "%s\n", line);
+}
 #else
+static void ggl_report_owner_stack(DWORD tid, LONGLONG waited_ms) { (void)tid; (void)waited_ms; }
 static void ggl_report_owner_pc(DWORD tid)
 {
     /* No portable way to sample another thread's PC; the watchdog's guest
@@ -124,6 +181,36 @@ static int ggl_stat_slot(void)
  * title's input layer) and how long a thread has waited for the lock in all,
  * in QPC ticks -- the frame-statistics hitch log reports the game thread's. */
 volatile DWORD g_xbox_game_tid;
+/* The thread that holds the lock most (the title's main thread): how long it
+ * has waited for the lock in all. The input poll's thread id was used before,
+ * but more than one thread polls, so the hitch log's figure jumped between
+ * threads' totals. */
+DWORD xbox_ggl_main_tid(void)
+{
+    int best = -1;
+    for (int i = 0; i < GGL_STAT_SLOTS; i++)
+        if (g_stat[i].tid && (best < 0 || g_stat[i].held > g_stat[best].held)) best = i;
+    return best < 0 ? 0 : g_stat[best].tid;
+}
+
+LONGLONG xbox_ggl_main_waited_qpc(void)
+{
+    int best = -1;
+    for (int i = 0; i < GGL_STAT_SLOTS; i++)
+        if (g_stat[i].tid && (best < 0 || g_stat[i].held > g_stat[best].held)) best = i;
+    return best < 0 ? 0 : g_stat[best].waited;
+}
+
+/* ...and how long it has held the guest CPU in all (the performance
+ * overlay's game-thread time, nv2a_gpu_perfhud.inc.c). */
+LONGLONG xbox_ggl_main_held_qpc(void)
+{
+    int best = -1;
+    for (int i = 0; i < GGL_STAT_SLOTS; i++)
+        if (g_stat[i].tid && (best < 0 || g_stat[i].held > g_stat[best].held)) best = i;
+    return best < 0 ? 0 : g_stat[best].held;
+}
+
 LONGLONG xbox_ggl_waited_qpc(DWORD tid)
 {
     for (int i = 0; i < GGL_STAT_SLOTS; i++)
@@ -137,6 +224,9 @@ static LONGLONG qpc_now(void)
     QueryPerformanceCounter(&v);
     return v.QuadPart;
 }
+
+/* Set by the interpreter: prints the guest address it is running. */
+void (*g_ggl_stall_report)(void);
 
 static DWORD WINAPI ggl_watchdog(LPVOID unused)
 {
@@ -168,7 +258,8 @@ static DWORD WINAPI ggl_watchdog(LPVOID unused)
                                     "best waiting prio=%ld last kernel call returned to guest 0x%08X\n",
                             g_owner, g_waiters, g_best_waiting_prio, g_owner_last_site);
                     fflush(stderr);
-                    if (g_owner) ggl_report_owner_pc(g_owner);
+                    if (g_owner) { ggl_report_owner_pc(g_owner); ggl_report_owner_stack(g_owner, 10000); }
+                    if (g_ggl_stall_report) g_ggl_stall_report();
                     WakeAllConditionVariable(&g_turn);
                 }
             } else {
@@ -187,6 +278,8 @@ static DWORD WINAPI ggl_watchdog(LPVOID unused)
                     owner, ms, g_owner_last_site, g_waiters);
             fflush(stderr);
             reported = owner;
+            ggl_report_owner_stack(owner, ms);
+            if (g_ggl_stall_report) g_ggl_stall_report();
         }
     }
     return 0;   /* not reached */
@@ -256,8 +349,56 @@ static void ggl_acquire_raw(void)
         g_wait[me].tid = tid; g_wait[me].prio = t_prio; g_wait[me].seq = seq;
         ggl_update_best();
         InterlockedIncrement(&g_waiters);
-        while (g_owner != 0 || !ggl_is_next(seq, t_prio))
-            SleepConditionVariableSRW(&g_turn, &g_lock, INFINITE, 0);
+        {
+            /* RECOMP_GGL_ISR_SAMPLE=1: when the interrupt thread (top
+             * priority) has waited 30 ms, name where the owner is running --
+             * the guest code that keeps an ISR (the APU's, so the audio)
+             * waiting (AUDIO-REPORT-HOTKEY-20261022). */
+            static int sample = -1;
+            static volatile LONG reports;
+            int sampled = 0;
+            if (sample < 0) sample = getenv("RECOMP_GGL_ISR_SAMPLE") != NULL;
+            while (g_owner != 0 || !ggl_is_next(seq, t_prio)) {
+                if (sample && t_prio >= 100 && !sampled) {
+                    if (!SleepConditionVariableSRW(&g_turn, &g_lock, 30, 0) &&
+                        (qpc_now() - asked) * 1000 / g_qpc_freq >= 30 && g_owner) {
+                        DWORD o = g_owner;
+                        unsigned site = g_owner_last_site;
+                        sampled = 1;
+                        if (InterlockedIncrement(&reports) <= 300) {
+                            ReleaseSRWLockExclusive(&g_lock);
+                            fprintf(stderr, "  [GGL] ISR thread waiting 30 ms for thread %lu (last kernel call returned to 0x%08X):\n",
+                                    (unsigned long)o, site);
+                            ggl_report_owner_pc(o);
+                            AcquireSRWLockExclusive(&g_lock);
+                        }
+                    }
+                    continue;
+                }
+                {
+                    static int longwait = -1;
+                    static volatile LONG lw_reports;
+                    if (longwait < 0) {
+                        const char *v = getenv("RECOMP_GGL_LONGWAIT_MS");
+                        longwait = v ? atoi(v) : 0;
+                    }
+                    if (longwait > 0 && t_prio < 100) {
+                        if (!SleepConditionVariableSRW(&g_turn, &g_lock, 15, 0)) {
+                            LONGLONG ms = (qpc_now() - asked) * 1000 / g_qpc_freq;
+                            DWORD o = g_owner;
+                            if (ms >= longwait && o && o != tid && tid == xbox_ggl_main_tid()
+                                    && InterlockedIncrement(&lw_reports) <= 2000) {
+                                ReleaseSRWLockExclusive(&g_lock);
+                                ggl_report_owner_stack(o, ms);
+                                AcquireSRWLockExclusive(&g_lock);
+                            }
+                        }
+                        continue;
+                    }
+                }
+                SleepConditionVariableSRW(&g_turn, &g_lock, INFINITE, 0);
+            }
+        }
         InterlockedDecrement(&g_waiters);
         for (int i = 0; i < g_nwait; i++)
             if (g_wait[i].tid == tid) { g_wait[i] = g_wait[--g_nwait]; break; }

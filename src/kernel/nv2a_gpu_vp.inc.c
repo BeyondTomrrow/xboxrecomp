@@ -71,7 +71,8 @@ static int gpu_vp_enabled(void)
     static int on = -1;
     if (on < 0) {
         const char *v = env_cached("RECOMP_GPU_VP");
-        on = v && *v && *v != '0';
+        /* SDL_GPU: only the raw-input form (vertices and indices are pulled) */
+        on = v && *v && *v != '0' && (!g_gx_sg || gpu_vp_raw_on());
     }
     return on;
 }
@@ -108,13 +109,13 @@ static const char *k_vp_prelude =
  * draw copies the guest's raw vertex bytes into a ByteAddressBuffer and the
  * program decodes each input itself (vfetch), from a per-draw table in b2:
  * va[k] = { byte offset of vertex 0, stride, type | size << 8 | mode << 16 }
- * with mode 0 = no data (0,0,0,1), 1 = constant (vk[k]), 2 = array. The
+ * with mode 0 = no data (0,0,0,1), 1 = constant (vkon[k]; "vk" is a reserved namespace for DXC -spirv), 2 = array. The
  * decoding is fetch_attr's, format for format. Converting every vertex on
  * the CPU and sending 256 bytes of it was ~70% of the draw path
  * (2026-10-02). */
 static const char *k_vp_prelude_raw =
     "cbuffer VC : register(b1) { float4 c[192]; float4 info; float4 clipr; float4 fogp; float4 lightp; };\n"
-    "cbuffer VA : register(b2) { int4 va[16]; float4 vk[16]; };\n"
+    "cbuffer VA : register(b2) { int4 va[16]; float4 vkon[16]; };\n"
     "ByteAddressBuffer RB : register(t0);\n"
     "struct PIn { float4 pos:SV_Position; float4 d0:COLOR0; float4 d1:COLOR1;\n"
     "  float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3; float4 wz:TEXCOORD4; float4 rawscreen:TEXCOORD5;\n"
@@ -127,7 +128,7 @@ static const char *k_vp_prelude_raw =
     "float4 vfetch(int k, uint vid) {\n"
     "  int4 d = va[k]; uint ty = (uint)d.z & 255u, sz = ((uint)d.z >> 8) & 255u, md = ((uint)d.z >> 16) & 255u;\n"
     "  float4 r = float4(0, 0, 0, 1);\n"
-    "  if (md == 1u) return vk[k];\n"
+    "  if (md == 1u) return vkon[k];\n"
     "  if (md != 2u) return r;\n"
     "  int a = d.x + (int)vid * d.y;\n"
     "  if (ty == 0u) { uint w = rb32(a); float4 q = float4(w & 255u, (w >> 8) & 255u, (w >> 16) & 255u, w >> 24) / 255.0;\n"
@@ -189,6 +190,58 @@ static const char *k_vp_epilogue =
     "  return o;\n"
     "}\n";
 
+/* SDL_GPU (gx/gx_sdl.c): the same program for Vulkan / Direct3D 12. Vertex
+ * uniforms in space 1 (slot 0 is the draw's pull data, 1 and 2 the buffers
+ * bound at b1 and b2 on Direct3D 11), the raw vertex bytes and the index list
+ * as storage buffers in space 0. With no geometry shader, vs_main below runs
+ * the program for its own vertex and for the other two corners of its
+ * triangle, and rebuilds the triangle as gs_main does. */
+static const char *k_vp_sg_head =
+    "[[vk::binding(0, 1)]] cbuffer VPULL : register(b0, space1) { uint4 vpull; float4 vjit; };\n"
+    "[[vk::binding(1, 1)]] cbuffer VC : register(b1, space1) { float4 c[192]; float4 info; float4 clipr; float4 fogp; float4 lightp; };\n"
+    "[[vk::binding(2, 1)]] cbuffer VA : register(b2, space1) { int4 va[16]; float4 vkon[16]; };\n"
+    "[[vk::binding(0, 0)]] ByteAddressBuffer RB : register(t0, space0);\n"
+    "[[vk::binding(1, 0)]] StructuredBuffer<uint> IX : register(t1, space0);\n"
+    /* Last frame's constants for this draw (gpu_vp_prev_consts): the same
+     * program run with them gives each vertex's previous position. */
+    "[[vk::binding(3, 1)]] cbuffer VCP : register(b3, space1) { float4 cp[192]; };\n"
+    "#define CSEL(i) (usep ? cp[i] : c[i])\n"
+    "struct PIn { float4 pos:SV_Position; float4 d0:COLOR0; float4 d1:COLOR1;\n"
+    "  float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3; float4 wz:TEXCOORD4; float4 rawscreen:TEXCOORD5;\n"
+    "  nointerpolation float4 tri0:TEXCOORD6; nointerpolation float4 tri1:TEXCOORD7; nointerpolation float4 tri2:TEXCOORD8;\n"
+    "  nointerpolation float2 depthmeta:TEXCOORD9; float4 mvc:TEXCOORD10; float4 mvp:TEXCOORD11;\n"
+    "  nointerpolation float react:TEXCOORD12; };\n";
+
+static const char *k_vp_sg_main =
+    "PIn vs_main(uint id : SV_VertexID) {\n"
+    "  PIn o = vp_one(IX[vpull.x + id], false);\n"
+    "  o.mvc = o.pos; o.react = 0;\n"
+    "  o.mvp = vpull.w != 0u ? vp_one(IX[vpull.x + id], true).pos : o.pos;\n"
+    "  if (vpull.y != 0u) {\n"
+    "    uint cn = id % 3u, t = vpull.x + id - cn;\n"
+    "    float4 pa = vp_one(IX[t + (cn + 1u) % 3u], false).rawscreen, pb = vp_one(IX[t + (cn + 2u) % 3u], false).rawscreen;\n"
+    "    float4 p0 = cn == 0u ? o.rawscreen : cn == 1u ? pb : pa;\n"
+    "    float4 p1 = cn == 1u ? o.rawscreen : cn == 2u ? pb : pa;\n"
+    "    float4 p2 = cn == 2u ? o.rawscreen : cn == 0u ? pb : pa;\n"
+    "    precise float2 e1 = p1.xy - p0.xy, e2 = p2.xy - p0.xy;\n"
+    "    precise float b1 = p1.z - p0.z, b2 = p2.z - p0.z;\n"
+    "    if (asfloat(vpull.z) != 0.0) { b1 = (p0.w - p1.w) / (p1.w * p0.w); b2 = (p0.w - p2.w) / (p2.w * p0.w); }\n"
+    "    precise float det = e1.x * e2.y - e1.y * e2.x;\n"
+    "    precise float dx = (b1 * e2.y - b2 * e1.y) / det;\n"
+    "    precise float dy = (b2 * e1.x - b1 * e2.x) / det;\n"
+    "    float slope = max(abs(dx), abs(dy));\n"
+    "    if (isnan(slope) || isinf(slope)) slope = 0;\n"
+    "    float clipped = 0;\n"
+    "    if (p0.w <= 0.0 || abs(p0.x) >= 1e6 || abs(p0.y) >= 1e6) clipped = 1;\n"
+    "    if (p1.w <= 0.0 || abs(p1.x) >= 1e6 || abs(p1.y) >= 1e6) clipped = 1;\n"
+    "    if (p2.w <= 0.0 || abs(p2.x) >= 1e6 || abs(p2.y) >= 1e6) clipped = 1;\n"
+    "    o.tri0 = p0; o.tri1 = p1; o.tri2 = p2;\n"
+    "    o.depthmeta = clipped != 0 ? float2(0, 0) : float2(slope, 1);\n"
+    "    o.pos.xy += vjit.xy * o.pos.w;\n"
+    "  }\n"
+    "  return o;\n"
+    "}\n";
+
 typedef struct { char *p; size_t n, cap; } VpBuf;
 
 static void vpb(VpBuf *b, const char *fmt, ...)
@@ -217,10 +270,12 @@ static void vp_src_expr(char *out, size_t n, const uint32_t *t, int mux, int reg
     case 2:  snprintf(base, sizeof base, "v[%u]", vp_field(t, 1, 9, 4)); break;
     case 3: {
         int ci = (int)vp_field(t, 1, 13, 8);
+        /* SDL_GPU: CSEL picks this frame's or last frame's constants (motion vectors). */
         if (vp_field(t, 3, 1, 1))
-            snprintf(base, sizeof base, "c[clamp(%d + a0, 0, %d)]", ci, VP_CONSTS - 1);
+            snprintf(base, sizeof base, g_gx_sg ? "CSEL(clamp(%d + a0, 0, %d))" : "c[clamp(%d + a0, 0, %d)]",
+                     ci, VP_CONSTS - 1);
         else
-            snprintf(base, sizeof base, "c[%d]", ci < VP_CONSTS ? ci : VP_CONSTS - 1);
+            snprintf(base, sizeof base, g_gx_sg ? "CSEL(%d)" : "c[%d]", ci < VP_CONSTS ? ci : VP_CONSTS - 1);
         break;
     }
     default: snprintf(base, sizeof base, "R[0]"); break;
@@ -253,11 +308,15 @@ static char *gpu_vp_translate(uint32_t start, uint32_t *len_out)
         const char *h0 = strstr(k_vp_prelude, "float vrcp");
         const char *h1 = strstr(k_vp_prelude, "PIn vs_main(VSIn i)");
         uint32_t mask = gpu_vp_input_mask(start), k;
+        if (g_gx_sg) {
+            vpb(&b, "%s", k_vp_sg_head);                       /* with its own PIn */
+            vpb(&b, "%s", strstr(k_vp_prelude_raw, "uint rb8("));
+        } else
         vpb(&b, "%s", k_vp_prelude_raw);
         if (h0 && h1 && h1 > h0)
             vpb(&b, "%.*s", (int)(h1 - h0), h0);
-        vpb(&b, "PIn vs_main(uint vid : SV_VertexID) {\n"
-                "  float4 v[16]; float4 R[13]; float4 O[16]; int a0 = 0; int k;\n"
+        vpb(&b, "%s", g_gx_sg ? "PIn vp_one(uint vid, bool usep) {\n" : "PIn vs_main(uint vid : SV_VertexID) {\n");
+        vpb(&b, "  float4 v[16]; float4 R[13]; float4 O[16]; int a0 = 0; int k;\n"
                 "  [unroll] for (k = 0; k < 16; k++) v[k] = float4(0, 0, 0, 1);\n"
                 "  [unroll] for (k = 0; k < 13; k++) R[k] = float4(0, 0, 0, 0);\n"
                 "  [unroll] for (k = 0; k < 16; k++) O[k] = float4(0, 0, 0, 1);\n");
@@ -347,6 +406,8 @@ static char *gpu_vp_translate(uint32_t start, uint32_t *len_out)
             break;
     }
     vpb(&b, "%s", k_vp_epilogue);
+    if (g_gx_sg)
+        vpb(&b, "%s", k_vp_sg_main);
     if (len_out)
         *len_out = (slot < VP_PROG_LEN ? slot + 1 : VP_PROG_LEN) - start;
     return b.p;
@@ -427,7 +488,7 @@ static void gpu_vp_compile_job(GpuVpJob *j)
 
     {   /* in the per-user cache folder (kernel_path.c xbox_user_path) */
         char rel[64];
-        snprintf(rel, sizeof rel, "cache\\vp\\%016llX.cso", (unsigned long long)sh);
+        snprintf(rel, sizeof rel, "cache\\vp%s\\%016llX.cso", gx_cache_suffix(), (unsigned long long)sh);
         xbox_user_path(rel, path, sizeof path);
     }
     f = fopen(path, "rb");
@@ -454,8 +515,14 @@ static void gpu_vp_compile_job(GpuVpJob *j)
         }
         code = ID3D10Blob_GetBufferPointer(blob);
         size = ID3D10Blob_GetBufferSize(blob);
-        CreateDirectoryA("cache", NULL);
-        CreateDirectoryA("cache\\vp", NULL);
+        {
+            char dir[MAX_PATH], rel[32];
+            xbox_user_path("cache", dir, sizeof dir);
+            CreateDirectoryA(dir, NULL);
+            snprintf(rel, sizeof rel, "cache\\vp%s", gx_cache_suffix());
+            xbox_user_path(rel, dir, sizeof dir);
+            CreateDirectoryA(dir, NULL);
+        }
         f = fopen(path, "wb");
         if (f) { fwrite(code, 1, size, f); fclose(f); }
         {
@@ -703,6 +770,8 @@ static int gpu_vp_ring_write(ID3D11Buffer *buf, UINT cap, UINT *pos, const void 
         return 0;
     memcpy((uint8_t *)m.pData + *pos, src, size);
     ID3D11DeviceContext_Unmap(s_gpu11.ctx, (ID3D11Resource *)buf, 0);
+    if (g_gx_sg)
+        gxs_buffer_written(buf, *pos, *pos + size);
     *at = *pos;
     *pos += (size + 255u) & ~255u;
     return 1;
@@ -850,6 +919,8 @@ static int gpu_vp_raw_upload(void)
             return 0;
         }
         ID3D11DeviceContext_Unmap(s_gpu11.ctx, (ID3D11Resource *)s_vp_raw, 0);
+        if (g_gx_sg)
+            gxs_buffer_written(s_vp_raw, s_vp_raw_pos, s_vp_raw_pos + total);
     }
     for (k = 0; k < NV_VERTEX_ATTRS; k++) {
         if (span_of[k] < 0)
@@ -863,6 +934,65 @@ static int gpu_vp_raw_upload(void)
         return 0;
     memcpy(m.pData, &va, sizeof va);
     ID3D11DeviceContext_Unmap(s_gpu11.ctx, (ID3D11Resource *)s_vp_vacb, 0);
+    return 1;
+}
+
+/* ---- last frame's constants, for motion vectors (SDL_GPU) ----------------
+ * Each vertex-program draw is matched to the same draw of the previous frame
+ * by (program start, texture, how many such draws came before it this
+ * frame) -- the game issues its draws in a fixed order -- and the shader runs
+ * the program with that frame's constants as well (CSEL, cp[]). Camera,
+ * players' bones and animated objects all move through the constants, so
+ * this gives each vertex its true previous position. No match: no motion. */
+#define MVP_SLOTS 8192u
+typedef struct { uint32_t key, frame; float c[VP_CONSTS][4]; } MvpEnt;
+static MvpEnt *s_mvp_tab;                      /* [2][MVP_SLOTS]: by frame parity */
+static struct { uint32_t key, frame, n; } s_mvp_ord[4096];
+static ID3D11Buffer *s_vp_cbprev;
+
+static uint32_t mvp_hash(uint32_t a, uint32_t b, uint32_t c)
+{
+    uint32_t h = 2166136261u;
+    h = (h ^ a) * 16777619u; h = (h ^ b) * 16777619u; h = (h ^ c) * 16777619u;
+    return (h ^ (h >> 15)) | 1u;
+}
+
+/* Fills last frame's constants for this draw into s_vp_cbprev; returns 1
+ * when they are known. */
+static int gpu_vp_prev_consts(void)
+{
+    uint32_t f = s_gpu11.frame, id = mvp_hash(s_vp.start, s_gpu.tex.valid ? s_gpu.tex.offset : 0, 0);
+    uint32_t o = id & 4095u, ord, key, i;
+    MvpEnt *cur = NULL, *prev = NULL;
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (!s_mvp_tab) {
+        s_mvp_tab = (MvpEnt *)calloc(2u * MVP_SLOTS, sizeof *s_mvp_tab);
+        if (!s_mvp_tab) return 0;
+    }
+    if (!s_vp_cbprev) {
+        D3D11_BUFFER_DESC bd;
+        memset(&bd, 0, sizeof bd);
+        bd.Usage = D3D11_USAGE_DYNAMIC; bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        bd.ByteWidth = sizeof(float) * 4 * VP_CONSTS; bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        if (FAILED(ID3D11Device_CreateBuffer(s_gpu11.dev, &bd, NULL, &s_vp_cbprev))) return 0;
+    }
+    if (s_mvp_ord[o].key != id || s_mvp_ord[o].frame != f) { s_mvp_ord[o].key = id; s_mvp_ord[o].frame = f; s_mvp_ord[o].n = 0; }
+    ord = s_mvp_ord[o].n++;
+    key = mvp_hash(s_vp.start, s_gpu.tex.valid ? s_gpu.tex.offset : 0, ord + 1u);
+    for (i = 0; i < 8; i++) {                  /* this frame's slot: free, stale or ours */
+        MvpEnt *e = &s_mvp_tab[(f & 1u) * MVP_SLOTS + ((key + i) & (MVP_SLOTS - 1u))];
+        if (e->frame != f || e->key == key) { cur = e; break; }
+    }
+    for (i = 0; i < 8; i++) {                  /* last frame's */
+        MvpEnt *e = &s_mvp_tab[((f - 1u) & 1u) * MVP_SLOTS + ((key + i) & (MVP_SLOTS - 1u))];
+        if (e->frame == f - 1u && e->key == key) { prev = e; break; }
+    }
+    if (cur) { cur->key = key; cur->frame = f; memcpy(cur->c, s_vp.c, sizeof cur->c); }
+    if (!prev) return 0;
+    if (FAILED(ID3D11DeviceContext_Map(s_gpu11.ctx, (ID3D11Resource *)s_vp_cbprev, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
+        return 0;
+    memcpy(m.pData, prev->c, sizeof prev->c);
+    ID3D11DeviceContext_Unmap(s_gpu11.ctx, (ID3D11Resource *)s_vp_cbprev, 0);
     return 1;
 }
 
@@ -964,6 +1094,12 @@ static int gpu_vp_bind(uint32_t nverts, uint32_t nidx, uint32_t rw, uint32_t rh,
         if (s_bound.vs_cb1 != s_vp_cb) {
             ID3D11DeviceContext_VSSetConstantBuffers(s_gpu11.ctx, 1, 1, &s_vp_cb);
             s_bound.vs_cb1 = s_vp_cb;
+        }
+        if (g_gx_sg) {
+            int have = g_want_motion ? gpu_vp_prev_consts() : 0;   /* motion only for FSR 3 */
+            if (have)
+                ID3D11DeviceContext_VSSetConstantBuffers(s_gpu11.ctx, 3, 1, &s_vp_cbprev);
+            gxs_set_pull_mv(have);
         }
     }
     return 1;

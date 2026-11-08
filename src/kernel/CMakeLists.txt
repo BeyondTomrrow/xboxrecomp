@@ -11,6 +11,7 @@ set(KERNEL_SOURCES
     kernel_memory.c
     kernel_file.c
     kernel_overlay.c
+    kernel_pack.c
     kernel_thread.c
     xbox_ggl.c
     kernel_sync.c
@@ -29,8 +30,47 @@ set(KERNEL_SOURCES
 
 )
 
+if(WIN32)
+    # The D3D11 renderer on Vulkan / Direct3D 12 through SDL_GPU (gx/gx_sdl.c);
+    # shaders compiled at run time by dxcompiler.dll (shipped next to the exe).
+    list(APPEND KERNEL_SOURCES gx/gx_sdl.c gx/gx_dxc.cpp gx/gx_ffx.cpp)
+endif()
+
+# The same renderer on hosts without Direct3D (Android): SDL_GPU on Vulkan,
+# shaders compiled by glslang (gx/gx_glslang.cpp), Direct3D types from the
+# mingw-w64 headers (DXVK's native set) and gx/portable.
+if(ANDROID)
+    set(_gx_portable_default ON)
+else()
+    set(_gx_portable_default OFF)
+endif()
+option(XBOXRECOMP_GX_PORTABLE "Build the D3D11 renderer on SDL_GPU/Vulkan without Windows" ${_gx_portable_default})
+set(XBOXRECOMP_DX_HEADERS "C:/Android/src/dxvk/include/native/directx" CACHE PATH "mingw-w64 DirectX headers (DXVK include/native/directx)")
+if(XBOXRECOMP_GX_PORTABLE AND NOT WIN32)
+    list(APPEND KERNEL_SOURCES gx/gx_sdl.c gx/gx_glslang.cpp gx/gx_portable.c)
+endif()
+
+# Data packs (kernel_pack.c) decompress with zstd (BSD); the consuming project
+# vendors it. Without it, packs are not read.
+get_filename_component(_xbox_zstd_default "${CMAKE_CURRENT_SOURCE_DIR}/../../../zstd" ABSOLUTE)
+set(XBOXRECOMP_ZSTD_DIR "${_xbox_zstd_default}" CACHE PATH "zstd source folder (zstd.h, common/, decompress/)")
+if(EXISTS "${XBOXRECOMP_ZSTD_DIR}/zstd.h")
+    file(GLOB _xbox_zstd_src "${XBOXRECOMP_ZSTD_DIR}/common/*.c" "${XBOXRECOMP_ZSTD_DIR}/decompress/*.c")
+    list(APPEND KERNEL_SOURCES ${_xbox_zstd_src})
+    set(_xbox_have_zstd ON)
+endif()
+
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
 target_link_libraries(xbox_kernel PUBLIC SDL3::SDL3)
+if(_xbox_have_zstd)
+    target_include_directories(xbox_kernel PRIVATE "${XBOXRECOMP_ZSTD_DIR}" "${XBOXRECOMP_ZSTD_DIR}/common")
+    target_compile_definitions(xbox_kernel PRIVATE XBOX_HAVE_ZSTD=1 ZSTD_DISABLE_ASM=1 ZSTD_MULTITHREAD=0)
+endif()
+if(XBOXRECOMP_GX_PORTABLE AND NOT WIN32)
+    target_compile_definitions(xbox_kernel PRIVATE XBOX_GX_PORTABLE=1)
+    target_include_directories(xbox_kernel PRIVATE ${XBOXRECOMP_DX_HEADERS} ${CMAKE_CURRENT_SOURCE_DIR}/gx/portable)
+    target_link_libraries(xbox_kernel PRIVATE glslang SPIRV glslang-default-resource-limits)
+endif()
 
 # See src/platform/CMakeLists.txt: resolve src/ relative to this file, not via
 # CMAKE_SOURCE_DIR, which is the consuming project's root under add_subdirectory().
@@ -44,6 +84,16 @@ target_include_directories(xbox_kernel PUBLIC
 if(WIN32)
     # platform contributes the src/ include path and guarded guest-memory copies.
     target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt)
+    # AMD FidelityFX SDK 1.1.4 (MIT), built locally: FSR 3 for gx/gx_ffx.cpp.
+    set(XBOXRECOMP_FFX_SDK "H:/2K5Remade-local/fidelityfx/FidelityFX-SDK-1.1.4/sdk" CACHE PATH "FidelityFX SDK folder")
+    target_include_directories(xbox_kernel PRIVATE ${XBOXRECOMP_FFX_SDK}/include)
+    target_link_libraries(xbox_kernel PUBLIC
+        ${XBOXRECOMP_FFX_SDK}/bin/ffx_sdk/ffx_fsr3_x64.lib
+        ${XBOXRECOMP_FFX_SDK}/bin/ffx_sdk/ffx_fsr3upscaler_x64.lib
+        ${XBOXRECOMP_FFX_SDK}/bin/ffx_sdk/ffx_frameinterpolation_x64.lib
+        ${XBOXRECOMP_FFX_SDK}/bin/ffx_sdk/ffx_opticalflow_x64.lib
+        ${XBOXRECOMP_FFX_SDK}/bin/ffx_sdk/ffx_backend_dx12_x64.lib
+        d3d12 dxgi)
 else()
     # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
     find_package(OpenSSL REQUIRED)

@@ -11,7 +11,12 @@
  *   - Thread priorities use NT KPRIORITY increments
  */
 
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 #include "kernel.h"
+#include <stdio.h>
+#include <stdlib.h>
 #include "xbox_memory_layout.h"   /* XBOX_WORKER_STACK_* + worker-stack decls */
 
 /* ============================================================================
@@ -29,6 +34,9 @@ typedef struct _XBOX_THREAD_START_INFO {
 
 static DWORD WINAPI xbox_thread_wrapper(LPVOID lpParameter)
 {
+#if defined(__linux__)
+    prctl(PR_SET_NAME, "guest", 0, 0, 0);   /* named in the Android [CPU] report */
+#endif
     XBOX_THREAD_START_INFO info = *(XBOX_THREAD_START_INFO*)lpParameter;
 
     /* Free the start info before calling the routine - the routine may
@@ -191,12 +199,27 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
         ms = (DWORD)(diff / 10000);
     }
 
-    if (Alertable) {
-        DWORD result = SleepEx(ms, TRUE);
-        if (result == WAIT_IO_COMPLETION)
+    {
+        static int log = -1, told;
+        LARGE_INTEGER a = {0}, b, f;
+        DWORD result = 0;
+        if (log < 0) log = getenv("RECOMP_SLEEP_LOG") != NULL;
+        if (log) QueryPerformanceCounter(&a);
+        if (Alertable)
+            result = SleepEx(ms, TRUE);
+        else
+            Sleep(ms);
+        if (log) {
+            double took;
+            QueryPerformanceCounter(&b);
+            QueryPerformanceFrequency(&f);
+            took = (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)f.QuadPart;
+            if (took > ms + 3.0 && told++ < 60)
+                fprintf(stderr, "  [SLEEP] thread %lu asked %lu ms, slept %.1f ms\n",
+                        GetCurrentThreadId(), ms, took);
+        }
+        if (Alertable && result == WAIT_IO_COMPLETION)
             return STATUS_ALERTED;
-    } else {
-        Sleep(ms);
     }
 
     return STATUS_SUCCESS;

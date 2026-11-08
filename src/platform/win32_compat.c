@@ -33,6 +33,9 @@ size_t view_take(const void *addr);
 #include <sched.h>
 #include <fenv.h>
 #include <sys/mman.h>
+#if defined(__ANDROID__)
+#include <sys/syscall.h>
+#endif
 #include "guest_memory.h"
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
@@ -914,6 +917,16 @@ static void *thread_trampoline(void *arg)
     w32_object *o = (w32_object *)arg;
     t_self_obj = o;
     t_tid      = o->tid;
+#if defined(__ANDROID__)
+    {   /* a stack for signal handlers: a crash reporter must still run when
+         * this thread's own stack is what overflowed */
+        stack_t ss;
+        ss.ss_sp = malloc(64 * 1024);
+        ss.ss_size = 64 * 1024;
+        ss.ss_flags = 0;
+        if (ss.ss_sp) sigaltstack(&ss, NULL);
+    }
+#endif
 
     /* CREATE_SUSPENDED gate */
     pthread_mutex_lock(&o->lock);
@@ -1026,7 +1039,12 @@ BOOL TerminateThread(HANDLE h, DWORD exitCode)
 {
     w32_object *o = (w32_object *)h;
     if (!o || o->kind != K_THREAD) return FALSE;
+#if defined(__ANDROID__)
+    /* bionic has no pthread_cancel: the thread is only marked finished */
+    fprintf(stderr, "[COMPAT] TerminateThread: no thread cancellation on Android\n");
+#else
     pthread_cancel(o->thread);
+#endif
     pthread_mutex_lock(&o->lock);
     o->exit_code = exitCode;
     o->exited    = 1;
@@ -1568,6 +1586,9 @@ VOID SecureZeroMemory(PVOID ptr, SIZE_T cnt)
 {
 #if defined(__APPLE__)
     memset_s(ptr, cnt, 0, cnt);
+#elif defined(__ANDROID__)
+    volatile unsigned char *p = (volatile unsigned char *)ptr;
+    while (cnt--) *p++ = 0;
 #else
     explicit_bzero(ptr, cnt);
 #endif
@@ -1638,6 +1659,17 @@ BOOL ReadFile(HANDLE h, LPVOID buf, DWORD len, LPDWORD nread, void *overlapped)
     ssize_t n = read(fd, buf, len);
     if (n < 0)  { if (nread) *nread = 0; SetLastError(ERROR_GEN_FAILURE);    return FALSE; }
     if (nread)  *nread = (DWORD)n;
+    return TRUE;
+}
+
+BOOL SetFilePointerEx(HANDLE h, LARGE_INTEGER dist, PLARGE_INTEGER newpos, DWORD method)
+{
+    int fd = w32_handle_fd(h);
+    off_t r;
+    if (fd < 0) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    r = lseek(fd, (off_t)dist.QuadPart, method == 2 ? SEEK_END : method == 1 ? SEEK_CUR : SEEK_SET);
+    if (r < 0) { SetLastError(ERROR_GEN_FAILURE); return FALSE; }
+    if (newpos) newpos->QuadPart = (LONGLONG)r;
     return TRUE;
 }
 
@@ -1861,6 +1893,8 @@ static int anon_map_fd(const char *name)
     int fd = shm_open(shm_name, O_CREAT | O_RDWR | O_EXCL, 0600);
     if (fd >= 0) shm_unlink(shm_name);
     return fd;
+#elif defined(__ANDROID__)
+    return (int)syscall(__NR_memfd_create, name ? name : "xbox_map", 0);   /* memfd_create(): API 30 */
 #else
     return memfd_create(name ? name : "xbox_map", 0);
 #endif

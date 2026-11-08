@@ -24,17 +24,22 @@
  * Opt-in with RECOMP_GPU=1 while it is verified against the software path.
  *
  * ponytail: depth/stencil clears with a partial rectangle clear the whole
- * buffer; fog is not applied; no mipmaps (level 0 only).
+ * buffer; fog is not applied. Mip levels: the title's own for DXT textures,
+ * box-filtered from level 0 for decoded ones (gpu_guest_levels, 2026-10-30).
  */
-#define COBJMACROS
-#if defined(_WIN32)
-#include <d3d11.h>
-#include <d3d11_1.h>     /* ID3D11Device1: shared HUD textures */
-#include <d3dcompiler.h>
-#include <d3d11sdklayers.h>
+#if defined(_WIN32) || defined(XBOX_GX_PORTABLE)
+/* The D3D11 method calls below run on Direct3D 11 itself, or on Vulkan or
+ * Direct3D 12 through SDL_GPU (gx/gx_sdl.c), chosen at start-up. With
+ * XBOX_GX_PORTABLE (Android) only SDL_GPU on Vulkan exists. */
+#include "gx/gx_d3d11.h"
+#ifdef _WIN32
 #include <intrin.h>        /* __rdtsc: draw-path profile */
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3dcompiler.lib")
+#else
+#include "gx/gx_portable.h"
+#include <SDL3/SDL_messagebox.h>
+#endif
 
 typedef struct {
     float pos[4];
@@ -66,11 +71,23 @@ typedef struct {
     uint32_t ox;                         /* widescreen: extra guest columns on each side of tex */
     ID3D11Texture2D *ctr;                /* ox > 0: the original-width centre, scaled (RT + SRV) */
     ID3D11RenderTargetView *ctr_rtv;
+    ID3D11Texture2D *mv;                 /* SDL_GPU: motion vectors (R16G16 float, target 1) */
+    ID3D11RenderTargetView *mv_rtv;
+    ID3D11Texture2D *dz;                 /* SDL_GPU: depth as R32 float (target 2), for the upscaler */
+    ID3D11RenderTargetView *dz_rtv;
+    ID3D11Texture2D *rx;                 /* SDL_GPU: reactive mask, 2D draws (target 3), for the upscaler */
+    ID3D11RenderTargetView *rx_rtv;
 } GpuSurface;
 
 /* Internal resolution (video settings): every render target is this many
  * times its guest size. Set by the presenter; surfaces follow on next use. */
 static uint32_t g_render_scale = 1;
+/* Motion vectors, depth copy and reactive mask (extra render targets for
+ * FSR 3) are only made while upscaling or frame generation is on: at a
+ * high scale they were most of the bandwidth of every draw (2026-10-29). */
+static int g_want_mv = 1;
+static int g_want_motion = 1;   /* last frame's constants for motion vectors (FSR 3 only) */
+#define GPU_SURF_WANTS_MV(w, h) (g_gx_sg && g_want_mv && (w) >= 640 && (h) >= 448)
 static uint32_t g_aniso = 1;
 /* 0 preserves the original Xbox combiner output. Optional profiles are
  * applied after the emulated material/lighting pipeline. */
@@ -103,11 +120,66 @@ static uint32_t gpu_wide_ox(uint32_t w, uint32_t h)
 /* The scale a target of this guest size (with its widescreen columns) gets:
  * the setting, stepped down until it fits D3D11's 16384 texture limit (a 32:9
  * target at a higher multiplier can exceed the hardware dimension limit). */
+#include <dxgi1_4.h>
+
+/* The graphics card with the most video memory, straight from DXGI: on
+ * Direct3D 12/Vulkan the IDXGI* macros go to gx_sdl.c, so the methods are
+ * called through the vtables. *dedicated gets its video memory in bytes. */
+static IDXGIAdapter3 *gpu_dxgi_adapter3(UINT64 *dedicated)
+{
+    static int tried;
+    static IDXGIAdapter3 *a3;
+    static UINT64 ded;
+    if (!tried) {
+        IDXGIFactory1 *f = NULL;
+        tried = 1;
+        if (SUCCEEDED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f))) {
+            IDXGIAdapter1 *a = NULL;
+            UINT i;
+            for (i = 0; f->lpVtbl->EnumAdapters1(f, i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
+                DXGI_ADAPTER_DESC1 d;
+                if (SUCCEEDED(a->lpVtbl->GetDesc1(a, &d)) && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+                        d.DedicatedVideoMemory > ded) {
+                    IDXGIAdapter3 *n = NULL;
+                    if (SUCCEEDED(a->lpVtbl->QueryInterface(a, &IID_IDXGIAdapter3, (void **)&n))) {
+                        if (a3) a3->lpVtbl->Release(a3);
+                        a3 = n;
+                        ded = d.DedicatedVideoMemory;
+                    }
+                }
+                a->lpVtbl->Release(a);
+            }
+            f->lpVtbl->Release(f);
+        }
+    }
+    if (dedicated) *dedicated = ded;
+    return a3;
+}
+
 static uint32_t gpu_fit_scale(uint32_t full_w, uint32_t h)
 {
     uint32_t sc = g_render_scale;
+    UINT64 ded = 0;
     while (sc > 1 && (full_w * sc > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION || h * sc > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION))
         sc--;
+    /* Video memory: three screen-sized targets (colour 4 + depth 8 + centre
+     * copy 4 bytes a pixel, + 9 with FSR 3's targets) within 55% of it. At
+     * 16x in 21:9 one target is ~2 GB; past an 8 GB card's memory Windows
+     * pages them to system RAM and the game ran at 2-8 fps with the GPU
+     * idle (2026-10-29). RECOMP_NO_VRAM_CAP=1 lifts the cap. */
+    gpu_dxgi_adapter3(&ded);
+    if (ded >= (512ull << 20) && !env_cached("RECOMP_NO_VRAM_CAP")) {
+        UINT64 budget = ded / 100 * 55 / 3, bpp = 16 + (GPU_SURF_WANTS_MV(640, 480) ? 9 : 0);
+        static uint32_t told;
+        uint32_t want = sc;
+        while (sc > 1 && (UINT64)full_w * sc * h * sc * bpp > budget)
+            sc--;
+        if (sc != want && told != sc) {
+            told = sc;
+            fprintf(stderr, "  [GPU11] %ux%u: internal resolution %ux -> %ux to fit %llu MB of video memory\n",
+                    full_w, h, want, sc, (unsigned long long)(ded >> 20));
+        }
+    }
     return sc;
 }
 
@@ -167,6 +239,7 @@ static struct {
     ID3D11Device *dev;
     ID3D11DeviceContext *ctx;
     ID3D11VertexShader *vs;
+    ID3D11VertexShader *vs_pull;         /* SDL_GPU: vs_pull, the geometry shader's work */
     ID3D11PixelShader *ps;
     ID3D11GeometryShader *gs;
     ID3D11InputLayout *layout;
@@ -227,6 +300,8 @@ static int gpu_renderer_mode(void)
             mode = RENDERER_SDL_GPU;
         else if (r && (! _stricmp(r, "d3d11") || ! _stricmp(r, "dx11")))
             mode = RENDERER_D3D11;
+        else if (r && (! _stricmp(r, "vulkan") || ! _stricmp(r, "vk") || ! _stricmp(r, "d3d12") || ! _stricmp(r, "dx12")))
+            mode = RENDERER_SDL_GPU;     /* gx/gx_sdl.c picks the API */
         else if (g && strcmp(g, "0") == 0)
             mode = RENDERER_CPU;
         else
@@ -292,6 +367,14 @@ static int gpu_init(void)
     if (FAILED(hr)) {
         fprintf(stderr, "  [GPU11] D3D11CreateDevice failed 0x%08lX; staying on the software rasteriser\n",
                 (unsigned long)hr);
+#if defined(XBOX_GX_PORTABLE) && !defined(__ANDROID__)
+        /* Linux has no other renderer: say so instead of showing a black window */
+        fflush(stderr);
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "ESPN NFL 2K5",
+                                 "No working Vulkan driver was found. Install your GPU's Vulkan driver "
+                                 "and check it with: vulkaninfo --summary", NULL);
+        ExitProcess(1);
+#endif
         return 0;
     }
     hr = D3DCompile(k_gpu_hlsl, strlen(k_gpu_hlsl), "nv2a", NULL, NULL, "vs_main", "vs_4_0", 0, 0, &vsb, &err);
@@ -306,6 +389,20 @@ static int gpu_init(void)
     }
     ID3D11Device_CreateVertexShader(s_gpu11.dev, ID3D10Blob_GetBufferPointer(vsb), ID3D10Blob_GetBufferSize(vsb), NULL, &s_gpu11.vs);
     ID3D11Device_CreatePixelShader(s_gpu11.dev, ID3D10Blob_GetBufferPointer(psb), ID3D10Blob_GetBufferSize(psb), NULL, &s_gpu11.ps);
+    if (g_gx_sg) {
+        /* No geometry shaders on SDL_GPU: every batch pulls its vertices in
+         * vs_pull, which also rebuilds the original triangle (gs_main). */
+        ID3DBlob *pb = NULL;
+        hr = D3DCompile(k_gpu_hlsl, strlen(k_gpu_hlsl), "nv2a", NULL, NULL, "vs_pull", "vs_5_0",
+                        D3DCOMPILE_IEEE_STRICTNESS, 0, &pb, &err);
+        if (FAILED(hr) || FAILED(ID3D11Device_CreateVertexShader(s_gpu11.dev, ID3D10Blob_GetBufferPointer(pb),
+                                                                 ID3D10Blob_GetBufferSize(pb), NULL, &s_gpu11.vs_pull))) {
+            fprintf(stderr, "  [GPU11] vs_pull failed: %s\n", err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "?");
+            return 0;
+        }
+        ID3D10Blob_Release(pb);
+        fprintf(stderr, "  [GPU11] renderer API: %s\n", gx_backend_name());
+    } else
     if (!env_cached("RECOMP_GPU_PLANE_DEPTH") || *env_cached("RECOMP_GPU_PLANE_DEPTH") != '0') {
         hr = D3DCompile(k_gpu_hlsl, strlen(k_gpu_hlsl), "nv2a", NULL, NULL, "gs_main", "gs_4_0",
                         D3DCOMPILE_IEEE_STRICTNESS, 0, &gsb, &err);
@@ -464,6 +561,12 @@ static void gpu_release_surface(GpuSurface *s)
     if (s->ctr) ID3D11Texture2D_Release(s->ctr);
     if (s->copy_srv) ID3D11ShaderResourceView_Release(s->copy_srv);
     if (s->copy) ID3D11Texture2D_Release(s->copy);
+    if (s->mv_rtv) ID3D11RenderTargetView_Release(s->mv_rtv);
+    if (s->mv) ID3D11Texture2D_Release(s->mv);
+    if (s->dz_rtv) ID3D11RenderTargetView_Release(s->dz_rtv);
+    if (s->dz) ID3D11Texture2D_Release(s->dz);
+    if (s->rx_rtv) ID3D11RenderTargetView_Release(s->rx_rtv);
+    if (s->rx) ID3D11Texture2D_Release(s->rx);
     memset(s, 0, sizeof *s);
 }
 
@@ -511,6 +614,11 @@ static int gpu_bind_surface(void)
     uint32_t w = s_gpu.clip_x + s_gpu.clip_w, h = s_gpu.clip_y + s_gpu.clip_h;
     uint32_t guest = dma_resolve(s_gpu.color_offset);
     int i, free_i = -1;
+    LARGE_INTEGER rb_t[5];                  /* RECOMP_REBUILD_LOG: where a rebuild's time goes */
+    int rb_on = 0;
+    GpuSurface carry;                       /* the old target while a resized one takes its pixels */
+
+    memset(&carry, 0, sizeof carry);
 
     if (surface_bpp() != 4 || !w || !h || w > 4096 || h > 4096 || !s_gpu.pitch) {
         /* RECOMP_GPU_PROFILE: surfaces that fall back to the software
@@ -538,15 +646,28 @@ static int gpu_bind_surface(void)
                     /* Retain a prior lower allocation after an OOM step-down,
                      * but rebuild if the player changes the requested scale. */
                     && s->requested_scale == gpu_fit_scale(w + 2 * gpu_wide_ox(w, h), h)
-                    && s->ox == gpu_wide_ox(w, h)) {
+                    && s->ox == gpu_wide_ox(w, h)
+                    && (s->mv_rtv != NULL) == (GPU_SURF_WANTS_MV(w, h) != 0)) {
                 if (s->stale) {             /* the CPU drew into it since */
                     gpu_surface_upload(s);
                     s->stale = 0;
                 }
                 return i;
             }
-            gpu_readback(s);
+            if (env_cached("RECOMP_REBUILD_LOG")) QueryPerformanceCounter(&rb_t[0]);
+            if (s->dirty && !s->stale && s->w == w && s->h == h && s->pitch == s_gpu.pitch
+                    && s->ox == gpu_wide_ox(w, h) && !env_cached("RECOMP_NO_GPU_CARRY")) {
+                /* Only the scale changed (auto resolution): the new target is
+                 * drawn from the old one on the GPU. Reading it back to guest
+                 * RAM and uploading it again waited for the GPU to finish the
+                 * frame, 5-170 ms a target (2026-10-30). */
+                carry = *s;
+                memset(s, 0, sizeof *s);
+            } else
+                gpu_readback(s);
+            if (env_cached("RECOMP_REBUILD_LOG")) QueryPerformanceCounter(&rb_t[1]);
             gpu_release_surface(s);
+            if (env_cached("RECOMP_REBUILD_LOG")) { QueryPerformanceCounter(&rb_t[2]); rb_t[3] = rb_t[4] = rb_t[2]; rb_on = 1; }
             free_i = i;
             break;
         }
@@ -572,7 +693,7 @@ retry_surface_create:
         td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
         sd.pSysMem = mem + guest; sd.SysMemPitch = s_gpu.pitch; sd.SysMemSlicePitch = 0;
-        if (FAILED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, sc == 1 && !ox ? &sd : NULL, &s->tex)) ||
+        if (FAILED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, sc == 1 && !ox && !carry.tex ? &sd : NULL, &s->tex)) ||
                 FAILED(ID3D11Device_CreateRenderTargetView(s_gpu11.dev, (ID3D11Resource *)s->tex, NULL, &s->rtv)))
             goto surface_create_failed;
         s->guest = guest; s->w = w; s->h = h; s->pitch = s_gpu.pitch;
@@ -602,7 +723,10 @@ retry_surface_create:
             if (FAILED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, NULL, &s->down)) || !s->down ||
                     FAILED(ID3D11Device_CreateRenderTargetView(s_gpu11.dev, (ID3D11Resource *)s->down, NULL, &s->down_rtv)))
                 goto surface_create_failed;
-            gpu_surface_upload(s);
+            if (rb_on) QueryPerformanceCounter(&rb_t[3]);
+            if (!carry.tex)
+                gpu_surface_upload(s);
+            if (rb_on) QueryPerformanceCounter(&rb_t[4]);
         }
         td.Usage = D3D11_USAGE_STAGING; td.BindFlags = 0; td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         if (FAILED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, NULL, &s->staging)) || !s->staging)
@@ -614,7 +738,50 @@ retry_surface_create:
                 FAILED(ID3D11Device_CreateDepthStencilView(s_gpu11.dev, (ID3D11Resource *)s->ds, NULL, &s->dsv)) || !s->dsv)
             goto surface_create_failed;
         ID3D11DeviceContext_ClearDepthStencilView(s_gpu11.ctx, s->dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+        if (GPU_SURF_WANTS_MV(w, h)) {
+            /* Screen-sized targets get motion vectors (upscaling and frame
+             * generation read them); off-screen ones do not need them. */
+            static const float zero[4] = { 0, 0, 0, 0 };
+            td.Format = DXGI_FORMAT_R16G16_FLOAT;
+            td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+            if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, NULL, &s->mv)) &&
+                SUCCEEDED(ID3D11Device_CreateRenderTargetView(s_gpu11.dev, (ID3D11Resource *)s->mv, NULL, &s->mv_rtv)))
+                ID3D11DeviceContext_ClearRenderTargetView(s_gpu11.ctx, s->mv_rtv, zero);
+            td.Format = DXGI_FORMAT_R32_FLOAT;
+            if (s->mv_rtv && SUCCEEDED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, NULL, &s->dz)) &&
+                SUCCEEDED(ID3D11Device_CreateRenderTargetView(s_gpu11.dev, (ID3D11Resource *)s->dz, NULL, &s->dz_rtv))) {
+                static const float far1[4] = { 1, 1, 1, 1 };
+                ID3D11DeviceContext_ClearRenderTargetView(s_gpu11.ctx, s->dz_rtv, far1);
+                td.Format = DXGI_FORMAT_R8_UNORM;
+                if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, NULL, &s->rx)) &&
+                    SUCCEEDED(ID3D11Device_CreateRenderTargetView(s_gpu11.dev, (ID3D11Resource *)s->rx, NULL, &s->rx_rtv)))
+                    ID3D11DeviceContext_ClearRenderTargetView(s_gpu11.ctx, s->rx_rtv, zero);
+            }
+        }
         s->dirty = 0;
+        if (carry.tex) {
+            ID3D11ShaderResourceView *srv = NULL;
+            if (SUCCEEDED(ID3D11Device_CreateShaderResourceView(s_gpu11.dev, (ID3D11Resource *)carry.tex, NULL, &srv))) {
+                gpu_blit(srv, s->rtv, (w + 2 * ox) * sc, h * sc, 0);
+                ID3D11ShaderResourceView_Release(srv);
+                s->dirty = 1;               /* guest RAM still has the old frame */
+            } else {
+                gpu_readback(&carry);
+                gpu_surface_upload(s);
+            }
+            s->gen = carry.gen + 1;
+            gpu_release_surface(&carry);
+        }
+        if (rb_on) {
+            LARGE_INTEGER e, fq;
+            QueryPerformanceCounter(&e);
+            QueryPerformanceFrequency(&fq);
+#define RB_MS(a, b) ((double)((b).QuadPart - (a).QuadPart) * 1000.0 / (double)fq.QuadPart)
+            fprintf(stderr, "  [REBUILD] %08X x%u: readback %.1f ms, release %.1f, create %.1f, upload %.1f, rest %.1f\n",
+                    guest, sc, RB_MS(rb_t[0], rb_t[1]), RB_MS(rb_t[1], rb_t[2]), RB_MS(rb_t[2], rb_t[3]),
+                    RB_MS(rb_t[3], rb_t[4]), RB_MS(rb_t[4], e));
+#undef RB_MS
+        }
         if (sc != requested_sc)
             fprintf(stderr, "  [GPU11] render target requested %ux, allocated %ux after memory fallback\n", requested_sc, sc);
         return free_i;
@@ -622,6 +789,10 @@ surface_create_failed:
         gpu_release_surface(s);
         if (sc > 1) { sc--; goto retry_surface_create; }
         fprintf(stderr, "  [GPU11] could not allocate %ux%u render target even at 1x\n", w + 2 * ox, h);
+        if (carry.tex) {
+            gpu_readback(&carry);
+            gpu_release_surface(&carry);
+        }
         return -1;
     }
 }
@@ -671,6 +842,10 @@ const uint32_t *(*g_xbox_tex_override)(uint32_t fmt, uint32_t w, uint32_t h, uin
 volatile long g_xbox_tex_dump_wanted;   /* the title dumps textures: DXT ones are decoded for it */
 
 /* DXT1/3/5 (BC1/2/3) to BGRA, for a texture dump. */
+/* BC1-3 sampled as they are, unless the device lacks them (gx/gx_sdl.c) */
+int gxs_bc_supported(void);
+static int gpu_bc_ok(void) { return !g_gx_sg || gxs_bc_supported(); }
+
 static uint32_t *dxt_decode(const uint8_t *src, uint32_t w, uint32_t h, uint32_t fmt)
 {
     uint32_t *out = (uint32_t *)calloc((size_t)w * h, 4), bx, by, i;
@@ -716,8 +891,12 @@ static uint32_t *dxt_decode(const uint8_t *src, uint32_t w, uint32_t h, uint32_t
 static uint32_t gpu_tex_bytes(const Texture *t);
 static int tex_override_wants(const Texture *t)
 {
-    return g_xbox_tex_override && g_xbox_tex_override_wants &&
-           g_xbox_tex_override_wants(t->color, t->width, t->height);
+    /* The hook's own value: bit 0 may replace, bit 1 follows gen(). As
+     * "a && b && wants()" it was 0/1, so bit 1 never reached gpu_tex_hash and a
+     * gen() change never re-uploaded anything (My NFL Eras office, 2026-10-16). */
+    if (!g_xbox_tex_override || !g_xbox_tex_override_wants)
+        return 0;
+    return g_xbox_tex_override_wants(t->color, t->width, t->height);
 }
 
 static uint32_t tex_content_hash(const Texture *t)
@@ -794,6 +973,20 @@ static uint32_t gpu_cube_face_bytes(int st, const Texture *t)
         w /= 2; h /= 2;
     }
     return (len + 127u) & ~127u;
+}
+
+/* Mip levels the title gave the texture on stage st (format register bits
+ * 16-19), as many as its size allows. Until 2026-10-30 only level 0 was
+ * used: far-off field lines, crowds and signs had no smaller versions and
+ * shimmered, the more so at a high internal resolution. RECOMP_NO_MIPS=1
+ * goes back to level 0 only. */
+static uint32_t gpu_guest_levels(int st, const Texture *t)
+{
+    uint32_t fmtreg = s_tex_reg[(0x1B04 + 0x40u * (uint32_t)st - NV_TEX_FIRST) / 4];
+    uint32_t levels = (fmtreg >> 16) & 0xF, l = 1;
+    if (env_cached("RECOMP_NO_MIPS") || levels <= 1) return 1;
+    while (l < levels && l < 14 && ((t->width >> l) || (t->height >> l))) l++;
+    return l;
 }
 
 /* SRV for texture stage st, decoding it through the software sampler the
@@ -880,6 +1073,58 @@ static void tex_pool_put(ID3D11Texture2D *tex, ID3D11ShaderResourceView *srv)
 }
 
 /* Create (or take from the pool and refill) a shader-resource texture. */
+/* Keep the pool stocked with the texture shapes the game makes most
+ * (RECOMP_TEX_SHAPES, a demo run 2026-10-30: 128x128, 64x64, 256x256,
+ * 256x128, 128x64, 32x32 BGRA and 256x256 BC1 were 9 in 10). A scene change
+ * creates 35-120 at once, ~0.6 ms each on Direct3D 12, and the pool -- filled
+ * only by evictions -- had none of them; now a few are made between frames
+ * (1.5 ms a frame at most), ~20 MB of video memory in all.
+ * RECOMP_NO_TEX_WARM=1 turns it off. */
+static void tex_pool_topup(void)
+{
+    /* with their mip chains (the title's levels, 2026-10-30 histogram) */
+    static const struct { UINT w, h, mips; DXGI_FORMAT fmt; int want; } k_shapes[] = {
+        { 128, 128, 5, DXGI_FORMAT_B8G8R8A8_UNORM, 48 }, { 64, 64, 4, DXGI_FORMAT_B8G8R8A8_UNORM, 40 },
+        { 256, 32, 3, DXGI_FORMAT_B8G8R8A8_UNORM, 20 },  { 256, 128, 5, DXGI_FORMAT_B8G8R8A8_UNORM, 20 },
+        { 128, 64, 4, DXGI_FORMAT_B8G8R8A8_UNORM, 16 },  { 256, 256, 6, DXGI_FORMAT_B8G8R8A8_UNORM, 16 },
+        { 32, 32, 3, DXGI_FORMAT_B8G8R8A8_UNORM, 12 },   { 256, 256, 6, DXGI_FORMAT_BC1_UNORM, 10 },
+        { 512, 256, 6, DXGI_FORMAT_B8G8R8A8_UNORM, 8 },
+    };
+    LARGE_INTEGER t0, t1, fq;
+    size_t s;
+    if (!tex_pool_on() || env_cached("RECOMP_NO_TEX_WARM") || s_tpool_n > TEX_POOL - 48)
+        return;
+    QueryPerformanceCounter(&t0);
+    QueryPerformanceFrequency(&fq);
+    for (s = 0; s < sizeof k_shapes / sizeof k_shapes[0]; s++) {
+        int have = 0, i;
+        if (k_shapes[s].fmt == DXGI_FORMAT_BC1_UNORM && !gpu_bc_ok())
+            continue;                           /* no BC on this GPU: DXT is decoded */
+        for (i = 0; i < s_tpool_n; i++)
+            if (s_tpool[i].d.Width == k_shapes[s].w && s_tpool[i].d.Height == k_shapes[s].h &&
+                    s_tpool[i].d.Format == k_shapes[s].fmt && s_tpool[i].d.MipLevels == k_shapes[s].mips &&
+                    s_tpool[i].d.ArraySize == 1 && !s_tpool[i].d.MiscFlags) have++;
+        while (have < k_shapes[s].want) {
+            D3D11_TEXTURE2D_DESC td;
+            ID3D11Texture2D *tex = NULL;
+            ID3D11ShaderResourceView *srv = NULL;
+            memset(&td, 0, sizeof td);
+            td.Width = k_shapes[s].w; td.Height = k_shapes[s].h; td.MipLevels = k_shapes[s].mips; td.ArraySize = 1;
+            td.Format = k_shapes[s].fmt; td.SampleDesc.Count = 1;
+            td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            if (FAILED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, NULL, &tex)) ||
+                    FAILED(ID3D11Device_CreateShaderResourceView(s_gpu11.dev, (ID3D11Resource *)tex, NULL, &srv))) {
+                if (tex) ID3D11Texture2D_Release(tex);
+                return;
+            }
+            tex_pool_put(tex, srv);
+            have++;
+            QueryPerformanceCounter(&t1);
+            if ((t1.QuadPart - t0.QuadPart) * 1000 > fq.QuadPart * 3 / 2) return;   /* 1.5 ms this frame */
+        }
+    }
+}
+
 static int tex_make(D3D11_TEXTURE2D_DESC *td, const D3D11_SUBRESOURCE_DATA *sd,
                     ID3D11Texture2D **tex, ID3D11ShaderResourceView **srv)
 {
@@ -905,6 +1150,35 @@ static int tex_make(D3D11_TEXTURE2D_DESC *td, const D3D11_SUBRESOURCE_DATA *sd,
     }
     if (++s_tpool_misses % 2000 == 0)
         fprintf(stderr, "  [TEXPOOL] %u reused, %u created (pool holds %d)\n", s_tpool_hits, s_tpool_misses, s_tpool_n);
+    if (env_cached("RECOMP_TEX_SHAPES")) {
+        /* test only: which texture shapes are created, most common first, every 200 */
+        static struct { UINT w, h, mips, arr, fmt, misc, n; } sh[256];
+        static int nsh;
+        static unsigned total;
+        int k;
+        for (k = 0; k < nsh; k++)
+            if (sh[k].w == td->Width && sh[k].h == td->Height && sh[k].mips == td->MipLevels && sh[k].arr == td->ArraySize &&
+                    sh[k].fmt == (UINT)td->Format && sh[k].misc == td->MiscFlags) break;
+        if (k == nsh && nsh < 256) {
+            sh[k].w = td->Width; sh[k].h = td->Height; sh[k].mips = td->MipLevels; sh[k].arr = td->ArraySize;
+            sh[k].fmt = (UINT)td->Format; sh[k].misc = td->MiscFlags; sh[k].n = 0; nsh++;
+        }
+        if (k < nsh) sh[k].n++;
+        if (++total % 200 == 0) {
+            int j, shown;
+            fprintf(stderr, "  [TEXSHAPES] %u created, %d shapes:", total, nsh);
+            for (shown = 0; shown < 24; shown++) {
+                int best = -1;
+                for (j = 0; j < nsh; j++) if (sh[j].n && (int)sh[j].n > 0 && (best < 0 || sh[j].n > sh[best].n)) best = j;
+                if (best < 0) break;
+                fprintf(stderr, " %ux%u/m%u/a%u/f%u/x%X=%u", sh[best].w, sh[best].h, sh[best].mips, sh[best].arr, sh[best].fmt,
+                        sh[best].misc, sh[best].n);
+                sh[best].n = ~sh[best].n;        /* mark printed (restored below) */
+            }
+            for (j = 0; j < nsh; j++) if ((int)sh[j].n < 0) sh[j].n = ~sh[j].n;
+            fprintf(stderr, "\n");
+        }
+    }
     if (FAILED(ID3D11Device_CreateTexture2D(s_gpu11.dev, td, sd, tex)))
         return 0;
     if (FAILED(ID3D11Device_CreateShaderResourceView(s_gpu11.dev, (ID3D11Resource *)*tex, NULL, srv))) {
@@ -946,7 +1220,50 @@ static int tex_upload_override(GpuTexture *e, const Texture *t, uint32_t tpal, u
     return 1;
 }
 
+static ID3D11ShaderResourceView *gpu_texture_lookup(int st, int cube);
+
+/* The intro movies decode into a ring of five 640x480 frame buffers, and the
+ * decoder fills a buffer with 0x86 bytes before it decodes the next frame
+ * into it. Read at the moment the draw is processed, a buffer can still be
+ * in that state, and each such frame flashed the screen solid grey (xemu
+ * shows the movie there). A frame that is nothing but the fill shows the
+ * last real frame of the same shape instead, as it already is on the GPU. */
+static int movie_frame_unfilled(const Texture *t)
+{
+    const uint8_t *gm = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t k, pitch = t->pitch ? t->pitch : t->width * 4;
+    for (k = 0; k < 32; k++) {
+        uint32_t row = t->height * (2 * k + 1) / 64, col = t->width * ((k * 7) % 32 + 1) / 34;
+        if (*(const uint32_t *)(gm + t->offset + row * pitch + col * 4) != 0x86868686u)
+            return 0;
+    }
+    return 1;
+}
+
 static ID3D11ShaderResourceView *gpu_texture(int st, int cube)
+{
+    static ID3D11ShaderResourceView *last;
+    static uint32_t last_w, last_h, last_fmt;
+    const Texture *t = st == 0 ? &s_gpu.tex : &s_stage[st];
+    ID3D11ShaderResourceView *v;
+    int movie = !cube && t->valid && t->width >= 320 && t->height >= 240 && t->width <= 4096 && t->height <= 4096
+             && (t->color == 0x12 || t->color == 0x1E);
+    static int no_hold = -1;
+    if (no_hold < 0) no_hold = getenv("NFL2K5_NO_MOVIE_HOLD") != NULL;
+    if (movie && !no_hold && movie_frame_unfilled(t)) {
+        if (last && last_w == t->width && last_h == t->height && last_fmt == t->color) {
+            uint32_t k;
+            for (k = 0; k < GPU_MAX_TEXTURES; k++)          /* still in the cache, not recycled */
+                if (s_gpu11.texs[k].srv == last) return last;
+        }
+        return gpu_texture_lookup(st, cube);
+    }
+    v = gpu_texture_lookup(st, cube);
+    if (movie && v) { last = v; last_w = t->width; last_h = t->height; last_fmt = t->color; }
+    return v;
+}
+
+static ID3D11ShaderResourceView *gpu_texture_lookup(int st, int cube)
 {
     Texture *t = st == 0 ? &s_gpu.tex : &s_stage[st];
     uint32_t faces = cube ? 6u : 1u, face_bytes = cube ? gpu_cube_face_bytes(st, t) : 0u, f;
@@ -1092,14 +1409,15 @@ static ID3D11ShaderResourceView *gpu_texture(int st, int cube)
      * no swizzle -- instead of being decoded texel by texel on the CPU,
      * which re-decoded the whole 4x4 block for every texel (2026-09-26). */
     if (d3d8_format_dxt_block_bytes(t->color) && (t->width & 3) == 0 && (t->height & 3) == 0
-            && (!cube || t->width == t->height)) {
+            && (!cube || t->width == t->height) && gpu_bc_ok()) {
         const uint8_t *gm = (const uint8_t *)xbox_GetMemoryOffset();
         uint32_t bb = d3d8_format_dxt_block_bytes(t->color);
         uint32_t fbytes = (t->width / 4) * (t->height / 4) * bb;
         D3D11_TEXTURE2D_DESC td;
-        D3D11_SUBRESOURCE_DATA sd[6];
+        D3D11_SUBRESOURCE_DATA sd[16];
+        uint32_t lv = cube ? 1u : gpu_guest_levels(st, t), l2;
         memset(&td, 0, sizeof td);
-        td.Width = t->width; td.Height = t->height; td.MipLevels = 1; td.ArraySize = faces;
+        td.Width = t->width; td.Height = t->height; td.MipLevels = lv; td.ArraySize = faces;
         td.Format = t->color == 0x0C ? DXGI_FORMAT_BC1_UNORM
                   : t->color == 0x0E ? DXGI_FORMAT_BC2_UNORM : DXGI_FORMAT_BC3_UNORM;
         td.SampleDesc.Count = 1;
@@ -1109,6 +1427,15 @@ static ID3D11ShaderResourceView *gpu_texture(int st, int cube)
             sd[f].pSysMem = gm + t->offset + f * face_bytes;
             sd[f].SysMemPitch = (t->width / 4) * bb;
             sd[f].SysMemSlicePitch = fbytes;
+        }
+        if (lv > 1) {   /* the levels follow level 0, each at least one block */
+            uint32_t off = t->offset, w2 = t->width, h2 = t->height;
+            for (l2 = 0; l2 < lv; l2++) {
+                uint32_t bw = (w2 + 3) / 4, bh = (h2 + 3) / 4;
+                sd[l2].pSysMem = gm + off; sd[l2].SysMemPitch = bw * bb; sd[l2].SysMemSlicePitch = bw * bh * bb;
+                off += bw * bh * bb;
+                w2 = w2 > 1 ? w2 / 2 : 1; h2 = h2 > 1 ? h2 / 2 : 1;
+            }
         }
         if (env_cached("RECOMP_GPU_TEXDUMP") && gpu_texdump_match(t, t->width * t->height)) {
             /* the blocks as they are, in a .dds (any image viewer decodes it) */
@@ -1242,6 +1569,20 @@ static ID3D11ShaderResourceView *gpu_texture(int st, int cube)
                 goto decoded;
         }
     }
+    if (d3d8_format_dxt_block_bytes(t->color) && (t->width & 3) == 0 && (t->height & 3) == 0) {
+        /* No BC formats on this GPU (many phones): the blocks decoded whole,
+         * a face at a time, rather than texel by texel below. */
+        const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+        int ok = 1;
+        for (f = 0; f < faces && ok; f++) {
+            uint32_t *dec = dxt_decode(mem + t->offset + f * face_bytes, t->width, t->height, t->color);
+            if (!dec) { ok = 0; break; }
+            memcpy(pix + (size_t)f * n, dec, (size_t)n * 4);
+            free(dec);
+        }
+        if (ok)
+            goto decoded;
+    }
     {
         uint32_t u, v, base = t->offset;
         int ok = 1;
@@ -1317,7 +1658,9 @@ decoded:
     }
     {
         D3D11_TEXTURE2D_DESC td;
-        D3D11_SUBRESOURCE_DATA sd[6];
+        D3D11_SUBRESOURCE_DATA sd[16];
+        uint32_t lv = cube || (t->width & (t->width - 1)) || (t->height & (t->height - 1)) ? 1u : gpu_guest_levels(st, t);
+        uint32_t *chain = NULL;
         memset(&td, 0, sizeof td);
         td.Width = t->width; td.Height = t->height; td.MipLevels = 1; td.ArraySize = faces;
         td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
@@ -1330,6 +1673,32 @@ decoded:
             free(pix);
             return NULL;                                 /* a cube face must be square */
         }
+        if (lv > 1) {
+            /* each level the 2x2 average of the one above (a 1-wide side halves alone) */
+            size_t total = 0;
+            uint32_t l2, w2 = t->width, h2 = t->height;
+            for (l2 = 1; l2 < lv; l2++) { w2 = w2 > 1 ? w2 / 2 : 1; h2 = h2 > 1 ? h2 / 2 : 1; total += (size_t)w2 * h2; }
+            chain = (uint32_t *)malloc(total * 4);
+            if (chain) {
+                const uint32_t *src = pix;
+                uint32_t *dst = chain, sw = t->width, sh = t->height;
+                for (l2 = 1; l2 < lv; l2++) {
+                    uint32_t dw2 = sw > 1 ? sw / 2 : 1, dh2 = sh > 1 ? sh / 2 : 1, x, y, c;
+                    for (y = 0; y < dh2; y++)
+                        for (x = 0; x < dw2; x++) {
+                            uint32_t x0 = sw > 1 ? 2 * x : 0, x1 = sw > 1 ? 2 * x + 1 : 0;
+                            uint32_t y0 = sh > 1 ? 2 * y : 0, y1 = sh > 1 ? 2 * y + 1 : 0;
+                            uint32_t a = src[y0 * sw + x0], b = src[y0 * sw + x1], cc = src[y1 * sw + x0], d = src[y1 * sw + x1], o = 0;
+                            for (c = 0; c < 32; c += 8)
+                                o |= ((((a >> c) & 0xFF) + ((b >> c) & 0xFF) + ((cc >> c) & 0xFF) + ((d >> c) & 0xFF) + 2) / 4) << c;
+                            dst[y * dw2 + x] = o;
+                        }
+                    sd[l2].pSysMem = dst; sd[l2].SysMemPitch = dw2 * 4; sd[l2].SysMemSlicePitch = dw2 * dh2 * 4;
+                    src = dst; dst += (size_t)dw2 * dh2; sw = dw2; sh = dh2;
+                }
+                td.MipLevels = lv;
+            }
+        }
         {
             LARGE_INTEGER c0, c1;
             QueryPerformanceCounter(&c0);
@@ -1337,6 +1706,7 @@ decoded:
             QueryPerformanceCounter(&c1);
             g_tex_create_qpc += c1.QuadPart - c0.QuadPart;
         }
+        free(chain);
     }
     free(pix);
     e->addr = t->offset; e->fmt = t->color; e->w = t->width; e->h = t->height;
@@ -1377,13 +1747,17 @@ static ID3D11SamplerState *gpu_sampler(int st)
     static uint32_t keys[64];
     const Texture *t = st == 0 ? &s_gpu.tex : &s_stage[st];
     uint32_t filt = s_tex_reg[(0x1B14 + 0x40u * (uint32_t)st - NV_TEX_FIRST) / 4];
-    uint32_t mag = (filt >> 24) & 0xF, key;
+    uint32_t mag = (filt >> 24) & 0xF, minf = (filt >> 16) & 0xFF, key;
+    /* NV2A min filter 3-6: mipmapped (nearest/linear, between levels or
+     * not); between-level blending is always used, it costs nothing and
+     * hides the level boundaries. 1, 2 and 7: level 0 only. */
+    int mip = minf >= 3 && minf <= 6 && !env_cached("RECOMP_NO_MIPS");
     D3D11_SAMPLER_DESC sd;
     int i;
     D3D11_TEXTURE_ADDRESS_MODE am[2];
     uint32_t modes[2];
     modes[0] = t->addr_u; modes[1] = t->addr_v;
-    key = (mag == 1 ? 1u : 0u) | (t->addr_u << 4) | (t->addr_v << 8) | (g_aniso << 16);
+    key = (mag == 1 ? 1u : 0u) | (mip ? 2u : 0u) | (t->addr_u << 4) | (t->addr_v << 8) | (g_aniso << 16);
     for (i = 0; i < 64; i++) {
         if (cache[i] && keys[i] == key)
             return cache[i];
@@ -1398,13 +1772,14 @@ static ID3D11SamplerState *gpu_sampler(int st)
               : modes[k] == 4 ? D3D11_TEXTURE_ADDRESS_BORDER
               : D3D11_TEXTURE_ADDRESS_CLAMP;
     memset(&sd, 0, sizeof sd);
-    sd.Filter = mag == 1 ? D3D11_FILTER_MIN_MAG_MIP_POINT : D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+    sd.Filter = mag == 1 ? (mip ? D3D11_FILTER_MIN_MAG_POINT_MIP_LINEAR : D3D11_FILTER_MIN_MAG_MIP_POINT)
+                         : (mip ? D3D11_FILTER_MIN_MAG_MIP_LINEAR : D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT);
     if (mag != 1 && g_aniso > 1) {
         sd.Filter = D3D11_FILTER_ANISOTROPIC;
         sd.MaxAnisotropy = g_aniso;
     }
     sd.AddressU = am[0]; sd.AddressV = am[1]; sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-    sd.MaxLOD = D3D11_FLOAT32_MAX;
+    sd.MaxLOD = mip ? D3D11_FLOAT32_MAX : 0.0f;
     if (cache[i]) ID3D11SamplerState_Release(cache[i]);
     cache[i] = NULL;
     ID3D11Device_CreateSamplerState(s_gpu11.dev, &sd, &cache[i]);
@@ -1570,6 +1945,8 @@ static ID3D11DepthStencilState *gpu_no_depth(void)
 
 /* The depth buffer's full-scale value (xemu pgraph_glsl_set_clip_range):
  * Z16 or Z24, integer or floating point (SET_CONTROL0 bit 12). */
+static int s_hs_done;                  /* nv2a_gpu_hostscene.inc.c: the host scene drew this frame */
+static float s_hs_guest_depthp[4];     /* the last depth-tested guest draw's depthp (host scenes share its depth) */
 static float gpu_zmax(void)
 {
     int z16 = ((s_gpu.format >> 4) & 0xF) == 1;
@@ -1617,6 +1994,15 @@ static void gpu_vertex(GpuVertex *o, const XfVert *x, uint32_t rw, uint32_t rh)
     o->pos[0] = nx * w; o->pos[1] = ny * w; o->pos[2] = nz * w; o->pos[3] = w;
     o->rawscreen[0] = vp_screen_coord(x->x) + (float)g_draw_ox; o->rawscreen[1] = vp_screen_coord(x->y);
     o->rawscreen[2] = x->z; o->rawscreen[3] = w;
+    /* RECOMP_HOSTSCENE_LOG: guest vertices drawn after a host scene this frame (the depth
+     * encoding the host scene has to match: w or z, in depth-buffer units over zmax) */
+    if (s_hs_done && env_cached("RECOMP_HOSTSCENE_LOG")) {
+        static int probe;
+        if (probe < 900 && (probe++ % 30) == 0)
+            fprintf(stderr, "[HSPROBE] scr %.1f %.1f z %.1f w %.4f zmax %.0f wbuf %u clip %.1f..%.1f\n",
+                    o->rawscreen[0], o->rawscreen[1], x->z, x->w, gpu_zmax(), (s_vp.control0 >> 16) & 1u,
+                    s_vp.clip_min, s_vp.clip_max);
+    }
     memcpy(o->d0, x->col, sizeof o->d0);
     memcpy(o->d1, x->spec, sizeof o->d1);
     /* As the program wrote them; the shader applies each stage's convention. */
@@ -1732,6 +2118,7 @@ static void gpu_log_rejected(uint32_t index, const XfVert *v)
  * stage (vertex build, textures, buffer upload + binds, state + draw call,
  * the rest), printed every five seconds. */
 static uint64_t s_dp_acc[6], s_dp_draws;
+static uint64_t s_dp_base[6];      /* what earlier reports cleared (the hitch log's running totals) */
 #define DP_NOW() (s_dp_on ? __rdtsc() : 0)
 static void gpu_dp_report(void)
 {
@@ -1747,6 +2134,10 @@ static void gpu_dp_report(void)
                 100.0 * (s_dp_acc[3] - s_dp_acc[2]) / tot, 100.0 * (tot - s_dp_acc[0] - s_dp_acc[1] - s_dp_acc[3]) / tot, s_gpu11.rt_copies, s_gpu11.surf_creates);
         s_gpu11.surf_creates = 0;
         s_gpu11.rt_copies = 0;
+    }
+    {
+        int k;
+        for (k = 0; k < 6; k++) s_dp_base[k] += s_dp_acc[k];
     }
     memset(s_dp_acc, 0, sizeof s_dp_acc);
     s_dp_draws = 0;
@@ -2055,6 +2446,7 @@ static int gpu_draw_batch_unlocked_body(int flat2d)
     c.depthp[1] = gpu_zmax();
     c.depthp[2] = s_vp.clip_max > s_vp.clip_min ? s_vp.clip_min : 0.0f;
     c.depthp[3] = s_vp.clip_max > s_vp.clip_min ? s_vp.clip_max : c.depthp[1];
+    if (s_vp.depth_test) memcpy(s_hs_guest_depthp, c.depthp, sizeof s_hs_guest_depthp);
     c.depthfmt[0] = (s_vp.control0 & 0x1000u) ? 0u :
                    (((s_gpu.format >> 4) & 0xFu) == 1u ? 16u : 24u);
     /* Offset applies to filled polygons, not line-list play art. Shader
@@ -2235,7 +2627,9 @@ static int gpu_draw_batch_unlocked_body(int flat2d)
             ID3D11DepthStencilState *dss = flat2d ? gpu_no_depth() : gpu_depth_state();
             int all = !s_bound.valid;
             if (all || s_bound.rtv != surf->rtv || s_bound.dsv != surf->dsv) {
-                ID3D11DeviceContext_OMSetRenderTargets(s_gpu11.ctx, 1, &surf->rtv, surf->dsv);
+                ID3D11RenderTargetView *rts[4] = { surf->rtv, surf->mv_rtv, surf->dz_rtv, surf->rx_rtv };
+                ID3D11DeviceContext_OMSetRenderTargets(s_gpu11.ctx, surf->rx_rtv ? 4 : surf->dz_rtv ? 3 : surf->mv_rtv ? 2 : 1,
+                                                       rts, surf->dsv);
                 s_bound.rtv = surf->rtv; s_bound.dsv = surf->dsv;
                 memset(s_bound.srv, 0, sizeof s_bound.srv);       /* resend textures */
                 s_bound.srv[0] = (ID3D11ShaderResourceView *)(uintptr_t)1;
@@ -2293,6 +2687,13 @@ static int gpu_draw_batch_unlocked_body(int flat2d)
             { uint64_t a = DP_NOW();
               if (vpvs && !gpu_vp_bind(vp_nverts, nv, rw, rh, vpvs))
                   vpvs = NULL, nv = 0;
+              /* SDL_GPU: the program reads the raw bytes and this batch's
+               * indices itself, and rebuilds its triangles (gpu_vp_translate). */
+              if (vpvs && g_gx_sg)
+                  gxs_set_pull2(s_vp_raw, s_vp_ib, s_vp_start_index,
+                                !lines && !(env_cached("RECOMP_GPU_PLANE_DEPTH") &&
+                                            *env_cached("RECOMP_GPU_PLANE_DEPTH") == '0'),
+                                c.depthp[0], 0);
               if (s_dp_on) s_dp_acc[2] += __rdtsc() - a; }
             if (!vpvs) {
                 if (s_bound.il != s_gpu11.layout) {
@@ -2303,10 +2704,20 @@ static int gpu_draw_batch_unlocked_body(int flat2d)
                     ID3D11DeviceContext_IASetVertexBuffers(s_gpu11.ctx, 0, 1, &s_gpu11.vb, &stride, &off);
                     s_bound.vb = s_gpu11.vb; s_bound.vb_stride = stride;
                 }
-                if (s_bound.vs != s_gpu11.vs) {
-                    ID3D11DeviceContext_VSSetShader(s_gpu11.ctx, s_gpu11.vs, NULL, 0);
-                    s_bound.vs = s_gpu11.vs;
+                {
+                    ID3D11VertexShader *want = g_gx_sg ? s_gpu11.vs_pull : s_gpu11.vs;
+                    if (s_bound.vs != want) {
+                        ID3D11DeviceContext_VSSetShader(s_gpu11.ctx, want, NULL, 0);
+                        s_bound.vs = want;
+                    }
                 }
+                /* SDL_GPU: the vertex shader reads this batch from the ring
+                 * and, for triangles, does the geometry shader's work. */
+                if (g_gx_sg)
+                    gxs_set_pull(s_gpu11.vb, first_vertex,
+                                 !flat2d && !lines && !(env_cached("RECOMP_GPU_PLANE_DEPTH") &&
+                                                        *env_cached("RECOMP_GPU_PLANE_DEPTH") == '0'),
+                                 c.depthp[0]);
             }
             if (s_bound.gs != gs) {
                 ID3D11DeviceContext_GSSetShader(s_gpu11.ctx, gs, NULL, 0);
@@ -2451,6 +2862,11 @@ static int gpu_clear_unlocked(uint32_t param)
         comb_unpack(s_gpu.clear_color, col);
         if ((param & 0xF0u) == 0xF0u && x0 == 0 && y0 == 0 && x1 >= s->w && y1 >= s->h) {
             ID3D11DeviceContext_ClearRenderTargetView(s_gpu11.ctx, s->rtv, col);
+            if (s->mv_rtv) {
+                static const float zero[4] = { 0, 0, 0, 0 };
+                ID3D11DeviceContext_ClearRenderTargetView(s_gpu11.ctx, s->mv_rtv, zero);
+                if (s->rx_rtv) ID3D11DeviceContext_ClearRenderTargetView(s_gpu11.ctx, s->rx_rtv, zero);
+            }
         } else {
             /* Partial rectangle or channel subset: a solid quad with the
              * channel write mask (it went through guest RAM before, a
@@ -2486,6 +2902,10 @@ static int gpu_clear_unlocked(uint32_t param)
         if (z < 0.0f) z = 0.0f;
         if (z > 1.0f) z = 1.0f;
         ID3D11DeviceContext_ClearDepthStencilView(s_gpu11.ctx, s->dsv, flags, z, (UINT8)(s_vp.zclear & 0xFF));
+        if (s->dz_rtv && (param & 1u)) {
+            float zz[4] = { z, z, z, z };
+            ID3D11DeviceContext_ClearRenderTargetView(s_gpu11.ctx, s->dz_rtv, zz);
+        }
     }
     s->dirty = 1;
     s->gen++;
@@ -2494,6 +2914,7 @@ static int gpu_clear_unlocked(uint32_t param)
 
 /* A frame is finished: bring the surface back to guest RAM for the window. */
 #include "nv2a_gpu_present.inc.c"
+#include "nv2a_gpu_hostscene.inc.c"   /* host-drawn 3D scenes at a pushbuffer marker */
 
 static void gpu_flip_unlocked(void)
 {
@@ -2515,6 +2936,7 @@ static void gpu_flip_unlocked(void)
     if (env_cached("RECOMP_GPU_TRACE") && (s_gpu11.frame % 300) == 0)
         fprintf(stderr, "  [GPUTRACE] f%u flip shows %08X\n", s_gpu11.frame, dma_resolve(s_gpu.color_offset));
     s_gpu11.frame++;
+    tex_pool_topup();
     if ((s_gpu11.frame % 600) == 0)
         fprintf(stderr, "  [GPU11] frames %u draws %u tris %u texture uploads %u readbacks %u\n",
                 s_gpu11.frame, s_gpu11.draws, s_gpu11.tris, s_gpu11.tex_uploads, s_gpu11.readbacks);
@@ -2554,6 +2976,19 @@ static int gpu_draw_batch(int flat2d)
     return r;
 }
 
+static int gpu_host_scene(void)
+{
+    int r;
+    gpu_lock(); r = gpu_host_scene_unlocked(); LeaveCriticalSection(&s_gpu_lock);
+    return r;
+}
+
+static void hs_zprobe(void)
+{
+    if (!env_cached("RECOMP_HOSTSCENE_ZPROBE")) return;
+    gpu_lock(); hs_zprobe_unlocked(); LeaveCriticalSection(&s_gpu_lock);
+}
+
 static int gpu_clear(uint32_t param)
 {
     int r;
@@ -2567,4 +3002,17 @@ static void gpu_flip(void)
 }
 #else
 #include "nv2a_gpu_sdl3.inc.c"
+#include "xbox_hostscene.h"
+/* Only the fallback SDL3 presenter lands here (no gx: a non-Android build without
+ * XBOXRECOMP_GX_PORTABLE, e.g. macOS). Linux (linux/CMakeLists.txt forces GX_PORTABLE) and
+ * Android render through gx on SDL_GPU and get the real host scene pass above; these stubs
+ * only keep the fallback linking. */
+void xbox_HostSceneSet(const XboxHostScene *scene) { (void)scene; }
+int xbox_HostSceneDrawn(void) { return 0; }
+static int gpu_host_scene(void) { return 0; }
+void xbox_HostSceneTrigger(const uint32_t *offsets, int n) { (void)offsets; (void)n; }
+int xbox_HostMeshAdd(const float *pnu, int nverts, const uint32_t *rgba, int tw, int th, int mat) { (void)pnu; (void)nverts; (void)rgba; (void)tw; (void)th; (void)mat; return -1; }
+static int gpu_host_scene_trigger(uint32_t tex_offset) { (void)tex_offset; return 0; }
+static void gpu_host_scene_frame_start(void) {}
+static void gpu_host_scene_flip(void) {}
 #endif

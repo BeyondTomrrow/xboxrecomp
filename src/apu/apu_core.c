@@ -19,6 +19,12 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
+#ifdef __ANDROID__
+#include <sys/resource.h>
+#endif
 #include "apu_state.h"
 #include "apu.h"
 #include "apu_xaudio2.h"
@@ -75,6 +81,32 @@ int mcpx_apu_irq_line(void) { return g_apu_irq_line != 0; }
  * voice went idle (2026-10-01). */
 void (*g_apu_irq_wake)(void);
 
+/* How long a notifier waits for the line, and the line for the title's ISR to
+ * acknowledge it ([APULOCK] report). DirectSound's Stop spins on the game
+ * thread until that acknowledgement, so these are game-thread milliseconds. */
+volatile int64_t g_apu_irq_note_us;      /* when the pending notifier was raised (apu_vp.c) */
+static int64_t g_apu_irq_line_us;
+static volatile LONGLONG g_apu_note_n, g_apu_note_sum_us, g_apu_note_max_us, g_apu_ack_n, g_apu_ack_sum_us, g_apu_ack_max_us;
+
+/* RECOMP_APU_TRACE=<file>: QPC-stamped voice-stop events, to join with a
+ * stack sampler's timeline. */
+void apu_tr(char c, unsigned v)
+{
+    static int on = -1;
+    static FILE *f;
+    static unsigned n;
+    LARGE_INTEGER q;
+    if (on < 0) {
+        const char *p = getenv("RECOMP_APU_TRACE");
+        f = p ? fopen(p, "w") : NULL;
+        on = f != NULL;
+    }
+    if (!on) return;
+    QueryPerformanceCounter(&q);
+    fprintf(f, "%lld %c %x\n", (long long)q.QuadPart, c, v);
+    if ((++n & 255) == 0) fflush(f);
+}
+
 static void update_irq(MCPXAPUState *d)
 {
     if (d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
@@ -86,11 +118,50 @@ static void update_irq(MCPXAPUState *d)
         qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_GINTSTS);
         /* In standalone mode we don't raise a PCI IRQ; the game's kernel
          * stub will poll ISTS directly or we'll signal via a flag. */
-        if (InterlockedExchange(&g_apu_irq_line, 1) == 0 && g_apu_irq_wake)
-            g_apu_irq_wake();   /* run the title's ISR now, not at the next poll */
+        if (InterlockedExchange(&g_apu_irq_line, 1) == 0) {
+            int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+            g_apu_irq_line_us = now;
+            apu_tr('L', d->regs[NV_PAPU_ISTS]);
+            if (g_apu_irq_note_us) {
+                int64_t w = now - g_apu_irq_note_us;
+                g_apu_note_n++; g_apu_note_sum_us += w;
+                if (w > g_apu_note_max_us) g_apu_note_max_us = w;
+            }
+            if (g_apu_irq_wake)
+                g_apu_irq_wake();   /* run the title's ISR now, not at the next poll */
+        }
+        g_apu_irq_note_us = 0;
     } else {
         qatomic_and(&d->regs[NV_PAPU_ISTS], ~NV_PAPU_ISTS_GINTSTS);
-        InterlockedExchange(&g_apu_irq_line, 0);
+        if (InterlockedExchange(&g_apu_irq_line, 0) != 0) {
+            int64_t w = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - g_apu_irq_line_us;
+            apu_tr('A', 0);
+            g_apu_ack_n++; g_apu_ack_sum_us += w;
+            if (w > g_apu_ack_max_us) g_apu_ack_max_us = w;
+        }
+    }
+}
+
+/* A title write (or a queued one) that trapped the front end for a stopped
+ * voice raises the line at once (apu_vp.c: voice_idle_now). Other notifiers
+ * keep waiting for the end of the next pipeline frame: raising those early too
+ * doubled the interrupts and gained nothing (2026-11-06 A/B). The caller holds
+ * d->lock. */
+volatile int g_apu_raise_now;
+static void apu_raise_pending_irq(MCPXAPUState *d)
+{
+    if (g_apu_raise_now) {
+        static int nowake = -1;
+        if (nowake < 0) nowake = getenv("RECOMP_APU_NO_IDLE_WAKE") != NULL;
+        g_apu_raise_now = 0;
+        update_irq(d);
+        d->set_irq = false;
+        /* The line is a level and update_irq only wakes the ISR thread on its
+         * rising edge: with the line still high from an earlier notifier, this
+         * trap waited 8 ms at the median for the next vblank deadline, against
+         * 0.04 ms on a rising edge (2026-11-06 trace), with the title spinning. */
+        if (!nowake && g_apu_irq_line && g_apu_irq_wake)
+            g_apu_irq_wake();
     }
 }
 
@@ -141,6 +212,7 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case NV_PAPU_FECTL:
     case NV_PAPU_SECTL:
+        if (addr == NV_PAPU_FECTL) apu_tr('U', (unsigned)val);
         qatomic_set(&d->regs[addr], (uint32_t)val);
         /* Starting the APU has to start the frame thread.
          *
@@ -298,12 +370,33 @@ static volatile float g_game_level;
 extern volatile float g_apu_bed_gain, g_apu_voice_level;
 extern volatile int g_apu_mute_music;
 extern volatile float g_apu_voice_gain;
-void xbox_AudioSetCommentaryGain(float gain) { g_apu_voice_gain = gain < 0.0f ? 0.0f : gain > 1.0f ? 1.0f : gain; }
-void xbox_AudioMuteGameMusic(int mute) { g_apu_mute_music = mute; }
+/* Every change of the host-side mix controls is logged (they are rare: a
+ * theme start/stop, a fade in steps): a control left set is how the crowd
+ * and effects went missing before (AUDIO-FIX-20261021). */
+static void mix_log(const char *what, float was, float now)
+{
+    float dd = now - was;
+    if (dd < 0) dd = -dd;
+    if (dd >= 0.1f || ((now == 0.0f || now == 1.0f) && was != now))
+        fprintf(stderr, "[MIXCTL] t=%lu %s %.2f -> %.2f\n", GetTickCount(), what, was, now);
+}
+void xbox_AudioSetCommentaryGain(float gain)
+{
+    float g = gain < 0.0f ? 0.0f : gain > 1.0f ? 1.0f : gain;
+    mix_log("commentary_gain", g_apu_voice_gain, g);
+    g_apu_voice_gain = g;
+}
+void xbox_AudioMuteGameMusic(int mute)
+{
+    mix_log("mute_game_music", (float)g_apu_mute_music, (float)(mute != 0));
+    g_apu_mute_music = mute;
+}
 float xbox_AudioGameLevel(void) { return g_apu_voice_level; }
 void xbox_AudioSetGameGain(float gain)
 {
-    g_apu_bed_gain = gain < 0.0f ? 0.0f : gain > 1.0f ? 1.0f : gain;
+    float g = gain < 0.0f ? 0.0f : gain > 1.0f ? 1.0f : gain;
+    mix_log("bed_gain", g_apu_bed_gain, g);
+    g_apu_bed_gain = g;
 }
 
 void mcpx_apu_monitor_frame(MCPXAPUState *d)
@@ -337,9 +430,16 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
                     g_test_tone.phase -= 2.0 * M_PI;
             }
         }
-        if (!g_audio_muted)
+        if (!g_audio_muted) {
+            int64_t m0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME), m1;
             mixer_render(d->monitor.frame_buf, MIXER_FRAME_SAMPLES);
-        else
+            m1 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+            if (m1 - m0 > 10000) {
+                static unsigned n;
+                if (n++ < 100)
+                    fprintf(stderr, "[APUSLOW] software mixer %.1f ms (its lock was held)\n", (m1 - m0) / 1000.0);
+            }
+        } else
             memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
         {
             double e = 0;
@@ -425,9 +525,57 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
  * Throttle (timing control for frame pacing)
  * ============================================================ */
 
+/* Paced by the speakers (AUDIO-FIX-20261021, dropouts): a monitor frame runs
+ * when the XAudio2 queue holds less than the target (56 ms) and waits while it
+ * holds more, so the APU follows the audio device's clock and keeps a constant
+ * cushion. Pacing by the wall clock alone kept whatever cushion was left after
+ * the last resync -- often 0-2 x 21 ms -- and every 20-40 ms pause of the
+ * pipeline (an ISR wait, a busy host thread) emptied it: 26-34 underruns per
+ * 10 minutes outside loads. After a pause the queue is refilled at once (the
+ * frames run back to back, as the old 64 ms catch-up did). When the device
+ * stops consuming (unplugged, lost), the wall clock takes over again. RECOMP_AUDIO_LEGACY=1: the old pacing. */
+static int throttle_by_queue(MCPXAPUState *d)
+{
+    int target = xa2_target_samples();
+    int64_t t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    static int64_t last_exit, stall_at;
+    extern int64_t g_apu_stall_total_us;
+    if (!xa2_is_active() || target <= 0 || xa2_legacy())
+        return 0;
+    if (last_exit && t0 - last_exit > 25000) {
+        /* 256 samples of work took over 25 ms of wall time: say how full the
+         * queue still is (an ISR wait is logged as such elsewhere). */
+        static unsigned n;
+        int q = xa2_queued_samples();
+        if (n++ < 200)
+            fprintf(stderr, "[APUSLOW] t=%lu %.1f ms since the last output frame (ISR wait %.1f ms), queue %d ms\n",
+                    GetTickCount(), (t0 - last_exit) / 1000.0, (g_apu_stall_total_us - stall_at) / 1000.0,
+                    q < 0 ? -1 : q / 48);
+    }
+    while (!d->pause_requested) {
+        int q = xa2_queued_samples();
+        int ms;
+        if (q < 0) return 0;              /* not consuming: wall clock */
+        if (q < target) break;
+        ms = (q - target) / 48;           /* time until it drops to the target */
+        if (ms < 1) ms = 1;
+        if (ms > 20) ms = 20;
+        qemu_cond_timedwait(&d->cond, &d->lock, ms);
+    }
+    d->next_frame_time_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    d->sleep_acc_us += (int)(d->next_frame_time_us - t0);
+    last_exit = d->next_frame_time_us;
+    stall_at = g_apu_stall_total_us;
+    return 1;
+}
+
 static void throttle(MCPXAPUState *d)
 {
     if (d->ep_frame_div % 8) {
+        return;
+    }
+    if (throttle_by_queue(d)) {
+        apu_tr('B', 0);
         return;
     }
 
@@ -481,9 +629,24 @@ static void se_frame(MCPXAPUState *d)
     float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
     memset(mixbins, 0, sizeof(mixbins));
 
-    mcpx_apu_vp_frame(d, mixbins);
-    mcpx_apu_dsp_frame(d, mixbins);
-    mcpx_apu_monitor_frame(d);
+    {
+        /* A pipeline frame that takes over 20 ms (it should take well under
+         * one) is logged with where the time went: an audio-thread stall
+         * is what empties the speaker queue (AUDIO-REPORT-HOTKEY-20261022). */
+        int64_t t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME), t1, t2, t3;
+        mcpx_apu_vp_frame(d, mixbins);
+        t1 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+        mcpx_apu_dsp_frame(d, mixbins);
+        t2 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+        mcpx_apu_monitor_frame(d);
+        t3 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+        if (t3 - t0 > 20000) {
+            static unsigned n;
+            if (n++ < 200)
+                fprintf(stderr, "[APUSLOW] t=%lu frame %.1f ms: vp %.1f dsp %.1f monitor/output %.1f\n",
+                        GetTickCount(), (t3 - t0) / 1000.0, (t1 - t0) / 1000.0, (t2 - t1) / 1000.0, (t3 - t2) / 1000.0);
+        }
+    }
 
     d->ep_frame_div++;
 
@@ -494,9 +657,32 @@ static void se_frame(MCPXAPUState *d)
  * APU frame thread (background processing)
  * ============================================================ */
 
+int64_t g_apu_stall_us;          /* time the pipeline waited for the title's ISR (RECOMP_APU_PITCH_LOG) */
+unsigned g_apu_stall_n;
+/* The same for the audio report (always on), and the VP frames emitted silent
+ * because an ISR wait passed 40 ms (each one 32 samples of game audio lost). */
+int64_t g_apu_dg_stall_us;
+unsigned g_apu_dg_stall_n, g_apu_dg_silent_vp;
+unsigned long g_apu_silent_vp_total;   /* the same, never reset (RECOMP_APU_PITCH_LOG) */
+int64_t g_apu_stall_total_us;          /* ISR waits in all (the [APUSLOW] lines) */
+
+static void apu_let_writers_in(MCPXAPUState *d);
+
 static void *mcpx_apu_frame_thread(void *arg)
 {
+#if defined(__linux__)
+    prctl(PR_SET_NAME, "apu_frame", 0, 0, 0);   /* named in the Android [CPU] report */
+#endif
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+    /* Above the game's and the renderer's threads: the pipeline is short work
+     * between waits, and a normal-priority audio thread lost 100-300 ms to busy
+     * host threads during frame hitches (VP frame deficits with no ISR wait,
+     * AUDIO-FIX-20261021 dropouts). RECOMP_APU_PRIORITY=0 leaves it normal. */
+    if (!xa2_legacy() && (!getenv("RECOMP_APU_PRIORITY") || strcmp(getenv("RECOMP_APU_PRIORITY"), "0") != 0))
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#ifdef __ANDROID__
+    setpriority(PRIO_PROCESS, 0, -6);   /* POSIX SetThreadPriority only records the value */
+#endif
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
@@ -542,6 +728,11 @@ static void *mcpx_apu_frame_thread(void *arg)
                 int64_t dur = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - stall_since;
                 st_n++;
                 st_total += dur;
+                g_apu_stall_us += dur;
+                g_apu_stall_n++;
+                g_apu_dg_stall_us += dur;
+                g_apu_stall_total_us += dur;
+                g_apu_dg_stall_n++;
                 if (dur > st_max) st_max = dur;
                 stall_since = 0;
             }
@@ -561,6 +752,13 @@ static void *mcpx_apu_frame_thread(void *arg)
         }
 
         throttle(d);
+
+        /* The doorbell ack stands in for the GP DSP, which on hardware runs
+         * whatever the front end is doing. Tying it to se_frame stopped it
+         * whenever FECTL was trapped or halted, and DirectSound then waits
+         * forever to post its next command: Burnout 3 stalls in
+         * sub_002F805E polling the same doorbell it was acked on at init. */
+        mcpx_apu_dsp_ack_poll(d);
 
         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                 NV_PAPU_SECTL_XCNTMODE);
@@ -586,9 +784,13 @@ static void *mcpx_apu_frame_thread(void *arg)
                 d->set_irq = false;
             }
             /* Lightweight: just monitor frame (test tone + software mixer) */
+            if (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF &&
+                (fectl & (NV_PAPU_FECTL_FEMETHMODE_TRAPPED | NV_PAPU_FECTL_FEMETHMODE_HALTED)))
+            { g_apu_dg_silent_vp++; g_apu_silent_vp_total++; }
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
         }
+        apu_let_writers_in(d);
     }
 
     qemu_mutex_unlock(&d->lock);
@@ -746,29 +948,176 @@ void mcpx_apu_dispatch_mmio(MCPXAPUState *d, hwaddr addr, uint64_t val,
  * addr is offset from APU base (0xFE800000)
  * ============================================================ */
 
+static void apu_q_flush_for_read(MCPXAPUState *d);
+
 uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
 {
     if (!d) return 0;
     if (addr >= 0x20000 && addr < 0x30000) {
         return mcpx_apu_vp_read(d, addr - 0x20000, size);
     } else if (addr < 0x20000) {
+        apu_q_flush_for_read(d);   /* queued voice commands first (mcpx_apu_mmio_write) */
         return mcpx_apu_read(d, (hwaddr)addr, size);
     }
     return 0;
 }
 
+/* Voice commands (the VP method FIFO, 0x20000-0x2FFFF) from the title's
+ * threads. The frame thread processes voices holding d->lock for bursts of
+ * up to 8 pipeline frames, so a write used to wait for the rest of the burst:
+ * in SOFTDRINK play DirectSound sends 20-50 thousand of them a second, the
+ * game thread spent up to a third of its time waiting for the lock and frames
+ * ran late (2026-11-02). Now a writer that finds the lock taken queues the
+ * command and goes on; whoever holds the lock next runs the queue first --
+ * the frame thread between frames, or the next writer. Commands still never
+ * land mid-frame and still run in order. Main-register writes (interrupts,
+ * control) stay synchronous, and run the queue first. RECOMP_APU_SYNC_WRITES=1
+ * makes every write wait for the lock again. */
+typedef struct { uint32_t addr, val, size; } ApuQueued;
+#define APU_QUEUE_LEN 16384u
+static ApuQueued g_apu_q[APU_QUEUE_LEN];
+static volatile LONG g_apu_q_head, g_apu_q_tail;    /* head: next to run; tail: next free */
+static CRITICAL_SECTION g_apu_q_cs;
+static volatile LONG g_apu_q_init;
+static volatile LONGLONG g_apu_mmio_wait_us, g_apu_mmio_writes, g_apu_mmio_queued, g_apu_mmio_slow, g_apu_mmio_full, g_apu_read_flush_us;
+
+static void apu_q_init(void)
+{
+    if (g_apu_q_init == 2) return;
+    if (InterlockedCompareExchange(&g_apu_q_init, 1, 0) == 0) {
+        InitializeCriticalSection(&g_apu_q_cs);
+        InterlockedExchange(&g_apu_q_init, 2);
+    }
+    while (g_apu_q_init != 2) SwitchToThread();
+}
+
+/* Run the queued commands. The caller holds d->lock. */
+static void apu_q_drain(MCPXAPUState *d)
+{
+    ApuQueued batch[256];
+    if (g_apu_q_init != 2 || g_apu_q_head == g_apu_q_tail) return;
+    for (;;) {
+        unsigned n = 0;
+        EnterCriticalSection(&g_apu_q_cs);
+        while (n < 256 && g_apu_q_head != g_apu_q_tail) {
+            batch[n++] = g_apu_q[g_apu_q_head];
+            g_apu_q_head = (g_apu_q_head + 1) & (APU_QUEUE_LEN - 1);
+        }
+        LeaveCriticalSection(&g_apu_q_cs);
+        if (!n) break;
+        for (unsigned i = 0; i < n; i++)
+            mcpx_apu_dispatch_mmio(d, (hwaddr)batch[i].addr, batch[i].val, batch[i].size, true);
+    }
+    apu_raise_pending_irq(d);
+}
+
+/* Threads blocked on d->lock from outside the frame thread (apu_let_writers_in). */
+static volatile LONG g_apu_lock_waiters;
+static void apu_lock_outside(MCPXAPUState *d)
+{
+    InterlockedIncrement(&g_apu_lock_waiters);
+    qemu_mutex_lock(&d->lock);
+    InterlockedDecrement(&g_apu_lock_waiters);
+}
+
 void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned int size)
 {
+    static int sync = -1;
+    LARGE_INTEGER a, b, f;
     if (!d) return;
+    if (sync < 0) sync = getenv("RECOMP_APU_SYNC_WRITES") != NULL;
+    apu_q_init();
+    InterlockedAdd64(&g_apu_mmio_writes, 1);
+    if (!sync && addr >= 0x20000 && addr < 0x30000) {
+        if (TryEnterCriticalSection(&d->lock.cs)) {
+            apu_q_drain(d);
+            mcpx_apu_dispatch_mmio(d, (hwaddr)addr, val, size, true);
+            apu_raise_pending_irq(d);
+            qemu_mutex_unlock(&d->lock);
+            return;
+        }
+        EnterCriticalSection(&g_apu_q_cs);
+        if (((g_apu_q_tail + 1) & (APU_QUEUE_LEN - 1)) != g_apu_q_head) {
+            ApuQueued *e = &g_apu_q[g_apu_q_tail];
+            e->addr = (uint32_t)addr; e->val = (uint32_t)val; e->size = size;
+            g_apu_q_tail = (g_apu_q_tail + 1) & (APU_QUEUE_LEN - 1);
+            LeaveCriticalSection(&g_apu_q_cs);
+            InterlockedAdd64(&g_apu_mmio_queued, 1);
+            return;
+        }
+        LeaveCriticalSection(&g_apu_q_cs);   /* full: wait for the lock below */
+        InterlockedAdd64(&g_apu_mmio_full, 1);
+    }
     /* Serialise with the frame thread, which processes voices holding
      * d->lock (as xemu does). Unlocked, the title's voice commands (set
      * position, start, pause/resume, buffer pointers) landed mid-frame and
      * were overwritten by the voice processor: NFL 2K5's music streamer saw
      * its positions jump and restarted the song every 1-5 s, and announcer
      * lines were cut (2026-10-01). The lock is a recursive critical section. */
-    qemu_mutex_lock(&d->lock);
+    QueryPerformanceCounter(&a);
+    apu_lock_outside(d);
+    QueryPerformanceCounter(&b);
+    QueryPerformanceFrequency(&f);
+    {
+        LONGLONG us = (b.QuadPart - a.QuadPart) * 1000000 / f.QuadPart;
+        InterlockedAdd64(&g_apu_mmio_wait_us, us);
+        if (us > 1000) InterlockedAdd64(&g_apu_mmio_slow, 1);
+    }
+    apu_q_drain(d);
     mcpx_apu_dispatch_mmio(d, (hwaddr)addr, val, size, true);
+    apu_raise_pending_irq(d);
     qemu_mutex_unlock(&d->lock);
+}
+
+/* Frame thread, holding d->lock between pipeline frames. While the pipeline
+ * keeps up it also lets go in its throttle wait; on a machine too slow for real
+ * time it never reaches that wait, so a thread blocked on the lock (a main
+ * register write holding the guest lock) waited for as long as the game ran. */
+static void apu_let_writers_in(MCPXAPUState *d)
+{
+    apu_q_drain(d);
+    if (g_apu_lock_waiters) {
+        int spins = 0;
+        qemu_mutex_unlock(&d->lock);
+        while (g_apu_lock_waiters && spins++ < 2000) SwitchToThread();
+        qemu_mutex_lock(&d->lock);
+    }
+}
+
+/* A main-register read after queued voice commands sees their effects. */
+static void apu_q_flush_for_read(MCPXAPUState *d)
+{
+    LARGE_INTEGER a, b, f;
+    if (g_apu_q_init != 2 || g_apu_q_head == g_apu_q_tail) return;
+    QueryPerformanceCounter(&a);
+    apu_lock_outside(d);
+    apu_q_drain(d);
+    qemu_mutex_unlock(&d->lock);
+    QueryPerformanceCounter(&b);
+    QueryPerformanceFrequency(&f);
+    InterlockedAdd64(&g_apu_read_flush_us, (b.QuadPart - a.QuadPart) * 1000000 / f.QuadPart);
+}
+
+void mcpx_apu_lock_report(void)
+{
+    static LONGLONG w0, n0, s0, q0, f0, r0;
+    LONGLONG w = g_apu_mmio_wait_us, n = g_apu_mmio_writes, s = g_apu_mmio_slow, q = g_apu_mmio_queued;
+    LONGLONG fu = g_apu_mmio_full, r = g_apu_read_flush_us;
+    fprintf(stderr, "[APULOCK] %lld register writes (%lld queued, %lld with the queue full), waited %.1f ms in all "
+            "for the APU lock (%lld over 1 ms), reads waited %.1f ms\n",
+            (long long)(n - n0), (long long)(q - q0), (long long)(fu - f0), (w - w0) / 1000.0,
+            (long long)(s - s0), (r - r0) / 1000.0);
+    w0 = w; n0 = n; s0 = s; q0 = q; f0 = fu; r0 = r;
+    {
+        LONGLONG nn = g_apu_note_n, ns = g_apu_note_sum_us, an = g_apu_ack_n, as = g_apu_ack_sum_us;
+        static LONGLONG nn0, ns0, an0, as0;
+        fprintf(stderr, "[APUIRQ] %lld notifiers waited %.2f ms on average for the line (longest %.1f); "
+                "%lld acknowledgements took %.2f ms on average (longest %.1f)\n",
+                (long long)(nn - nn0), nn > nn0 ? (ns - ns0) / 1000.0 / (double)(nn - nn0) : 0.0, g_apu_note_max_us / 1000.0,
+                (long long)(an - an0), an > an0 ? (as - as0) / 1000.0 / (double)(an - an0) : 0.0, g_apu_ack_max_us / 1000.0);
+        nn0 = nn; ns0 = ns; an0 = an; as0 = as;
+        g_apu_note_max_us = g_apu_ack_max_us = 0;
+    }
 }
 
 /* ============================================================

@@ -60,7 +60,10 @@ static const char *env_cached(const char *name) {
     uintptr_t k = (uintptr_t) name;
     unsigned h = (unsigned) (((k >> 3) * 2654435761u) >> 8) & 1023u, i;
     for (i = 0; i < 1024; i++, h = (h + 1) & 1023u) {
-        const char *n = (const char *) InterlockedCompareExchangePointer(&tab[h].name, NULL, NULL);
+        /* A plain volatile load: x86 loads already order after the store
+         * that published the name (a locked compare-exchange here, for a
+         * read, was 1.5% of the render thread, 2026-10-30). */
+        const char *n = (const char *) tab[h].name;
         if (n == name) return tab[h].value;
         if (!n) break;
     }
@@ -352,6 +355,7 @@ static struct {
     uint32_t batches_textured, batches_no_uv, batches_no_tex;
     Texture tex;
 } s_gpu;
+static uint32_t s_tex_raw0;
 
 /* What each vertex attribute reads when the batch does not supply it as an
  * array: the last SET_VERTEX_DATA* value, or the last element of the last
@@ -376,6 +380,9 @@ typedef struct {
 
 static PbUnhandled s_unhandled[PB_EXEC_MAX_UNHANDLED];
 static int s_unhandled_count;
+/* slot + 1 of each method in s_unhandled: a scan of ~200 entries on every
+ * unhandled method was ~1% of the render thread (2026-10-30) */
+static uint16_t s_unhandled_slot[0x4000];
 
 /* Every texture-stage register, as the title last set it.
  * Texturing is not implemented yet; knowing which formats and sizes a title
@@ -465,10 +472,17 @@ static void note_unhandled(uint32_t method, uint32_t param) {
     int i;
 
     s_gpu.unhandled_total++;
+    i = s_unhandled_slot[(method >> 2) & 0x3FFF] - 1;
+    if (i >= 0 && s_unhandled[i].method == method) {
+        s_unhandled[i].count++;
+        s_unhandled[i].last_param = param;
+        return;
+    }
     for (i = 0; i < s_unhandled_count; i++) {
         if (s_unhandled[i].method == method) {
             s_unhandled[i].count++;
             s_unhandled[i].last_param = param;
+            s_unhandled_slot[(method >> 2) & 0x3FFF] = (uint16_t)(i + 1);
             return;
         }
     }
@@ -482,6 +496,7 @@ static void note_unhandled(uint32_t method, uint32_t param) {
         s_unhandled[s_unhandled_count].count = 1;
         s_unhandled[s_unhandled_count].last_param = param;
         s_unhandled_count++;
+        s_unhandled_slot[(method >> 2) & 0x3FFF] = (uint16_t)s_unhandled_count;
     }
 }
 
@@ -4539,11 +4554,17 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param) {
             s_gpu.zeta_offset = param;
             break;
         case NV097_SET_COLOR_CLEAR_VALUE:
+            if (param == XBOX_HOSTSCENE_MAGIC) {   /* not a colour: a host scene goes here (xbox_hostscene.h) */
+                if (gpu_enabled()) gpu_host_scene();
+                break;
+            }
             s_gpu.clear_color = param;
             break;
         case NV097_CLEAR_SURFACE:
-            if (gpu_enabled() && gpu_clear(param))
+            if (gpu_enabled() && gpu_clear(param)) {
+                if (param & 0xF0u) gpu_host_scene_frame_start();   /* after the colour clear */
                 break;
+            }
             if (gpu_enabled())
                 gpu_cpu_access();
             clear_surface(param);
@@ -4567,7 +4588,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param) {
                 /* Three ways a batch can have arrived, and only one is in use at
                  * a time: vertices completed by SET_VERTEX4F, a payload written
                  * with INLINE_ARRAY, or indices into the title's own arrays. */
-                if (s_gpu.imm_count)
+                if (gpu_enabled() && gpu_host_scene_trigger(s_tex_raw0))
+                    ;   /* the trigger is dropped; the next frame starts with the host scene */
+                else if ((gpu_enabled() ? gpu_host_scene_frame_start() : (void)0), s_gpu.imm_count)
                     draw_immediate();
                 else if (s_gpu.inline_count)
                     draw_inline_array();
@@ -4674,6 +4697,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param) {
              * vertex array offset -- physical, and reachable only through the
              * contiguous window when it names contiguous memory. */
             s_gpu.tex.offset = dma_resolve(param);
+            s_tex_raw0 = param;                 /* the host scene matches the guest's own offset */
             record_tex_reg(method, param);
             break;
 
@@ -4718,8 +4742,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param) {
              * There is no scanout here to wait for, so that is now. */
             s_gpu.flip_read = s_gpu.flip_write;
             /* The surface drawn into up to here is a finished frame: show it. */
-            if (gpu_enabled())
+            if (gpu_enabled()) {
                 gpu_flip();
+                gpu_host_scene_flip();
+            }
             /* RECOMP_SHOT_PREFIX=<path prefix>: every RECOMP_SHOT_SECONDS (default
              * 30) write the finished frame as <prefix>-<n>.bmp, straight from the
              * surface -- works when the window is minimised or the screen is

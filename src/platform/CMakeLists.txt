@@ -24,7 +24,7 @@ if(WIN32)
     target_include_directories(platform PUBLIC ${XBOXRECOMP_SRC_DIR})
 else()
     add_library(platform STATIC win32_compat.c)
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR ANDROID)
         target_sources(platform PRIVATE guest_memory.c)
     endif()
     target_include_directories(platform PUBLIC

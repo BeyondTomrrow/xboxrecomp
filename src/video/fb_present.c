@@ -15,7 +15,7 @@
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
-#define FB_TITLE          "ESPN NFL 2K5 - LINUX V0.5"
+#define FB_TITLE          "ESPN NFL 2K5"
 #define FB_GUEST_RAM_SIZE 0x04000000u
 
 enum {
@@ -101,6 +101,8 @@ static unsigned fb_scancode_to_vk(SDL_Scancode sc) {
         case SDL_SCANCODE_UP: return 0x26u;
         case SDL_SCANCODE_RIGHT: return 0x27u;
         case SDL_SCANCODE_DOWN: return 0x28u;
+        case SDL_SCANCODE_PAGEUP: return 0x21u;
+        case SDL_SCANCODE_PAGEDOWN: return 0x22u;
         default: return 0u;
     }
 }
@@ -260,6 +262,7 @@ static int SDLCALL fb_thread_sdl(void *data) {
 
     g_fb.ultrawide = getenv("RECOMP_ULTRAWIDE") && *getenv("RECOMP_ULTRAWIDE") != '0';
 
+    fprintf(stderr, "  [FBWIN] window thread: SDL video init\n");
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         fprintf(stderr, "  [FBWIN] SDL_Init failed: %s\n", SDL_GetError());
         SDL_SetAtomicInt(&g_fb.running, 0);
@@ -278,6 +281,7 @@ static int SDLCALL fb_thread_sdl(void *data) {
         g_fb.mode = FB_MODE_BORDERLESS;
     }
 
+    fprintf(stderr, "  [FBWIN] window thread: creating the window\n");
     win = SDL_CreateWindow(FB_TITLE, (int) g_fb.width, (int) g_fb.height, flags);
     if (!win) {
         fprintf(stderr, "  [FBWIN] SDL_CreateWindow failed: %s\n", SDL_GetError());
@@ -288,6 +292,14 @@ static int SDLCALL fb_thread_sdl(void *data) {
     {
         const char *on = getenv("RECOMP_SDLGPU"), *pres = getenv("RECOMP_SDLGPU_PRESENT");
         int expect = on && *on && strcmp(on, "0") != 0 && !(pres && strcmp(pres, "0") == 0);
+#if !defined(_WIN32)
+        /* gx on Vulkan presents into this window: no SDL_Renderer (an EGL
+         * surface) first, which the Vulkan swap chain would then replace */
+        {
+            const char *r = getenv("RECOMP_RENDERER");
+            if (r && (!strcmp(r, "vulkan") || !strcmp(r, "vk"))) expect = 1;
+        }
+#endif
         gpu_expected_until = expect ? SDL_GetTicks() + 10000 : 0;
     }
 
@@ -351,11 +363,8 @@ static int SDLCALL fb_thread_sdl(void *data) {
                     );
                     fb_texture_opaque(g_fb.fallback_texture);
                 }
-                if (!presenter(win, g_fb.ultrawide)) {
-                    SDL_SetAtomicPointer((void **)&g_fb.presenter, NULL);
-                    SDL_SetAtomicInt(&g_fb.gpu_present, 0);   /* back to the SDL_Renderer */
-                    gpu_expected_until = 0;
-                }
+                /* (no presenter here: it is NULL on this branch) */
+                gpu_expected_until = 0;
 
                 fb_draw_sdl_fallback();
             }

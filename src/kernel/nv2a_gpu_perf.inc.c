@@ -144,6 +144,12 @@ static void perf_memory(void)
         DXGI_QUERY_VIDEO_MEMORY_INFO vi;
         if (SUCCEEDED(IDXGIAdapter3_QueryVideoMemoryInfo(s_perf.adapter3, 0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vi)))
             s_perf.vram_mb = (unsigned)(vi.CurrentUsage >> 20);
+    } else {
+        /* Direct3D 12/Vulkan: no D3D11 device to ask; DXGI directly */
+        IDXGIAdapter3 *a3 = gpu_dxgi_adapter3(NULL);
+        DXGI_QUERY_VIDEO_MEMORY_INFO vi;
+        if (a3 && SUCCEEDED(a3->lpVtbl->QueryVideoMemoryInfo(a3, 0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vi)))
+            s_perf.vram_mb = (unsigned)(vi.CurrentUsage >> 20);
     }
 #else
     FILE *f = fopen("/proc/self/statm", "r");
@@ -163,13 +169,21 @@ extern volatile LONG64 g_xbox_read_qpc, g_xbox_read_bytes, g_xbox_read_count;
 extern volatile LONG64 g_pb_exec_qpc, g_pb_qwait_qpc, g_pb_capture_qpc;
 extern volatile DWORD g_xbox_game_tid;
 LONGLONG xbox_ggl_waited_qpc(DWORD tid);
+LONGLONG xbox_ggl_main_waited_qpc(void);
+DWORD xbox_ggl_main_tid(void);
+
+extern volatile LONG64 g_gx_compile_qpc, g_gx_pipe_qpc;     /* gx/gx_sdl.c (0 on Direct3D 11) */
+extern volatile LONG g_gx_compiles, g_gx_pipes;
 
 static void perf_hitch(float ms, float present_ms)
 {
+    static LONG64 cq, pq;
+    static LONG cn, pn;
     static LONG64 rq, rb, rc, ex, qw, cp, gw, tx, tcx;
     LONG64 tq = g_tex_upload_qpc, tc = g_tex_create_qpc;
-    LONG64 lw = g_xbox_game_tid ? xbox_ggl_waited_qpc(g_xbox_game_tid) : 0;
+    LONG64 lw = xbox_ggl_main_waited_qpc();
     static uint32_t draws, texup, surfs;
+    static unsigned phit, pmiss;
     static LONG ps;
     static unsigned logged;
     LONG64 q = g_xbox_read_qpc, b = g_xbox_read_bytes, c = g_xbox_read_count;
@@ -177,6 +191,9 @@ static void perf_hitch(float ms, float present_ms)
     double f = 1000.0 / (double)s_perf.freq.QuadPart;
     if (ms > 25.0f && s_perf.n > 1800 && logged < 400) {
         logged++;
+        fprintf(stderr, "  [HITCH]   texture pool: %u reused, %u created; shader compiles %ld (%.1f ms), pipelines %ld (%.1f ms)\n",
+                s_tpool_hits - phit, s_tpool_misses - pmiss, (long)(g_gx_compiles - cn), (double)(g_gx_compile_qpc - cq) * f,
+                (long)(g_gx_pipes - pn), (double)(g_gx_pipe_qpc - pq) * f);
         fprintf(stderr, "  [HITCH] %.1f ms: present %.1f ms, reads %lld (%lld KB, %.1f ms), tex uploads %u (%.1f ms, create %.1f), new targets %u, "
                         "ps ready %ld, draws %u; render thread %.1f ms, queue wait %.1f ms, capture %.1f ms, game thread lock wait %.1f ms\n",
                 ms, present_ms, (long long)(c - rc), (long long)((b - rb) >> 10), (double)(q - rq) * f,
@@ -185,8 +202,51 @@ static void perf_hitch(float ms, float present_ms)
     }
     rq = q; rb = b; rc = c; ex = e; qw = w; cp = k; gw = lw; tx = tq; tcx = tc;
     draws = s_gpu11.draws; texup = s_gpu11.tex_uploads; surfs = s_gpu11.surf_creates; ps = s_ps_ready;
+    phit = s_tpool_hits; pmiss = s_tpool_misses;
+    {
+        /* the game thread's own CPU time that frame: busy (the title's work)
+         * or waiting (events, sleeps, the render thread) */
+        static DWORD htid;
+        static HANDLE h;
+        static ULONG64 pc;
+        ULONG64 c = 0;
+        DWORD tid = xbox_ggl_main_tid();
+        if (tid && tid != htid) {
+            if (h) CloseHandle(h);
+            h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+            htid = tid;
+            pc = 0;
+        }
+        if (h && QueryThreadCycleTime(h, &c)) {
+            static double avg;
+            double d = pc ? (double)(c - pc) / 1e6 : 0.0;
+            if (pc && ms > 25.0f && s_perf.n > 1800 && logged < 400)
+                fprintf(stderr, "  [HITCH]   game thread %lu: %.1f Mcyc of CPU (usual %.1f)\n", (unsigned long)tid, d, avg);
+            if (pc) avg = avg * 0.98 + d * 0.02;
+            pc = c;
+        }
+    }
+    if (s_dp_on > 0) {
+        /* RECOMP_GPU_PROFILE: the draw path's stages in that frame (Mcycles) */
+        static uint64_t pd[6];
+        uint64_t d[6];
+        int j;
+        for (j = 0; j < 6; j++) d[j] = s_dp_base[j] + s_dp_acc[j];
+        if (ms > 25.0f && s_perf.n > 1800 && logged < 400)
+            fprintf(stderr, "  [HITCH]   draw path Mcyc: all %.1f build %.1f tex %.1f upload+bind %.1f state+draw %.1f\n",
+                    (d[5] - pd[5]) / 1e6, (d[0] - pd[0]) / 1e6, (d[1] - pd[1]) / 1e6, (d[2] - pd[2]) / 1e6,
+                    ((d[3] - pd[3]) - (d[2] - pd[2])) / 1e6);
+        memcpy(pd, d, sizeof pd);
+    }
+    cq = g_gx_compile_qpc; pq = g_gx_pipe_qpc; cn = g_gx_compiles; pn = g_gx_pipes;
 }
 
+/* Frames presented and the longest frame (us) since the APU's audio report
+ * last took it (apu_vp.c diag_report, once a second). */
+volatile LONG g_xbox_perf_frames;
+volatile LONG g_xbox_perf_worst_us;
+
+/* Called once per present, after the swap chain's Present returned. */
 static void perf_on_present(int scale, float present_ms)
 {
     LARGE_INTEGER now;
@@ -201,6 +261,26 @@ static void perf_on_present(int scale, float present_ms)
     QueryPerformanceCounter(&now);
     ms = (float)((double)(now.QuadPart - s_perf.last.QuadPart) * 1000.0 / (double)s_perf.freq.QuadPart);
     s_perf.last = now;
+    {
+        /* RECOMP_TEST_SLOW_FRAMES=<every s>:<for s>:<ms>: a test knob that makes
+         * frame-rate dips on purpose (every N s, for M s, each frame takes K ms
+         * longer), to see what the game and its audio do in a slowdown. */
+        static int every = -1, len, add;
+        if (every < 0) {
+            const char *e = getenv("RECOMP_TEST_SLOW_FRAMES");
+            every = 0;
+            if (e && sscanf(e, "%d:%d:%d", &every, &len, &add) != 3) every = 0;
+        }
+        if (every > 0 && add > 0 &&
+            (GetTickCount() / 1000u) % (unsigned)every >= (unsigned)(every - len)) {
+            /* as a slow GPU would: the guest CPU is not held meanwhile */
+            int depth = xbox_ggl_release_all();
+            Sleep((DWORD)add);
+            xbox_ggl_reacquire(depth);
+        }
+    }
+    InterlockedIncrement(&g_xbox_perf_frames);
+    if ((LONG)(ms * 1000.0f) > g_xbox_perf_worst_us) InterlockedExchange(&g_xbox_perf_worst_us, (LONG)(ms * 1000.0f));
     s_perf.ft[s_perf.head] = ms;
     s_perf.head = (s_perf.head + 1) % PERF_RING;
     s_perf.n++;
@@ -246,16 +326,4 @@ static void perf_on_present(int scale, float present_ms)
         s_perf.win_t0 = now; s_perf.win_frames = 0; s_perf.win_ft_sum = 0; s_perf.win_ft_max = 0; s_perf.win_cpu0 = cpu;
         s_perf.win_gpu_sum = 0; s_perf.win_gpu_n = 0;
     }
-}
-
-static int perf_overlay_text(char *l1, size_t n1, char *l2, size_t n2, int fps)
-{
-    snprintf(l1, n1, "%d FPS  %.1f ms", fps, s_perf.ft_avg);
-    if (s_perf.gpu_ms >= 0)
-        snprintf(l2, n2, "1%% low %.0f   GPU %.1f ms   CPU %.1f ms   VRAM %u MB",
-                 s_perf.low1, s_perf.gpu_ms, s_perf.cpu_ms, s_perf.vram_mb);
-    else
-        snprintf(l2, n2, "1%% low %.0f   CPU %.1f ms   VRAM %u MB",
-                 s_perf.low1, s_perf.cpu_ms, s_perf.vram_mb);
-    return 1;
 }

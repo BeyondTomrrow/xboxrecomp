@@ -272,6 +272,15 @@ HANDLE CreateFileW(LPCWSTR name, DWORD access, DWORD share,
 BOOL   ReadFile(HANDLE h, LPVOID buf, DWORD len, LPDWORD nread, void *overlapped);
 BOOL   WriteFile(HANDLE h, LPCVOID buf, DWORD len, LPDWORD nwritten, void *overlapped);
 DWORD  GetFileSize(HANDLE h, LPDWORD high);
+#ifndef FILE_BEGIN
+#define FILE_BEGIN   0
+#define FILE_CURRENT 1
+#define FILE_END     2
+#endif
+#ifndef MAXDWORD
+#define MAXDWORD 0xFFFFFFFFu
+#endif
+BOOL   SetFilePointerEx(HANDLE h, LARGE_INTEGER dist, PLARGE_INTEGER newpos, DWORD method);
 BOOL   GetFileSizeEx(HANDLE h, PLARGE_INTEGER size);
 BOOL   FlushFileBuffers(HANDLE h);
 

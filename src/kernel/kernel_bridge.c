@@ -25,6 +25,9 @@
  *   different parameter layouts (pointer vs value), so each needs its own bridge.
  */
 
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 #include "kernel.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
@@ -368,11 +371,26 @@ void xbox_bridge_end_title_tick(void)
  * emit that pulse only at a bridge boundary already executing on the guest
  * thread.  This avoids corrupting TLS registers or the guest stack from a
  * Windows timer callback. */
+/* Set by a gen patch (BOOT_MOVIE_BEGIN/END, tools/apply-gen-patches.py)
+ * while the boot intro loop plays a movie. The pulse stays pending and runs
+ * once the movie ends: a frontend callback presents frames
+ * (sub_00028F40 -> sub_00028DE0) and, run on the scheduler thread beside the
+ * movie thread's own frame loop, left one of them spinning in BlockOnFence
+ * for good -- the intro froze on its first or fourth movie, on every
+ * renderer, depending on timing (2026-10-31). NFL2K5_MOVIE_SCHED=1 restores
+ * the old behaviour for comparison. */
+volatile long g_xbox_boot_movie_active;
+
 static void bridge_dispatch_scheduler_tick(void)
 {
     recomp_func_t scheduler;
     uint32_t save_eax, save_ecx, save_edx, save_esp;
     uint32_t save_ebx, save_esi, save_edi, save_ebp, save_seh_ebp;
+    static int movie_sched = -1;
+
+    if (movie_sched < 0) movie_sched = getenv("NFL2K5_MOVIE_SCHED") != NULL;
+    if (g_xbox_boot_movie_active && !movie_sched)
+        return;
 
     /* Do not consume the initial 16 ms slot before the title has populated
      * B04D20/B04D24.  Early boot drains DPCs too, but there is no work for
@@ -777,6 +795,9 @@ static void bridge_run_thread_inline(recomp_func_t fn, uint32_t ctx1,
 
 static DWORD WINAPI bridge_thread_main(LPVOID param)
 {
+#if defined(__linux__)
+    prctl(PR_SET_NAME, "xbox_bridge", 0, 0, 0);   /* named in the Android [CPU] report */
+#endif
     struct bridge_thread_start *s = (struct bridge_thread_start *)param;
     recomp_func_t fn = s->fn;
     uint32_t ctx1 = s->ctx1, ctx2 = s->ctx2;
@@ -1764,10 +1785,10 @@ static void bridge_KeWaitForSingleObject(void)
     HANDLE h;
 
     h = ke_shadow_lookup(object);
-    if (!h)
+    /* An untagged value in guest RAM is the dispatcher object's address, not a
+     * handle (bridge_resolve_handle would pass it through as one). */
+    if (!h && !(object >= 0x00010000u && object < XBOX_TOTAL_RAM))
         h = bridge_resolve_handle(object);
-    if (!h)
-        h = XBOX_TO_NATIVE(object);
 
     /* An infinite host wait must periodically return to guest context so host
      * timer completions can drain from the DPC queue. Finite guest timeouts
@@ -1780,6 +1801,15 @@ static void bridge_KeWaitForSingleObject(void)
         BRIDGE_MEM32(object + 4) != 0) {
         BRIDGE_MEM32(object + 4) = 0;
         g_eax = 0;
+        return;
+    }
+    /* No host object behind it: the wait used to go to the OS with the guest
+     * address as the handle and fail (WAIT_FAILED -> STATUS_UNSUCCESSFUL).
+     * Same result without the call -- a UWP process has strict handle checks,
+     * where an invalid handle ends the process (0xC0000008, 2026-10-31). */
+    if (!h) {
+        xbox_bridge_drain_guest_dpcs();   /* as the failed wait's loop did */
+        g_eax = (uint32_t)STATUS_UNSUCCESSFUL;
         return;
     }
     dpc_slice.QuadPart = -100000; /* 10 ms in 100 ns units */
@@ -2553,7 +2583,15 @@ static void kernel_vblank_tick(void)
                     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0),
                     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + 0x140u));
         n++;
-        fflush(stderr);
+        /* Not on every vblank: this thread holds the guest lock here, and a
+         * write to the log can block for 60+ ms, stalling the game thread
+         * (seen as "game thread lock wait"). main.c's flusher thread does it.
+         * RECOMP_VBLANK_FLUSH=1 brings the old behaviour back for comparison. */
+        {
+            static int every = -1;
+            if (every < 0) every = getenv("RECOMP_VBLANK_FLUSH") != NULL;
+            if (every || n <= 3) fflush(stderr);
+        }
     }
 #undef frequency
 #undef next_tick
@@ -2776,6 +2814,9 @@ static void bridge_KeInitializeTimerEx(void)
  */
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
+#if defined(__linux__)
+    prctl(PR_SET_NAME, "xbox_timer", 0, 0, 0);   /* named in the Android [CPU] report */
+#endif
     int slot = xbox_worker_stack_alloc();
 
     (void)unused;
@@ -3827,6 +3868,20 @@ static void bridge_NtQueryDirectoryFile(void)
         fn.MaximumLength = BRIDGE_MEM16(filename_va + 2);
         fn.Buffer        = fn_buf ? (PCHAR)XBOX_TO_NATIVE(fn_buf) : NULL;
         if (fn.Buffer) pfn = &fn;
+    }
+    {   /* NFL2K5_DIRTRACE=1 (study): who lists directories -- code addresses on the guest stack */
+        static int on = -1, n;
+        if (on < 0) on = getenv("NFL2K5_DIRTRACE") != NULL;
+        if (on && n < 40) {
+            int k, shown = 0;
+            n++;
+            fprintf(stderr, "[DIRTRACE] query len=%u class=%u restart=%u callers:", length, info_class, restart);
+            for (k = 0; k < 96 && shown < 12; k++) {
+                uint32_t w = BRIDGE_MEM32(g_esp + 4u * (uint32_t)k);
+                if (w >= 0x00011000u && w < 0x004E0000u) { fprintf(stderr, " %08X", w); shown++; }
+            }
+            fprintf(stderr, "\n");
+        }
     }
     g_eax = (uint32_t)xbox_NtQueryDirectoryFile(handle, NULL, NULL, NULL, &ios,
                 XBOX_TO_NATIVE(info_va), length, (XBOX_FILE_INFORMATION_CLASS)info_class,
@@ -9940,8 +9995,82 @@ void xbox_kernel_set_ordinal_remap(const unsigned short *map, int count)
     g_ordinal_remap_count = count;
 }
 
+#if defined(_WIN32)
+/* Logging never waits for a disk. Guest threads print and flush stderr while
+ * holding the guest lock, and a log write that stalled on the disk stalled
+ * every guest thread with it: in all 17 waits over 30 ms in a sampled game the
+ * lock's owner was in WriteFile under fflush, or queued for the stream behind
+ * one (2026-11-06). stderr's descriptor becomes a pipe; this thread alone
+ * writes the real file (session.log, or wherever stderr was redirected).
+ * RECOMP_LOG_SYNC=1 or NFL2K5_LOG_UNBUFFERED=1 keep direct writes. */
+#include <io.h>
+#include <fcntl.h>
+static HANDLE s_log_r, s_log_out;
+static volatile LONG s_log_busy;
+static LPTOP_LEVEL_EXCEPTION_FILTER s_log_prev_filter;
+
+static DWORD WINAPI log_writer_thread(LPVOID unused)
+{
+    static char buf[1 << 16];
+    (void)unused;
+    for (;;) {
+        DWORD n = 0, w = 0;
+        if (!ReadFile(s_log_r, buf, sizeof buf, &n, NULL) || !n) return 0;
+        InterlockedExchange(&s_log_busy, 1);
+        WriteFile(s_log_out, buf, n, &w, NULL);
+        InterlockedExchange(&s_log_busy, 0);
+    }
+}
+
+/* The lines already printed reach the file before the process goes. */
+static void log_drain(void)
+{
+    DWORD t0 = GetTickCount(), avail = 1;
+    fflush(stderr);
+    while (GetTickCount() - t0 < 1000) {
+        if (!PeekNamedPipe(s_log_r, NULL, 0, NULL, &avail, NULL)) break;
+        if (!avail && !s_log_busy) break;
+        Sleep(1);
+    }
+}
+
+static LONG WINAPI log_crash_filter(EXCEPTION_POINTERS *ep)
+{
+    LONG r = s_log_prev_filter ? s_log_prev_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
+    log_drain();
+    return r;
+}
+
+static void log_writer_start(void)
+{
+    HANDLE w = NULL, h;
+    int fd, wfd;
+    if (getenv("RECOMP_LOG_SYNC") || getenv("NFL2K5_LOG_UNBUFFERED")) return;
+    fd = _fileno(stderr);
+    if (fd < 0 || (intptr_t)(h = (HANDLE)_get_osfhandle(fd)) <= 0) return;
+    fflush(stderr);
+    if (!DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &s_log_out, 0, FALSE, DUPLICATE_SAME_ACCESS)) return;
+    if (!CreatePipe(&s_log_r, &w, NULL, 8u << 20)) { CloseHandle(s_log_out); return; }
+    wfd = _open_osfhandle((intptr_t)w, _O_WRONLY | _O_BINARY);
+    if (wfd < 0 || _dup2(wfd, fd) != 0) {
+        if (wfd >= 0) _close(wfd); else CloseHandle(w);
+        CloseHandle(s_log_r); CloseHandle(s_log_out);
+        return;
+    }
+    _close(wfd);
+    _setmode(fd, _O_TEXT);               /* the line endings stderr had */
+    CloseHandle(CreateThread(NULL, 0, log_writer_thread, NULL, 0, NULL));
+    s_log_prev_filter = SetUnhandledExceptionFilter(log_crash_filter);
+    atexit(log_drain);
+}
+#else
+static void log_writer_start(void) {}
+#endif
+
 void xbox_kernel_bridge_init(void)
 {
+    log_writer_start();
+
     int i;
     int resolved = 0;
     int bridged = 0;

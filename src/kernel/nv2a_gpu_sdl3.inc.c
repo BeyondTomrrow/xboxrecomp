@@ -57,13 +57,16 @@ volatile LONG g_xbox_input_blocked = 0;
 void (*g_xbox_fps_limit_changed)(void) = NULL;
 int (*xbox_present_in_match_fn)(void) = NULL;
 int xbox_hud_shared_failed = 1;
+volatile LONG g_xbox_perf_frames;      /* frames presented / worst frame (apu_vp.c's audio report) */
+volatile LONG g_xbox_perf_worst_us;
 
 typedef struct { int bb_w, bb_h; float game_x, game_y, game_w, game_h; } XboxHudFrame;
-typedef struct { const void *pixels; int w, h, stride, x, y, changed, dw, dh; void *shared; } XboxHudImage;
+typedef struct { const void *pixels; int w, h, stride, x, y, changed, dw, dh; void *shared; int dirty_y0, dirty_y1; const unsigned char *dirty_rows; } XboxHudImage;
 typedef int (*XboxHudCallback)(const XboxHudFrame *f, XboxHudImage *img);
 static XboxHudCallback s_hud_cb = NULL;
 
 void xbox_PresentSetHudCallback(XboxHudCallback cb) { s_hud_cb = cb; }
+void xbox_PresentSetTopHudCallback(XboxHudCallback cb) { (void)cb; }
 int  xbox_VideoFpsLimit(void) { return s_vs.fps_limit; }
 
 static void vs_load(void)

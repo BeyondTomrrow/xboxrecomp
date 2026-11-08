@@ -1,4 +1,4 @@
-/* ── Presentation and video settings (2026-09-26) ────────────────────────
+/* â”€â”€ Presentation and video settings (2026-09-26) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
  *
  * Included into nv2a_gpu_d3d11.inc.c.
  *
@@ -33,11 +33,19 @@ static HWND xbox_GetNativeHwnd(void)
 {
     SDL_Window *win = (SDL_Window *)xbox_FramebufferWindowHwnd();
     if (!win) return NULL;
+#if !defined(_WIN32) || defined(NFL2K5_UWP)
+    /* No Win32 window: only SDL_GPU presents here, and the presenter uses
+     * the handle as the window's identity (Android/Linux showed nothing,
+     * the swap chain waiting forever for an HWND, 2026-10-30). The UWP
+     * build is the same: its SDL window is the dummy driver's. */
+    return (HWND)win;
+#else
     return (HWND)SDL_GetPointerProperty(
         SDL_GetWindowProperties(win),
         SDL_PROP_WINDOW_WIN32_HWND_POINTER,
         NULL
     );
+#endif
 }
 
 int  xbox_ggl_release_all(void);
@@ -64,13 +72,30 @@ typedef struct {
     int fps_limit;          /* frame-rate cap in Hz: 30, 60, 120; 0 unlimited; -1 original (game's own 30/60) */
     int widescreen;         /* built-in Hor+ widescreen: the picture fills the window */
     int lighting;           /* 0 classic, 1 enhanced, 2 maximum */
+    int renderer;           /* graphics API from the next start: 0 Direct3D 11, 1 Vulkan, 2 Direct3D 12 (gx/gx_sdl.c) */
+    int upscaler;           /* 0 off, 1 FSR 3 native AA, 2 quality, 3 balanced, 4 performance, 5 ultra performance */
+    int framegen;           /* FSR 3 frame generation: a generated frame between each two (Direct3D 12) */
+    int dynres;             /* dynamic resolution: the internal resolution drops below `scale` while the GPU is the limit */
+    int post;               /* post-processing preset (nv2a_gpu_post.inc.c): 0 off, 1 Broadcast, 2 Cinematic, 3 Vivid, 4 Night Game */
+    int sharpen;            /* 0 off, 1 low, 2 medium, 3 high */
+    int ao;                 /* ambient occlusion (Direct3D 12 / Vulkan): 0 off, 1 on, 2 strong */
+    int hdr;                /* HDR10 output (Direct3D 12 / Vulkan, an HDR display): 0 off, 1 on */
 } VideoSettings;
 
 /* NFL 2K5 draws several full-screen backdrops only inside the 640-pixel
  * title-safe area of its 720-pixel scanout.  A CRT hid the remaining edge;
  * showing the full scanout exposes hard black strips beside the sky. */
-static VideoSettings s_vs = { VM_BORDERLESS, 1920, 1080, AR_ORIGINAL, 3, SF_ENHANCED, 1, 100, 100, 0, 0, 8, 0, 1 };
+/* Highest internal resolution offered, the same everywhere: what the picture
+ * looks like is the player's choice (2026-11-06), also on a phone that cannot
+ * hold it. */
+#define VS_MAX_SCALE 16
+static VideoSettings s_vs = { VM_BORDERLESS, 1920, 1080, AR_ORIGINAL, 3, SF_ENHANCED, 1, 100, 100, 0, 0, 8, 0, 1, 0, 0, 0, 0, 1, 1, 1, 0, 0 };
 static volatile LONG s_vs_dirty = 1;
+static uint32_t pr_dynres_scale(void);
+extern volatile LONG g_gx_hdr_wanted;         /* gx/gx_sdl.c: HDR10 output */
+int gxs_hdr_supported(void);
+static float s_last_present_ms;                     /* how long the last Present waited */
+static void preset_apply(VideoSettings *v, int p);
 void xbox_VideoSettingsLoad(void);           /* window/swap chain need (re)applying */
 
 static const char *k_vs_file = "nfl2k5_video.ini";
@@ -81,8 +106,17 @@ static void vs_load(void)
     char vpath[MAX_PATH];
     FILE *f = fopen(xbox_user_path(k_vs_file, vpath, sizeof vpath), "r");
     char line[256];
-    if (!f)
+    if (!f) {
+        /* first start: a preset from the graphics card's video memory */
+        UINT64 ded = 0;
+        int p;
+        gpu_dxgi_adapter3(&ded);
+        p = ded >= (7ull << 30) ? 4 : ded >= (5ull << 30) ? 3 : ded >= (3ull << 30) ? 2 : 1;
+        preset_apply(&s_vs, p);
+        fprintf(stderr, "  [VIDEO] first start: %llu MB of video memory, preset %s\n",
+                (unsigned long long)(ded >> 20), p == 4 ? "Ultra" : p == 3 ? "High" : p == 2 ? "Medium" : "Low");
         return;
+    }
     while (fgets(line, sizeof line, f)) {
         char key[64];
         int v, v2;
@@ -102,11 +136,24 @@ static void vs_load(void)
         else if (!strcmp(key, "fps_limit")) s_vs.fps_limit = v;
         else if (!strcmp(key, "widescreen")) s_vs.widescreen = v != 0;
         else if (!strcmp(key, "lighting")) s_vs.lighting = v;
+        else if (!strcmp(key, "renderer")) s_vs.renderer = v;
+        else if (!strcmp(key, "upscaler")) s_vs.upscaler = v;
+        else if (!strcmp(key, "framegen")) s_vs.framegen = v != 0;
+        else if (!strcmp(key, "dynres")) s_vs.dynres = v != 0;
+        else if (!strcmp(key, "post")) s_vs.post = v;
+        else if (!strcmp(key, "sharpen")) s_vs.sharpen = v;
+        else if (!strcmp(key, "ao")) s_vs.ao = v;
+        else if (!strcmp(key, "hdr")) s_vs.hdr = v != 0;
     }
     fclose(f);
     if (s_vs.scale < 1) s_vs.scale = 1;
-    if (s_vs.scale > 16) s_vs.scale = 16;   /* stable maximum for the supported display modes */
+    if (s_vs.scale > VS_MAX_SCALE) s_vs.scale = VS_MAX_SCALE;   /* stable maximum for the supported display modes */
     if (s_vs.lighting < 0 || s_vs.lighting > 2) s_vs.lighting = 0;
+    if (s_vs.renderer < 0 || s_vs.renderer > 2) s_vs.renderer = 0;
+    if (s_vs.upscaler < 0 || s_vs.upscaler > 5) s_vs.upscaler = 0;
+    if (s_vs.post < 0 || s_vs.post > 4) s_vs.post = 0;
+    if (s_vs.sharpen < 0 || s_vs.sharpen > 3) s_vs.sharpen = 0;
+    if (s_vs.ao < 0 || s_vs.ao > 2) s_vs.ao = 0;
     if (s_vs.filter < SF_BILINEAR || s_vs.filter > SF_ENHANCED) s_vs.filter = SF_ENHANCED;
     if (s_vs.crop < 0) s_vs.crop = 0;
     if (s_vs.crop > 40) s_vs.crop = 40;
@@ -135,9 +182,27 @@ static void vs_save(void)
                "; widescreen: 1 fills the screen with a wider view (built-in widescreen), 0 the original 4:3 picture\n"
                "widescreen = %d\n"
                "; lighting: 0 classic Xbox, 1 enhanced material response, 2 maximum material response\n"
-               "lighting = %d\n",
+               "lighting = %d\n"
+               "; renderer: graphics API, used from the next start: 0 Direct3D 11, 1 Vulkan, 2 Direct3D 12\n"
+               "renderer = %d\n"
+               "; upscaler (Direct3D 12): 0 off, 1 FSR 3 native AA, 2 quality, 3 balanced, 4 performance, 5 ultra performance\n"
+               "upscaler = %d\n"
+               "; framegen (Direct3D 12): 1 FSR 3 frame generation, a generated frame between each two\n"
+               "framegen = %d\n"
+               "; dynres: 1 auto: scale is the limit, lowered only while the GPU cannot keep up;\n"
+               "; 0 stays at scale\n"
+               "dynres = %d\n"
+               "; post: 0 off, 1 Broadcast, 2 Cinematic, 3 Vivid, 4 Night Game (bloom, highlight roll-off, grading)\n"
+               "post = %d\n"
+               "; sharpen: 0 off, 1 low, 2 medium, 3 high (contrast-adaptive)\n"
+               "sharpen = %d\n"
+               "; ao: ambient occlusion, Direct3D 12 / Vulkan: 0 off, 1 on, 2 strong\n"
+               "ao = %d\n"
+               "; hdr: 1 HDR10 output (Direct3D 12 / Vulkan and an HDR display with Windows HDR on)\n"
+               "hdr = %d\n",
             s_vs.mode, s_vs.res_w, s_vs.res_h, s_vs.aspect, s_vs.scale, s_vs.filter, s_vs.vsync,
-            s_vs.brightness, s_vs.gamma, s_vs.crop, s_vs.show_fps, s_vs.aniso, s_vs.fps_limit, s_vs.widescreen, s_vs.lighting);
+            s_vs.brightness, s_vs.gamma, s_vs.crop, s_vs.show_fps, s_vs.aniso, s_vs.fps_limit, s_vs.widescreen, s_vs.lighting, s_vs.renderer, s_vs.upscaler, s_vs.framegen,
+            s_vs.dynres, s_vs.post, s_vs.sharpen, s_vs.ao, s_vs.hdr);
     fclose(f);
 }
 
@@ -215,17 +280,40 @@ static volatile LONG s_menu_open;
 volatile LONG g_xbox_input_blocked;      /* nfl2k5_input_hle.c: game input off while the menu is up */
 static int s_menu_sel;
 
+/* GX_SDL (Vulkan/Direct3D 12, gx/gx_sdl.c): SDL_GPU's register spaces, and
+ * the point-sampled read of Src as its own texture-sampler slot (SrcP). */
 static const char k_present_hlsl[] =
+    "#ifdef GX_SDL\n"
+    "[[vk::binding(0, 3)]] cbuffer P : register(b0, space3) { float4 src; float4 prm; float4 sz; };\n"
+    "//@GX_PAIRS ps_main 0:0 0:1\n"
+    "[[vk::combinedImageSampler]][[vk::binding(0, 2)]] Texture2D Src : register(t0, space2);\n"
+    "[[vk::combinedImageSampler]][[vk::binding(0, 2)]] SamplerState Lin : register(s0, space2);\n"
+    "[[vk::combinedImageSampler]][[vk::binding(1, 2)]] Texture2D SrcP : register(t1, space2);\n"
+    "[[vk::combinedImageSampler]][[vk::binding(1, 2)]] SamplerState Pt : register(s1, space2);\n"
+    "#else\n"
     "cbuffer P : register(b0) { float4 src; float4 prm; float4 sz; };\n"
     "Texture2D Src : register(t0);\n"
     "SamplerState Lin : register(s0); SamplerState Pt : register(s1);\n"
+    "#define SrcP Src\n"
+    "#endif\n"
     "struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
     "V vs_main(uint id : SV_VertexID) {\n"
     "  V o; float2 p = float2((id << 1) & 2, id & 2);\n"
     "  o.pos = float4(p * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = p; return o; }\n"
     "float4 ps_main(V i) : SV_Target {\n"
     "  float2 uv = src.xy + i.uv * src.zw; float4 c;\n"
-    "  if (prm.z == 1.0) c = Src.Sample(Pt, uv);\n"
+    /* Shrinking a raised internal resolution to the screen: average every
+     * rendered pixel under the screen pixel (bilinear taps two texels apart).
+     * The 5-tap filters below read one texel apart, so at 16x on a 1440-line
+     * screen they used ~4 of the ~28 pixels drawn for each one shown, and
+     * the picture shimmered like a far lower scale (2026-10-29). */
+    "  float2 ssr = sz.xy * src.zw / max(sz.zw, 1.0);\n"
+    "  if ((prm.z == 0.0 || prm.z == 3.0) && max(ssr.x, ssr.y) > 1.5) {\n"
+    "    int2 n = (int2)clamp(ceil(ssr * 0.5), 1.0, 8.0);\n"
+    "    float2 st = ssr / (float2)n / sz.xy, o = uv - st * ((float2)n - 1.0) * 0.5; float4 a = 0;\n"
+    "    [loop] for (int y = 0; y < n.y; y++) [loop] for (int x = 0; x < n.x; x++) a += Src.SampleLevel(Lin, o + st * float2(x, y), 0);\n"
+    "    c = a / (float)(n.x * n.y);\n"
+    "  } else if (prm.z == 1.0) c = SrcP.Sample(Pt, uv);\n"
     "  else if (prm.z == 2.0) {\n"
     "    float2 tex = uv * sz.xy, fl = floor(tex), s = frac(tex);\n"
     "    float2 sc = max(floor(sz.zw / (sz.xy * src.zw)), 1.0);\n"
@@ -244,6 +332,7 @@ static const char k_present_hlsl[] =
     "    float3 detail = cc.rgb * 4.0 - n.rgb - s.rgb - e.rgb - w.rgb;\n"
     "    c = float4(clamp(cc.rgb + detail * 0.16, lo, hi), cc.a);\n"
     "  } else c = Src.Sample(Lin, uv);\n"
+    "  if (prm.w == 1.0) return float4(saturate(abs(c.rg) * 40.0), c.r < 0 || c.g < 0 ? 0.6 : 0.0, 1.0);\n"
     "  c.rgb = pow(saturate(c.rgb * prm.x), prm.y); c.a = 1.0; return c; }\n"
     "float4 ps_ovl(V i) : SV_Target { return Src.Sample(Lin, i.uv); }\n"
     "float4 ps_fill(V i) : SV_Target { return src; }\n";
@@ -304,12 +393,30 @@ static int pr_init(void)
          * (performance captures); the ini is left alone. */
         const char *e = getenv("NFL2K5_RENDER_SCALE");
         if (e && atoi(e) >= 1 && atoi(e) <= 16) s_vs.scale = atoi(e);
+        e = getenv("NFL2K5_UPSCALER");       /* likewise for the upscaler (0-5) */
+        if (e && atoi(e) >= 0 && atoi(e) <= 5) s_vs.upscaler = atoi(e);
+        e = getenv("NFL2K5_FRAMEGEN");       /* and frame generation (0/1) */
+        if (e) s_vs.framegen = atoi(e) != 0;
+        e = getenv("NFL2K5_DYNRES");         /* and dynamic resolution (0/1) */
+        if (e) s_vs.dynres = atoi(e) != 0;
+        e = getenv("NFL2K5_POST");           /* post-processing preset, sharpening, ambient occlusion */
+        if (e && atoi(e) >= 0 && atoi(e) <= 4) s_vs.post = atoi(e);
+        e = getenv("NFL2K5_SHARPEN");
+        if (e && atoi(e) >= 0 && atoi(e) <= 3) s_vs.sharpen = atoi(e);
+        e = getenv("NFL2K5_AO");
+        if (e && atoi(e) >= 0 && atoi(e) <= 2) s_vs.ao = atoi(e);
+        e = getenv("NFL2K5_HDR");
+        if (e) s_vs.hdr = atoi(e) != 0;
     }
     g_render_scale = (uint32_t)s_vs.scale;
     g_aniso = (uint32_t)s_vs.aniso;
     g_lighting_profile = (uint32_t)s_vs.lighting;
     return s_pr.ok;
 }
+
+#include "nv2a_gpu_post.inc.c"
+static const char *const k_sharpen_names[] = { "Off", "Low", "Medium", "High" };
+static const char *const k_ao_names[] = { "Off", "On", "Strong" };
 
 /* Common state for the helper draws below. */
 static void pr_helper_state(ID3D11RenderTargetView *dst, UINT x, UINT y, UINT w, UINT h, const PresentConsts *pc)
@@ -383,6 +490,32 @@ static void pr_release_bb(void)
     if (s_pr.bb_rtv) { ID3D11RenderTargetView_Release(s_pr.bb_rtv); s_pr.bb_rtv = NULL; }
 }
 
+/* One owner per window: fb_present.c draws with an SDL renderer until a GPU
+ * presenter is registered, and destroys it on its own thread before calling
+ * the presenter the first time. A DXGI flip swap chain on a window that
+ * still has the renderer's is refused (E_ACCESSDENIED, seen with an SDL
+ * built with its Direct3D 11 renderer), so the swap chain waits for that. */
+extern void xbox_FramebufferSetGpuPresenter(int (*fn)(void *window, int letterbox));
+static volatile LONG s_pr_owned;
+
+static int pr_hold_window(void *window, int letterbox)
+{
+    (void)window; (void)letterbox;
+    InterlockedExchange(&s_pr_owned, 1);
+    SDL_Delay(4);                          /* the window thread keeps pumping events */
+    return 1;
+}
+
+static int pr_window_owned(void)
+{
+    static int asked;
+    if (!asked) {
+        asked = 1;
+        xbox_FramebufferSetGpuPresenter(pr_hold_window);
+    }
+    return s_pr_owned != 0;
+}
+
 /* The swap chain on the framebuffer window, (re)sized to its client area. */
 static int pr_swapchain(void)
 {
@@ -392,6 +525,41 @@ static int pr_swapchain(void)
     UINT w, h;
     if (!hw)
         return 0;
+    if (g_gx_sg) {
+        /* Vulkan / Direct3D 12: the SDL_GPU swap chain (gx_sdl.c). */
+        int sw = 0, sh = 0;
+        if (!s_pr.sc) {
+            s_pr.sc = gxs_swapchain(xbox_FramebufferWindowHwnd(), &sw, &sh);
+            if (!s_pr.sc)
+                return 0;
+            s_pr.hwnd = hw;
+            s_pr.bb_w = s_pr.bb_h = 0;
+            xbox_FramebufferSetGpuPresent(1);
+            fprintf(stderr, "  [PRESENT] presenting through %s (SDL_GPU)\n", gx_backend_name());
+        } else
+            gxs_swapchain(xbox_FramebufferWindowHwnd(), &sw, &sh);
+        w = (UINT)sw; h = (UINT)sh;
+        if (!w || !h)
+            return 0;
+        if (w != s_pr.bb_w || h != s_pr.bb_h || !s_pr.bb_rtv) {
+            ID3D11Texture2D *bb = NULL;
+            pr_release_bb();
+            ID3D11DeviceContext_OMSetRenderTargets(s_gpu11.ctx, 0, NULL, NULL);
+            if (FAILED(IDXGISwapChain1_ResizeBuffers(s_pr.sc, 0, w, h, DXGI_FORMAT_UNKNOWN, 0)) ||
+                FAILED(IDXGISwapChain1_GetBuffer(s_pr.sc, 0, &IID_ID3D11Texture2D, (void **)&bb)))
+                return 0;
+            ID3D11Device_CreateRenderTargetView(s_gpu11.dev, (ID3D11Resource *)bb, NULL, &s_pr.bb_rtv);
+            ID3D11Texture2D_Release(bb);
+            s_pr.bb_w = w; s_pr.bb_h = h;
+            s_pr.ovl_valid = 0;
+        }
+        return s_pr.bb_rtv != NULL;
+    }
+    if (!s_pr.sc && !pr_window_owned()) {
+        static int told;
+        if (!told++) fprintf(stderr, "  [PRESENT] waiting for the window's fallback renderer to let go\n");
+        return 0;
+    }
     if (!s_pr.sc || s_pr.hwnd != hw) {
         IDXGIDevice *dxd = NULL;
         IDXGIAdapter *ad = NULL;
@@ -490,18 +658,17 @@ static void pr_apply_mode(void)
  * callback runs on this thread once per presented frame, is told where the
  * game picture sits, and returns its image (uploaded only when changed). */
 typedef struct { int bb_w, bb_h; float game_x, game_y, game_w, game_h; } XboxHudFrame;
-typedef struct { const void *pixels; int w, h, stride, x, y, changed, dw, dh; void *shared; } XboxHudImage;   /* dw/dh: drawn size (0 = w/h); shared: NT handle of a keyed-mutex texture, or NULL */
+typedef struct { const void *pixels; int w, h, stride, x, y, changed, dw, dh; void *shared; int dirty_y0, dirty_y1; const unsigned char *dirty_rows; } XboxHudImage;   /* dw/dh: drawn size (0 = w/h); shared: NT handle of a keyed-mutex texture, or NULL */
 int xbox_hud_shared_failed;
 typedef int (*XboxHudCallback)(const XboxHudFrame *f, XboxHudImage *img);
 static void pr_present_shot(void);
+static void pr_luma(void);
 static void pr_frame_limit(void);
 static void pr_record(void);
-static XboxHudCallback s_hud_cb;
+static XboxHudCallback s_hud_cbs[3];   /* 0: the broadcast HUD; 1: drawn over it (Android touch controls); 2: performance overlay */
 static struct {
-    ID3D11Texture2D *tex;
-    ID3D11ShaderResourceView *srv;
+    struct { ID3D11Texture2D *tex; ID3D11ShaderResourceView *srv; int w, h; } layer[3];
     ID3D11BlendState *blend;
-    int w, h;
     /* Shared textures from the HTML host, opened once per handle. */
     struct { HANDLE handle; ID3D11Texture2D *tex; ID3D11ShaderResourceView *srv; IDXGIKeyedMutex *mutex; } sh[4];
     int sh_next;
@@ -539,15 +706,16 @@ static ID3D11ShaderResourceView *hud_shared_view(HANDLE h, IDXGIKeyedMutex **mut
     return s_hud.sh[i].srv;
 }
 
-void xbox_PresentSetHudCallback(XboxHudCallback cb) { s_hud_cb = cb; }
+void xbox_PresentSetHudCallback(XboxHudCallback cb) { s_hud_cbs[0] = cb; }
+void xbox_PresentSetTopHudCallback(XboxHudCallback cb) { s_hud_cbs[1] = cb; }
 
-static void pr_draw_hud(float gx, float gy, float gw, float gh)
+static void pr_draw_hud_layer(int l, float gx, float gy, float gw, float gh)
 {
     gpu_state_invalidate();     /* binds its own state: the next draw resends all */
     XboxHudFrame f;
     XboxHudImage img;
     D3D11_VIEWPORT vp;
-    if (!s_hud_cb)
+    if (!s_hud_cbs[l])
         return;
     {   /* NFL2K5_HUD_CPU=1: no shared texture (diagnosis) */
         static int checked;
@@ -558,7 +726,7 @@ static void pr_draw_hud(float gx, float gy, float gw, float gh)
     memset(&img, 0, sizeof img);
     ID3D11ShaderResourceView *view;
     IDXGIKeyedMutex *lock = NULL;
-    if (!s_hud_cb(&f, &img) || !img.pixels || img.w <= 0 || img.h <= 0)
+    if (!s_hud_cbs[l](&f, &img) || !img.pixels || img.w <= 0 || img.h <= 0)
         return;
     if (!s_hud.blend) {
         D3D11_BLEND_DESC bld;
@@ -576,32 +744,52 @@ static void pr_draw_hud(float gx, float gy, float gw, float gh)
         if (!view || IDXGIKeyedMutex_AcquireSync(lock, 0, 4) != S_OK)
             return;                     /* this frame without it; next uses pixels or retries */
     } else {
-    if (!s_hud.tex || s_hud.w != img.w || s_hud.h != img.h) {
+    if (!s_hud.layer[l].tex || s_hud.layer[l].w != img.w || s_hud.layer[l].h != img.h) {
         D3D11_TEXTURE2D_DESC td;
-        if (s_hud.srv) { ID3D11ShaderResourceView_Release(s_hud.srv); s_hud.srv = NULL; }
-        if (s_hud.tex) { ID3D11Texture2D_Release(s_hud.tex); s_hud.tex = NULL; }
+        if (s_hud.layer[l].srv) { ID3D11ShaderResourceView_Release(s_hud.layer[l].srv); s_hud.layer[l].srv = NULL; }
+        if (s_hud.layer[l].tex) { ID3D11Texture2D_Release(s_hud.layer[l].tex); s_hud.layer[l].tex = NULL; }
         memset(&td, 0, sizeof td);
         td.Width = (UINT)img.w; td.Height = (UINT)img.h; td.MipLevels = 1; td.ArraySize = 1;
         td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
-        td.Usage = D3D11_USAGE_DYNAMIC; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-        if (FAILED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, NULL, &s_hud.tex)) ||
-            FAILED(ID3D11Device_CreateShaderResourceView(s_gpu11.dev, (ID3D11Resource *)s_hud.tex, NULL, &s_hud.srv)))
+        td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, NULL, &s_hud.layer[l].tex)) ||
+            FAILED(ID3D11Device_CreateShaderResourceView(s_gpu11.dev, (ID3D11Resource *)s_hud.layer[l].tex, NULL, &s_hud.layer[l].srv)))
             return;
-        s_hud.w = img.w; s_hud.h = img.h;
+        s_hud.layer[l].w = img.w; s_hud.layer[l].h = img.h;
         img.changed = 1;
+        img.dirty_y0 = img.dirty_y1 = 0;           /* a new texture: all of it */
     }
     if (img.changed) {
-        D3D11_MAPPED_SUBRESOURCE m;
-        if (SUCCEEDED(ID3D11DeviceContext_Map(s_gpu11.ctx, (ID3D11Resource *)s_hud.tex, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-            int row;
-            for (row = 0; row < img.h; row++)
-                memcpy((uint8_t *)m.pData + (size_t)row * m.RowPitch,
-                       (const uint8_t *)img.pixels + (size_t)row * (size_t)img.stride, (size_t)img.w * 4u);
-            ID3D11DeviceContext_Unmap(s_gpu11.ctx, (ID3D11Resource *)s_hud.tex, 0);
+        /* Only the rows the page changed, when it says (a full frame was
+         * 20 MB a frame at 3440x1440) */
+        int y0 = 0, y1 = img.h;
+        if (img.dirty_y1 > img.dirty_y0) {
+            y0 = img.dirty_y0 < 0 ? 0 : img.dirty_y0;
+            y1 = img.dirty_y1 > img.h ? img.h : img.dirty_y1;
+        }
+        while (y0 < y1) {
+            /* each band of changed rows (a scorebug, a ticker), gaps under
+             * 16 rows bridged */
+            int end = y1;
+            if (img.dirty_rows) {
+                int gap = 0, y;
+                while (y0 < y1 && !img.dirty_rows[y0]) y0++;
+                for (y = y0, end = y0; y < y1; y++) {
+                    if (img.dirty_rows[y]) { end = y + 1; gap = 0; }
+                    else if (++gap >= 16) break;
+                }
+                if (y0 >= y1) break;
+            }
+            {
+                D3D11_BOX box = { 0, (UINT)y0, 0, (UINT)img.w, (UINT)end, 1 };
+                ID3D11DeviceContext_UpdateSubresource(s_gpu11.ctx, (ID3D11Resource *)s_hud.layer[l].tex, 0, &box,
+                                                      (const uint8_t *)img.pixels + (size_t)y0 * (size_t)img.stride,
+                                                      (UINT)img.stride, 0);
+            }
+            y0 = end;
         }
     }
-    view = s_hud.srv;
+    view = s_hud.layer[l].srv;
     }
     vp.TopLeftX = (float)img.x; vp.TopLeftY = (float)img.y;
     vp.Width = (float)(img.dw > 0 ? img.dw : img.w); vp.Height = (float)(img.dh > 0 ? img.dh : img.h);
@@ -619,18 +807,84 @@ static void pr_draw_hud(float gx, float gy, float gw, float gh)
     }
 }
 
+#include "nv2a_gpu_perfhud.inc.c"   /* the performance overlay: HUD layer 2 */
+
+static void pr_draw_hud(float gx, float gy, float gw, float gh)
+{
+    pr_draw_hud_layer(0, gx, gy, gw, gh);
+    pr_draw_hud_layer(1, gx, gy, gw, gh);
+    s_hud_cbs[2] = perfhud_frame;
+    pr_draw_hud_layer(2, gx, gy, gw, gh);
+}
+
 /* ---- the settings page -------------------------------------------------- */
 
-enum { MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_LIGHTING, MI_FILTER, MI_VSYNC, MI_BRIGHT, MI_GAMMA, MI_CROP,
-       MI_ANISO, MI_FPS, MI_LIMIT, MI_RESET, MI_CLOSE, MI_COUNT };
+enum { MI_PRESET, MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_AO, MI_HDR, MI_FILTER, MI_VSYNC, MI_BRIGHT, MI_GAMMA, MI_CROP,
+       MI_ANISO, MI_FPS, MI_LIMIT, MI_API, MI_UPSCALE, MI_FRAMEGEN, MI_RESET, MI_CLOSE, MI_COUNT };
+static const char *const k_upscaler_names[] = { "Off", "FSR 3 Native AA", "FSR 3 Quality", "FSR 3 Balanced",
+                                                 "FSR 3 Performance", "FSR 3 Ultra Performance" };
+static const float k_upscaler_ratio[] = { 1.0f, 1.0f, 1.5f, 1.7f, 2.0f, 3.0f };
+static UINT s_fsr_out_h;                 /* last upscale's output height, 0 when off */
+static const char *const k_api_names[] = { "Direct3D 11", "Vulkan", "Direct3D 12" };
+static const char *const k_perf_overlay_names[] = { "Off", "FPS only", "Full" };   /* show_fps */
 static const int k_fps_limits[] = { 30, 60, 120, 0, -1 };
 #define FPS_LIMITS 5
 /* The title's frame-interval hook (src/main.c) re-reads the cap when it
  * changes, so a new setting applies at once rather than at the game's next
  * camera change. */
 void (*g_xbox_fps_limit_changed)(void);
-int xbox_VideoFpsLimit(void) { return s_vs.fps_limit; }
+/* Android 12+ Game Mode "battery" (Samsung Game Booster's battery setting;
+ * NFL2K5_GAME_MODE from android/app NFL2K5Activity) or the game's own Battery
+ * Saver: 1x internal resolution
+ * and 30 FPS, applied over the saved settings without changing them. */
+volatile int g_xbox_battery_saver;             /* Options > Phone Settings (src/platform/android) */
+volatile int g_xbox_heat_level;                /* Android heat control: 1 = half the scale ceiling, 2 = 1x and 30 FPS */
+static int vs_battery_mode(void)
+{
+    static int b = -1;
+    if (b < 0) {
+        const char *m = getenv("NFL2K5_GAME_MODE");
+        b = m && !strcmp(m, "battery");
+    }
+    return b || g_xbox_battery_saver || g_xbox_heat_level >= 2;
+}
+/* The scale only follows what the player turned on: Battery Saver, or Heat
+ * Control at its last step. The system's battery Game Mode (above) caps the
+ * frame rate but leaves the picture alone. */
+static int vs_scale_forced_low(void) { return g_xbox_battery_saver || g_xbox_heat_level >= 2; }
+int xbox_VideoFpsLimit(void) { return vs_battery_mode() ? 30 : s_vs.fps_limit; }
 static void fps_limit_changed(void) { if (g_xbox_fps_limit_changed) g_xbox_fps_limit_changed(); }
+
+/* ---- graphics presets (2026-10-30) ---------------------------------------
+ * One choice that sets the internal resolution, texture filtering, the post
+ * effects and Auto resolution together. The values stay editable after; the
+ * row then reads "Custom". A first start with no settings file picks one from
+ * the graphics card's video memory (vs_load). */
+static const char *const k_preset_names[] = { "Custom", "Low", "Medium", "High", "Ultra" };
+static void preset_apply(VideoSettings *v, int p)
+{
+    static const struct { int scale, aniso, post, sharpen, ao, lighting; } k[] = {
+        { 0, 0, 0, 0, 0, 0 },
+        { 2, 4, 0, 0, 0, 0 },     /* Low: 2x, no effects; Auto lowers it further if needed */
+        { 3, 8, 1, 1, 0, 1 },     /* Medium */
+        { 6, 16, 1, 1, 1, 1 },    /* High */
+        { 9, 16, 1, 1, 1, 2 },    /* Ultra (ambient occlusion On: Strong leaves dark halos round players) */
+    };
+    if (p < 1 || p > 4) return;
+    v->scale = k[p].scale; v->aniso = k[p].aniso; v->post = k[p].post; v->sharpen = k[p].sharpen;
+    v->ao = k[p].ao; v->lighting = k[p].lighting; v->dynres = 1;
+    if (v->scale > VS_MAX_SCALE) v->scale = VS_MAX_SCALE;
+}
+static int preset_current(const VideoSettings *v)
+{
+    int p;
+    for (p = 1; p <= 4; p++) {
+        VideoSettings c = *v;
+        preset_apply(&c, p);
+        if (!memcmp(&c, v, sizeof c)) return p;
+    }
+    return 0;
+}
 
 static void menu_label(int item, char *name, char *val, size_t n)
 {
@@ -641,13 +895,24 @@ static void menu_label(int item, char *name, char *val, size_t n)
     static const char *lighting[] = { "Classic Xbox", "Enhanced", "Maximum" };
     val[0] = 0;
     switch (item) {
+    case MI_PRESET: strcpy(name, "Graphics preset"); snprintf(val, n, "%s", k_preset_names[preset_current(&s_vs)]); break;
     case MI_MODE:   strcpy(name, "Display mode"); snprintf(val, n, "%s", modes[s_vs.mode % 3]); break;
     case MI_RES:    strcpy(name, s_vs.mode == VM_BORDERLESS ? "Resolution (desktop)" : "Resolution");
                     snprintf(val, n, "%d x %d", s_vs.res_w, s_vs.res_h); break;
     case MI_ASPECT: strcpy(name, "Aspect ratio"); snprintf(val, n, "%s", aspects[s_vs.aspect % 6]); break;
     case MI_SCALE:  strcpy(name, "Internal resolution");
                     snprintf(val, n, "%dx  (%d x %d)", s_vs.scale, 720 * s_vs.scale, 480 * s_vs.scale); break;
+    case MI_DYNRES: strcpy(name, "Dynamic resolution");
+                    if (s_vs.dynres) snprintf(val, n, "Auto, limit %dx  (now %ux)", s_vs.scale, g_render_scale);
+                    else snprintf(val, n, "Off, fixed at %dx", s_vs.scale); break;
     case MI_LIGHTING: strcpy(name, "Lighting and materials"); snprintf(val, n, "%s", lighting[s_vs.lighting % 3]); break;
+    case MI_POST:   strcpy(name, "Post-processing"); snprintf(val, n, "%s", k_post_presets[s_vs.post % POST_PRESETS].name); break;
+    case MI_SHARPEN: strcpy(name, "Sharpening"); snprintf(val, n, "%s", k_sharpen_names[s_vs.sharpen & 3]); break;
+    case MI_AO:     strcpy(name, "Ambient occlusion");
+                    snprintf(val, n, "%s%s", k_ao_names[s_vs.ao % 3], s_vs.ao && !g_gx_sg ? "  (Direct3D 12 only)" : ""); break;
+    case MI_HDR:    strcpy(name, "HDR output");
+                    snprintf(val, n, "%s%s", s_vs.hdr ? "On (HDR10)" : "Off",
+                             !s_vs.hdr ? "" : !g_gx_sg ? "  (Direct3D 12 only)" : !gxs_hdr_supported() ? "  (display does not support it)" : ""); break;
     case MI_FILTER: strcpy(name, "Upscaling filter"); snprintf(val, n, "%s", filters[s_vs.filter % 4]); break;
     case MI_VSYNC:  strcpy(name, "VSync"); snprintf(val, n, "%s", s_vs.vsync ? "On" : "Off"); break;
     case MI_BRIGHT: strcpy(name, "Brightness"); snprintf(val, n, "%d%%", s_vs.brightness); break;
@@ -655,13 +920,26 @@ static void menu_label(int item, char *name, char *val, size_t n)
     case MI_CROP:   strcpy(name, "Crop sides"); snprintf(val, n, s_vs.crop ? "%d px" : "Off", s_vs.crop); break;
     case MI_ANISO:  strcpy(name, "Anisotropic filtering");
                     snprintf(val, n, s_vs.aniso > 1 ? "%dx" : "Off", s_vs.aniso); break;
-    case MI_FPS:    strcpy(name, "Show FPS"); snprintf(val, n, "%s", s_vs.show_fps ? "On" : "Off"); break;
+    case MI_FPS:    strcpy(name, "Performance overlay"); snprintf(val, n, "%s", k_perf_overlay_names[s_vs.show_fps % 3]); break;
     case MI_WIDE:   strcpy(name, "Widescreen"); snprintf(val, n, "%s", s_vs.widescreen ? "On" : "Off"); break;
     case MI_LIMIT:  strcpy(name, "Frame rate cap");
                     if (s_vs.fps_limit < 0) snprintf(val, n, "Original (30/60)");
                     else snprintf(val, n, s_vs.fps_limit ? "%d" : "Unlimited", s_vs.fps_limit); break;
+    case MI_API:    strcpy(name, "Graphics API");
+                    snprintf(val, n, "%s%s", k_api_names[s_vs.renderer % 3],
+                             strcmp(k_api_names[s_vs.renderer % 3], gx_backend_name()) ? "  (after restart)" : ""); break;
+    case MI_UPSCALE: strcpy(name, "Upscaling");
+                    snprintf(val, n, "%s%s", k_upscaler_names[s_vs.upscaler % 6],
+                             s_vs.upscaler && !gxs_fsr_available() ? "  (Direct3D 12 only)" : ""); break;
+    case MI_FRAMEGEN: strcpy(name, "Frame generation");
+                    snprintf(val, n, "%s%s", s_vs.framegen ? "FSR 3 (2x frames)" : "Off",
+                             s_vs.framegen && !gxs_fsr_available() ? "  (Direct3D 12 only)" : ""); break;
     case MI_RESET:  strcpy(name, "Reset to defaults"); break;
+#ifdef __ANDROID__
+    case MI_CLOSE:  strcpy(name, "Close"); break;
+#else
     case MI_CLOSE:  strcpy(name, "Close  (F1 / Esc)"); break;
+#endif
     default:        name[0] = 0; break;
     }
 }
@@ -670,6 +948,11 @@ static void menu_change(int item, int dir)
 {
     int i;
     switch (item) {
+    case MI_PRESET: { int p = preset_current(&s_vs);
+                      p = p ? p + dir : (dir > 0 ? 1 : 4);
+                      if (p < 1) p = 4;
+                      if (p > 4) p = 1;
+                      preset_apply(&s_vs, p); } break;
     case MI_MODE:   s_vs.mode = (s_vs.mode + 3 + dir) % 3; InterlockedExchange(&s_vs_dirty, 1); break;
     case MI_RES:
         for (i = 0; i < s_nres; i++)
@@ -679,8 +962,12 @@ static void menu_change(int item, int dir)
         InterlockedExchange(&s_vs_dirty, 1);
         break;
     case MI_ASPECT: s_vs.aspect = (s_vs.aspect + 6 + dir) % 6; break;
-    case MI_SCALE:  s_vs.scale += dir; if (s_vs.scale < 1) s_vs.scale = 16; if (s_vs.scale > 16) s_vs.scale = 1; break;
+    case MI_SCALE:  s_vs.scale += dir; if (s_vs.scale < 1) s_vs.scale = VS_MAX_SCALE; if (s_vs.scale > VS_MAX_SCALE) s_vs.scale = 1; break;
     case MI_LIGHTING: s_vs.lighting = (s_vs.lighting + 3 + dir) % 3; break;
+    case MI_POST:   s_vs.post = (s_vs.post + POST_PRESETS + dir) % POST_PRESETS; break;
+    case MI_SHARPEN: s_vs.sharpen = (s_vs.sharpen + 4 + dir) % 4; break;
+    case MI_AO:     s_vs.ao = (s_vs.ao + 3 + dir) % 3; break;
+    case MI_HDR:    s_vs.hdr = !s_vs.hdr; break;
     case MI_FILTER: s_vs.filter = (s_vs.filter + 4 + dir) % 4; break;
     case MI_VSYNC:  s_vs.vsync = !s_vs.vsync; break;
     case MI_BRIGHT: s_vs.brightness += 5 * dir; if (s_vs.brightness < 50) s_vs.brightness = 50;
@@ -690,12 +977,16 @@ static void menu_change(int item, int dir)
     case MI_ANISO:  { static const int a[] = { 1, 2, 4, 8, 16 }; int k;
                       for (k = 0; k < 5 && a[k] != s_vs.aniso; k++) {}
                       k = (k >= 5 ? 0 : (k + 5 + dir) % 5); s_vs.aniso = a[k]; } break;
-    case MI_FPS:    s_vs.show_fps = !s_vs.show_fps; break;
+    case MI_FPS:    s_vs.show_fps = (s_vs.show_fps % 3 + 3 + dir) % 3; break;
     case MI_WIDE:   s_vs.widescreen = !s_vs.widescreen; break;
     case MI_LIMIT:  { int k;
                       for (k = 0; k < FPS_LIMITS && k_fps_limits[k] != s_vs.fps_limit; k++) {}
                       k = (k >= FPS_LIMITS ? 3 : (k + FPS_LIMITS + dir) % FPS_LIMITS); s_vs.fps_limit = k_fps_limits[k];
                       fps_limit_changed(); } break;
+    case MI_API:    s_vs.renderer = (s_vs.renderer + 3 + dir) % 3; break;
+    case MI_UPSCALE: s_vs.upscaler = (s_vs.upscaler + 6 + dir) % 6; break;
+    case MI_FRAMEGEN: s_vs.framegen = !s_vs.framegen; break;
+    case MI_DYNRES: s_vs.dynres = !s_vs.dynres; break;
     default: return;
     }
     s_pr.ovl_valid = 0;
@@ -705,7 +996,10 @@ static void menu_change(int item, int dir)
 static void menu_activate(int item)
 {
     if (item == MI_RESET) {
-        VideoSettings d = { VM_BORDERLESS, 1920, 1080, AR_ORIGINAL, 3, SF_ENHANCED, 1, 100, 100, 0, 0, 8, 0, 1 };
+        VideoSettings d = { VM_BORDERLESS, 1920, 1080, AR_ORIGINAL, 3, SF_ENHANCED, 1, 100, 100, 0, 0, 8, 0, 1, 0, 0, 0, 0, 1, 1, 1, 0, 0 };
+        d.renderer = s_vs.renderer;          /* the API is not a picture setting */
+        d.upscaler = s_vs.upscaler;
+        d.framegen = s_vs.framegen;
         s_vs = d;
         InterlockedExchange(&s_vs_dirty, 1);
         vs_save();
@@ -732,8 +1026,37 @@ typedef struct XboxMenuPage {
     void (*activate)(int row);
     int (*busy)(void);
 } XboxMenuPage;
+#ifdef __ANDROID__
+static const int k_page_items[] = { MI_PRESET, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_FILTER,
+                                    MI_BRIGHT, MI_GAMMA, MI_CROP, MI_ANISO, MI_FPS, MI_LIMIT, MI_RESET, MI_CLOSE };
+#define PAGE_ITEMS ((int)(sizeof k_page_items / sizeof k_page_items[0]))
+static int page_item(int row) { return row >= 0 && row < PAGE_ITEMS ? k_page_items[row] : MI_COUNT; }
+static int video_page_count(void) { return PAGE_ITEMS; }
+#elif defined(NFL2K5_UWP)
+/* A UWP app (PC or Xbox) has one window mode, its own size and one graphics
+ * API (Direct3D 12 through SDL_GPU): no display-mode, desktop-resolution or
+ * API rows. */
+static const int k_page_items[] = { MI_PRESET, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_AO,
+                                    MI_HDR, MI_FILTER, MI_VSYNC, MI_BRIGHT, MI_GAMMA, MI_CROP, MI_ANISO, MI_FPS, MI_LIMIT,
+                                    MI_UPSCALE, MI_FRAMEGEN, MI_RESET, MI_CLOSE };
+#define PAGE_ITEMS ((int)(sizeof k_page_items / sizeof k_page_items[0]))
+static int page_item(int row) { return row >= 0 && row < PAGE_ITEMS ? k_page_items[row] : MI_COUNT; }
+static int video_page_count(void) { return PAGE_ITEMS; }
+#elif defined(XBOX_GX_PORTABLE)
+/* Desktop Linux: one graphics API (Vulkan); FSR and HDR10 output are not built. */
+static const int k_page_items[] = { MI_PRESET, MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_AO,
+                                    MI_FILTER, MI_VSYNC, MI_BRIGHT, MI_GAMMA, MI_CROP, MI_ANISO, MI_FPS, MI_LIMIT, MI_RESET, MI_CLOSE };
+#define PAGE_ITEMS ((int)(sizeof k_page_items / sizeof k_page_items[0]))
+static int page_item(int row) { return row >= 0 && row < PAGE_ITEMS ? k_page_items[row] : MI_COUNT; }
+static int video_page_count(void) { return PAGE_ITEMS; }
+#else
+static int page_item(int row) { return row; }
 static int video_page_count(void) { return MI_COUNT; }
-static const XboxMenuPage k_video_page = { "VIDEO SETTINGS", video_page_count, menu_label, menu_change, menu_activate, NULL };
+#endif
+static void video_page_label(int row, char *name, char *val, size_t n) { menu_label(page_item(row), name, val, n); }
+static void video_page_change(int row, int dir) { menu_change(page_item(row), dir); }
+static void video_page_activate(int row) { menu_activate(page_item(row)); }
+static const XboxMenuPage k_video_page = { "VIDEO SETTINGS", video_page_count, video_page_label, video_page_change, video_page_activate, NULL };
 #define MENU_MAX_PAGES 6
 static const XboxMenuPage *s_pages[MENU_MAX_PAGES] = { &k_video_page };
 static int s_npages = 1, s_menu_page;
@@ -749,8 +1072,21 @@ static int menu_rows(void) { int n = menu_page()->count(); return n > 0 ? n : 1;
  * menu; its rows are these settings as indexed value lists. Called from the
  * game thread: changes mark the swap chain for re-applying on the next flip
  * and are saved at once. */
-static const int k_vm_items[] = { MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_LIGHTING, MI_FILTER, MI_VSYNC,
+#ifdef __ANDROID__
+/* A phone has one screen mode, one graphics API (Vulkan) and always syncs to
+ * the display; FSR, HDR10 output and ambient occlusion are Direct3D 12 only. */
+static const int k_vm_items[] = { MI_PRESET, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_FILTER,
                                   MI_BRIGHT, MI_GAMMA, MI_CROP, MI_ANISO, MI_FPS, MI_LIMIT };
+#elif defined(NFL2K5_UWP)
+static const int k_vm_items[] = { MI_PRESET, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_AO, MI_HDR, MI_FILTER, MI_VSYNC,
+                                  MI_BRIGHT, MI_GAMMA, MI_CROP, MI_ANISO, MI_FPS, MI_LIMIT, MI_UPSCALE, MI_FRAMEGEN };
+#elif defined(XBOX_GX_PORTABLE)
+static const int k_vm_items[] = { MI_PRESET, MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_AO, MI_FILTER, MI_VSYNC,
+                                  MI_BRIGHT, MI_GAMMA, MI_CROP, MI_ANISO, MI_FPS, MI_LIMIT };
+#else
+static const int k_vm_items[] = { MI_PRESET, MI_MODE, MI_RES, MI_WIDE, MI_ASPECT, MI_SCALE, MI_DYNRES, MI_LIGHTING, MI_POST, MI_SHARPEN, MI_AO, MI_HDR, MI_FILTER, MI_VSYNC,
+                                  MI_BRIGHT, MI_GAMMA, MI_CROP, MI_ANISO, MI_FPS, MI_LIMIT, MI_API, MI_UPSCALE, MI_FRAMEGEN };
+#endif
 #define VM_COUNT ((int)(sizeof k_vm_items / sizeof k_vm_items[0]))
 static const int k_vm_aniso[] = { 1, 2, 4, 8, 16 };
 
@@ -758,31 +1094,47 @@ int xbox_VideoSettingCount(void) { return VM_COUNT; }
 
 const char *xbox_VideoSettingName(int i)
 {
-    static const char *names[] = { "Display Mode", "Resolution", "Widescreen", "Aspect Ratio", "Render Scale", "Lighting & Materials",
-                                   "Upscaling Filter", "VSync", "Brightness", "Gamma",
-                                   "Overscan Crop", "Texture Filtering", "Show FPS", "Frame Rate Cap" };
-    return (i >= 0 && i < VM_COUNT) ? names[i] : "";
+    static const char *names[MI_COUNT] = {
+        [MI_PRESET] = "Graphics Preset", [MI_MODE] = "Display Mode", [MI_RES] = "Resolution", [MI_WIDE] = "Widescreen",
+        [MI_ASPECT] = "Aspect Ratio", [MI_SCALE] = "Render Scale", [MI_DYNRES] = "Dynamic Resolution",
+        [MI_LIGHTING] = "Lighting & Materials", [MI_POST] = "Post-Processing", [MI_SHARPEN] = "Sharpening",
+        [MI_AO] = "Ambient Occlusion", [MI_HDR] = "HDR Output", [MI_FILTER] = "Upscaling Filter", [MI_VSYNC] = "VSync",
+        [MI_BRIGHT] = "Brightness", [MI_GAMMA] = "Gamma", [MI_CROP] = "Overscan Crop", [MI_ANISO] = "Texture Filtering",
+        [MI_FPS] = "Performance Overlay", [MI_LIMIT] = "Frame Rate Cap", [MI_API] = "Graphics API", [MI_UPSCALE] = "Upscaling",
+        [MI_FRAMEGEN] = "Frame Generation" };
+    return (i >= 0 && i < VM_COUNT && names[k_vm_items[i]]) ? names[k_vm_items[i]] : "";
 }
 
 int xbox_VideoSettingIsToggle(int i)
 {
-    return i >= 0 && i < VM_COUNT && (k_vm_items[i] == MI_VSYNC || k_vm_items[i] == MI_FPS || k_vm_items[i] == MI_WIDE);
+    return i >= 0 && i < VM_COUNT && (k_vm_items[i] == MI_VSYNC || k_vm_items[i] == MI_WIDE ||
+                                          k_vm_items[i] == MI_FRAMEGEN || k_vm_items[i] == MI_DYNRES);
 }
 
 int xbox_VideoSettingValues(int i)
 {
     if (i < 0 || i >= VM_COUNT) return 1;
     switch (k_vm_items[i]) {
+    case MI_PRESET: return 5;
     case MI_MODE: return 3;
     case MI_FILTER: return 4;
     case MI_RES:    res_build(); return s_nres ? s_nres : 1;
     case MI_ASPECT: return 6;
-    case MI_SCALE:  return 16;
+    case MI_SCALE:  return VS_MAX_SCALE;
     case MI_LIGHTING: return 3;
-    case MI_VSYNC: case MI_FPS: case MI_WIDE: return 2;
+    case MI_POST:   return POST_PRESETS;
+    case MI_SHARPEN: return 4;
+    case MI_AO:     return 3;
+    case MI_HDR:    return 2;
+    case MI_VSYNC: case MI_WIDE: return 2;
+    case MI_FPS:    return 3;
     case MI_BRIGHT: case MI_GAMMA: return 21;
     case MI_CROP: case MI_ANISO: return 5;
     case MI_LIMIT:  return FPS_LIMITS;
+    case MI_API:    return 3;
+    case MI_UPSCALE: return 6;
+    case MI_FRAMEGEN: return 2;
+    case MI_DYNRES: return 2;
     }
     return 1;
 }
@@ -791,6 +1143,7 @@ static int vm_get(const VideoSettings *vs, int item)
 {
     int k;
     switch (item) {
+    case MI_PRESET: return preset_current(vs);
     case MI_MODE:   return vs->mode;
     case MI_RES:
         res_build();
@@ -800,6 +1153,10 @@ static int vm_get(const VideoSettings *vs, int item)
     case MI_ASPECT: return vs->aspect;
     case MI_SCALE:  return vs->scale - 1;
     case MI_LIGHTING: return vs->lighting;
+    case MI_POST:   return vs->post;
+    case MI_SHARPEN: return vs->sharpen;
+    case MI_AO:     return vs->ao;
+    case MI_HDR:    return vs->hdr;
     case MI_FILTER: return vs->filter;
     case MI_VSYNC:  return vs->vsync ? 1 : 0;
     case MI_BRIGHT: return (vs->brightness - 50) / 5;
@@ -809,12 +1166,16 @@ static int vm_get(const VideoSettings *vs, int item)
         for (k = 0; k < 5; k++)
             if (k_vm_aniso[k] == vs->aniso) return k;
         return 0;
-    case MI_FPS:    return vs->show_fps ? 1 : 0;
+    case MI_FPS:    return vs->show_fps % 3;
     case MI_WIDE:   return vs->widescreen ? 1 : 0;
     case MI_LIMIT:
         for (k = 0; k < FPS_LIMITS; k++)
             if (k_fps_limits[k] == vs->fps_limit) return k;
         return 3;
+    case MI_API:    return vs->renderer;
+    case MI_UPSCALE: return vs->upscaler;
+    case MI_FRAMEGEN: return vs->framegen;
+    case MI_DYNRES: return vs->dynres;
     }
     return 0;
 }
@@ -822,20 +1183,29 @@ static int vm_get(const VideoSettings *vs, int item)
 static void vm_set(VideoSettings *vs, int item, int idx)
 {
     switch (item) {
+    case MI_PRESET: preset_apply(vs, idx); break;
     case MI_MODE:   vs->mode = idx; break;
     case MI_RES:    res_build(); if (idx < s_nres) { vs->res_w = s_res[idx][0]; vs->res_h = s_res[idx][1]; } break;
     case MI_ASPECT: vs->aspect = idx; break;
     case MI_SCALE:  vs->scale = idx + 1; break;
     case MI_LIGHTING: vs->lighting = idx; break;
+    case MI_POST:   vs->post = idx % POST_PRESETS; break;
+    case MI_SHARPEN: vs->sharpen = idx & 3; break;
+    case MI_AO:     vs->ao = idx % 3; break;
+    case MI_HDR:    vs->hdr = idx != 0; break;
     case MI_FILTER: vs->filter = idx; break;
     case MI_VSYNC:  vs->vsync = idx; break;
     case MI_BRIGHT: vs->brightness = 50 + 5 * idx; break;
     case MI_GAMMA:  vs->gamma = 60 + 5 * idx; break;
     case MI_CROP:   vs->crop = 8 * idx; break;
     case MI_ANISO:  vs->aniso = k_vm_aniso[idx % 5]; break;
-    case MI_FPS:    vs->show_fps = idx; break;
+    case MI_FPS:    vs->show_fps = idx % 3; break;
     case MI_WIDE:   vs->widescreen = idx; break;
     case MI_LIMIT:  vs->fps_limit = k_fps_limits[idx % FPS_LIMITS]; break;
+    case MI_API:    vs->renderer = idx % 3; break;
+    case MI_UPSCALE: vs->upscaler = idx % 6; break;
+    case MI_FRAMEGEN: vs->framegen = idx != 0; break;
+    case MI_DYNRES: vs->dynres = idx != 0; break;
     }
 }
 
@@ -853,21 +1223,38 @@ void xbox_VideoSettingValueName(int i, int idx, char *buf, size_t n)
     item = k_vm_items[i];
     vm_set(&v, item, idx);
     switch (item) {
+    case MI_PRESET: snprintf(buf, n, "%s", k_preset_names[idx >= 0 && idx <= 4 ? idx : 0]); break;
     case MI_MODE:   snprintf(buf, n, "%s", modes[v.mode % 3]); break;
     case MI_RES:    snprintf(buf, n, "%d x %d", v.res_w, v.res_h); break;
     case MI_ASPECT: snprintf(buf, n, "%s", aspects[v.aspect % 6]); break;
-    case MI_SCALE:  snprintf(buf, n, "%dx (%d x %d)", v.scale, 720 * v.scale, 480 * v.scale); break;
+    case MI_SCALE:
+        if (vs_scale_forced_low())
+            snprintf(buf, n, "%dx, now 1x: %s", v.scale, g_xbox_battery_saver ? "Battery Saver on" : "Heat Control");
+        else snprintf(buf, n, "%dx (%d x %d)", v.scale, 720 * v.scale, 480 * v.scale);
+        break;
     case MI_LIGHTING: snprintf(buf, n, "%s", lighting[v.lighting % 3]); break;
+    case MI_POST:   snprintf(buf, n, "%s", k_post_presets[v.post % POST_PRESETS].name); break;
+    case MI_SHARPEN: snprintf(buf, n, "%s", k_sharpen_names[v.sharpen & 3]); break;
+    case MI_AO:     snprintf(buf, n, "%s", k_ao_names[v.ao % 3]); break;
+    case MI_HDR:    snprintf(buf, n, "%s", v.hdr ? "On (HDR10)" : "Off"); break;
     case MI_FILTER: snprintf(buf, n, "%s", filters[v.filter % 4]); break;
     case MI_VSYNC:  snprintf(buf, n, "%s", v.vsync ? "On" : "Off"); break;
     case MI_BRIGHT: snprintf(buf, n, "%d%%", v.brightness); break;
     case MI_GAMMA:  snprintf(buf, n, "%d.%02d", v.gamma / 100, v.gamma % 100); break;
     case MI_CROP:   if (v.crop) snprintf(buf, n, "%d px", v.crop); else snprintf(buf, n, "Off"); break;
     case MI_ANISO:  if (v.aniso > 1) snprintf(buf, n, "%dx Anisotropic", v.aniso); else snprintf(buf, n, "Standard"); break;
-    case MI_FPS:    snprintf(buf, n, "%s", v.show_fps ? "On" : "Off"); break;
+    case MI_FPS:    snprintf(buf, n, "%s", k_perf_overlay_names[v.show_fps % 3]); break;
     case MI_WIDE:   snprintf(buf, n, "%s", v.widescreen ? "On" : "Off"); break;
     case MI_LIMIT:  if (v.fps_limit < 0) snprintf(buf, n, "Original (30/60)");
                     else if (v.fps_limit) snprintf(buf, n, "%d FPS", v.fps_limit); else snprintf(buf, n, "Unlimited"); break;
+    case MI_API:    snprintf(buf, n, "%s%s", k_api_names[v.renderer % 3],
+                             strcmp(k_api_names[v.renderer % 3], gx_backend_name()) ? " (restart)" : ""); break;
+    case MI_UPSCALE: snprintf(buf, n, "%s", k_upscaler_names[v.upscaler % 6]); break;
+    case MI_FRAMEGEN: snprintf(buf, n, "%s", v.framegen ? "FSR 3 (2x)" : "Off"); break;
+    case MI_DYNRES:
+        if (idx) snprintf(buf, n, "Auto, limit %dx (now %ux)", v.scale, g_render_scale);
+        else snprintf(buf, n, "Off, fixed at %dx", v.scale);
+        break;
     }
 }
 
@@ -899,6 +1286,13 @@ void xbox_VideoSettingsLoad(void)
     static LONG once;
     if (!InterlockedExchange(&once, 1)) {
         vs_load();
+#ifdef __ANDROID__
+        /* not offered on a phone (see k_vm_items) */
+        s_vs.vsync = 1; s_vs.hdr = 0; s_vs.ao = 0; s_vs.upscaler = 0; s_vs.framegen = 0; s_vs.renderer = 1;
+#elif defined(XBOX_GX_PORTABLE)
+        /* not offered on Linux (see k_vm_items); an ini copied from Windows may ask */
+        s_vs.hdr = 0; s_vs.upscaler = 0; s_vs.framegen = 0; s_vs.renderer = 1;
+#endif
         res_build();
     }
 }
@@ -906,11 +1300,18 @@ void xbox_VideoSettingsLoad(void)
 static void menu_key(unsigned vk)
 {
     if (vk == VK_F1) {
+#ifdef __ANDROID__
+        /* Nothing draws this menu here (pr_build_overlay is Windows only):
+         * opening it only blocked the game's input behind an invisible page.
+         * Its settings are in the game's Options on Android. */
+        return;
+#else
         LONG open = !s_menu_open;
         InterlockedExchange(&s_menu_open, open);
         InterlockedExchange(&g_xbox_input_blocked, open);
         s_pr.ovl_valid = 0;
         return;
+#endif
     }
     if (vk == VK_F2) {                                              /* next broadcast presentation */
         extern int nfl2k5_pres_values(int what);
@@ -923,6 +1324,11 @@ static void menu_key(unsigned vk)
             nfl2k5_pres_set(0, v);
             xbox_PresentToast("PRESENTATION", nfl2k5_pres_package_name(v), "F2 for the next one", 3500);
         }
+        return;
+    }
+    if (vk == VK_F9) {                                              /* save what I just heard */
+        extern void xbox_AudioReportRequest(void);
+        xbox_AudioReportRequest();
         return;
     }
     if (vk == VK_RETURN && (GetKeyState(VK_MENU) & 0x8000)) {       /* Alt+Enter */
@@ -1007,6 +1413,7 @@ static void menu_pad(void)
 
 /* Draw the page (or just the FPS counter) with GDI into a BGRA bitmap and
  * upload it; alpha is made from a colour key. */
+#ifdef _WIN32
 static void pr_build_overlay(void)
 {
     /* Tall enough for the open page's rows (32 px each), at least the old 560. */
@@ -1079,23 +1486,6 @@ static void pr_build_overlay(void)
         SelectObject(dc, of);
         DeleteObject(panel); DeleteObject(bar); DeleteObject(selb);
     }
-    if (s_vs.show_fps) {
-        char t[64], t2[128];
-        int len, len2;
-        perf_overlay_text(t, sizeof t, t2, sizeof t2, s_pr.fps);
-        len = (int)strlen(t); len2 = (int)strlen(t2);
-        of = (HFONT)SelectObject(dc, fb);
-        SetTextColor(dc, RGB(1, 1, 1));
-        TextOutA(dc, 6, 6, t, len);
-        SetTextColor(dc, RGB(120, 255, 120));
-        TextOutA(dc, 4, 4, t, len);
-        SelectObject(dc, fs);
-        SetTextColor(dc, RGB(1, 1, 1));
-        TextOutA(dc, 6, 40, t2, len2);
-        SetTextColor(dc, RGB(200, 230, 200));
-        TextOutA(dc, 4, 38, t2, len2);
-        SelectObject(dc, of);
-    }
     GdiFlush();
     {
         uint32_t *p = (uint32_t *)bits;
@@ -1123,8 +1513,90 @@ static void pr_build_overlay(void)
     DeleteDC(dc);
     s_pr.ovl_valid = 1;
 }
+#elif defined(__ANDROID__)
+static void pr_build_overlay(void) { }   /* Android has no F1 menu */
+#else
+/* The same page without GDI, in the performance overlay's 5x7 font. F1 also
+ * blocks the game's input, so without a picture here the game looked frozen. */
+static void pt_fill(uint32_t *p, int W, int H, int x0, int y0, int w, int h, uint32_t c)
+{
+    int x, y;
+    for (y = y0; y < y0 + h && y < H; y++)
+        for (x = x0; x < x0 + w && x < W; x++)
+            if (x >= 0 && y >= 0) p[y * W + x] = c;
+}
 
-/* ── Toast: a short banner in the bottom-left corner ──────────────────
+static int pt_width(const char *t, int s) { return (int)strlen(t) * 6 * s; }
+
+static void pt_text(uint32_t *p, int W, int H, int x, int y, int s, const char *t, int max_w, uint32_t c)
+{
+    int room = max_w / (6 * s), n = (int)strlen(t), i, cx, cy;
+    for (i = 0; i < n && i < room; i++, x += 6 * s) {
+        unsigned char ch = (unsigned char)t[i];
+        const uint8_t *g;
+        if (n > room && i >= room - 2) ch = '.';         /* the text does not fit */
+        if (ch < 0x20 || ch > 0x7E) ch = '?';
+        g = k_ph_font[ch - 0x20];
+        for (cx = 0; cx < 5; cx++)
+            for (cy = 0; cy < 8; cy++)
+                if (g[cx] & (1u << cy))
+                    pt_fill(p, W, H, x + cx * s, y + cy * s, s, s, c);
+    }
+}
+
+static void pt_upload(const uint32_t *bits, int W, int H, ID3D11Texture2D **tex, ID3D11ShaderResourceView **srv)
+{
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_SUBRESOURCE_DATA sd;
+    memset(&td, 0, sizeof td);
+    td.Width = W; td.Height = H; td.MipLevels = td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_IMMUTABLE; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    sd.pSysMem = bits; sd.SysMemPitch = W * 4; sd.SysMemSlicePitch = 0;
+    if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, &sd, tex)))
+        ID3D11Device_CreateShaderResourceView(s_gpu11.dev, (ID3D11Resource *)*tex, NULL, srv);
+}
+
+static void pr_build_overlay(void)
+{
+    const int W = 760, H = s_menu_open && 90 + menu_rows() * 32 + 80 > 560 ? 90 + menu_rows() * 32 + 80 : 560;
+    uint32_t *p = (uint32_t *)calloc((size_t)W * H, 4);
+    int i;
+    if (!p) return;
+    if (s_pr.ovl) { ID3D11Texture2D_Release(s_pr.ovl); s_pr.ovl = NULL; }
+    if (s_pr.ovl_srv) { ID3D11ShaderResourceView_Release(s_pr.ovl_srv); s_pr.ovl_srv = NULL; }
+    if (s_menu_open) {
+        pt_fill(p, W, H, 20, 20, W - 40, H - 40, 0xE6101626u);
+        pt_fill(p, W, H, 20, 20, W - 40, 54, 0xFFAA141Eu);
+        pt_text(p, W, H, 40, 36, 3, menu_page()->title, 400, 0xFFFFFFFFu);
+        if (s_npages > 1) {
+            char pg[48];
+            snprintf(pg, sizeof pg, "LB/RB page %d of %d", s_menu_page % s_npages + 1, s_npages);
+            pt_text(p, W, H, W - 40 - pt_width(pg, 2), 40, 2, pg, 300, 0xFFFFFFFFu);
+        }
+        for (i = 0; i < menu_rows(); i++) {
+            char name[64], val[96], v2[104];
+            int y = 90 + i * 32, vw;
+            uint32_t col = i == s_menu_sel ? 0xFFFFD23Cu : 0xFFE1E6F0u;
+            name[0] = val[0] = 0;
+            menu_page()->label(i, name, val, sizeof val);
+            if (i == s_menu_sel) pt_fill(p, W, H, 30, y - 2, W - 60, 32, 0xFF283C6Eu);
+            snprintf(v2, sizeof v2, i == s_menu_sel ? "< %s >" : "%s", val);
+            vw = val[0] ? pt_width(v2, 2) : 0;
+            if (vw > 340) vw = 340 / 12 * 12;
+            pt_text(p, W, H, 50, y + 7, 2, name, W - 100 - vw - 12, col);
+            if (val[0]) pt_text(p, W, H, W - 50 - vw, y + 7, 2, v2, vw, col);
+        }
+        pt_text(p, W, H, 50, H - 50, 2, "D-pad: choose   Left/Right: change   A: select", W - 100, 0xFF8C96AAu);
+    }
+    pt_upload(p, W, H, &s_pr.ovl, &s_pr.ovl_srv);
+    free(p);
+    s_pr.ovl_w = W; s_pr.ovl_h = H;
+    s_pr.ovl_valid = 1;
+}
+#endif
+
+/* â”€â”€ Toast: a short banner in the bottom-left corner â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
  * xbox_PresentToast(header, line1, line2, ms): "NOW PLAYING" for the local
  * music library, drawn in the style of the game's own panels. Any thread may
  * call it; the presenter rebuilds the texture when the text changes. */
@@ -1142,8 +1614,16 @@ void xbox_PresentToast(const char *header, const char *line1, const char *line2,
     s_toast_until = GetTickCount() + ms;
     InterlockedIncrement(&s_toast_version);
     ReleaseSRWLockExclusive(&s_toast_lock);
+#ifdef __ANDROID__
+    {   /* the panel above is GDI text, Windows only: a pack install said nothing on a phone */
+        char text[400];
+        snprintf(text, sizeof text, "%s: %s %s", header ? header : "", line1 ? line1 : "", line2 ? line2 : "");
+        SDL_ShowAndroidToast(text, ms > 3000 ? 1 : 0, -1, 0, 0);
+    }
+#endif
 }
 
+#ifdef _WIN32
 static void pr_build_toast(void)
 {
     const int W = 640, H = 132;
@@ -1224,6 +1704,30 @@ static void pr_build_toast(void)
     DeleteObject(fh); DeleteObject(ft); DeleteObject(fs);
     DeleteDC(dc);
 }
+#elif defined(__ANDROID__)
+static void pr_build_toast(void) { }   /* GDI text: Windows only */
+#else
+static void pr_build_toast(void)
+{
+    const int W = 640, H = 132;
+    uint32_t *p = (uint32_t *)calloc((size_t)W * H, 4);
+    char text[3][128];
+    if (!p) return;
+    AcquireSRWLockShared(&s_toast_lock);
+    memcpy(text, s_toast_text, sizeof text);
+    ReleaseSRWLockShared(&s_toast_lock);
+    if (s_pr.toast) { ID3D11Texture2D_Release(s_pr.toast); s_pr.toast = NULL; }
+    if (s_pr.toast_srv) { ID3D11ShaderResourceView_Release(s_pr.toast_srv); s_pr.toast_srv = NULL; }
+    pt_fill(p, W, H, 0, 0, W, H, 0xEB0E1422u);
+    pt_fill(p, W, H, 0, 0, W, 36, 0xFFAA141Eu);
+    pt_text(p, W, H, 16, 8, 3, text[0], W - 32, 0xFFFFFFFFu);
+    pt_text(p, W, H, 16, 50, 3, text[1], W - 32, 0xFFFFFFFFu);
+    pt_text(p, W, H, 16, 96, 2, text[2], W - 32, 0xFF78DC78u);
+    pt_upload(p, W, H, &s_pr.toast, &s_pr.toast_srv);
+    free(p);
+    s_pr.toast_w = W; s_pr.toast_h = H;
+}
+#endif
 
 /* Draw the toast while it is due, in the bottom-left corner. */
 static void pr_draw_toast(void)
@@ -1363,15 +1867,55 @@ static int pr_present(uint32_t guest)
         return 0;
     if (InterlockedExchange(&s_vs_dirty, 0))
         pr_apply_mode();
-    g_render_scale = (uint32_t)s_vs.scale;     /* surfaces follow on their next use */
+#ifdef __ANDROID__
+    g_render_scale = vs_scale_forced_low() ? 1u : (uint32_t)s_vs.scale;     /* surfaces follow on their next use */
+    {   /* never silently: a log line, and the frame limit applied at once (at
+         * start it only took effect at the next settings change) */
+        static int forced = -1;
+        if (forced != vs_scale_forced_low()) {
+            forced = vs_scale_forced_low();
+            if (forced) fprintf(stderr, "  [VIDEO] resolution held at 1x by %s\n", g_xbox_battery_saver ? "Battery Saver" : "Heat Control");
+            fps_limit_changed();
+        }
+    }
+    if (g_render_scale > 1 && g_xbox_heat_level >= 1) g_render_scale = (g_render_scale + 1) / 2;   /* Heat Control is on */
+#else
+    g_render_scale = vs_battery_mode() || g_xbox_heat_level ? 1u : (uint32_t)s_vs.scale;     /* surfaces follow on their next use */
+#endif
+    g_want_motion = ((s_vs.upscaler || s_vs.framegen) && gxs_fsr_available()) || env_cached("RECOMP_FORCE_MV");
+    g_want_mv = g_want_motion || s_vs.ao > 0;   /* the depth copy also feeds ambient occlusion */
+#ifdef __ANDROID__
+    /* Dynamic Resolution as chosen in Options: Off stays at Render Scale, Auto
+     * has it as the limit (pr_dynres_scale). NFL2K5_DYNRES=0 is for tests. */
+    if (s_vs.dynres && !vs_scale_forced_low() && !(getenv("NFL2K5_DYNRES") && getenv("NFL2K5_DYNRES")[0] == '0'))
+        g_render_scale = pr_dynres_scale();
+#else
+    if (s_vs.dynres && !vs_battery_mode() && !g_xbox_heat_level)
+        g_render_scale = pr_dynres_scale();
+#endif
+    g_gx_hdr_wanted = s_vs.hdr;                /* gx/gx_sdl.c switches the swap chain */
+    if (env_cached("RECOMP_SCALE_CYCLE")) {
+        /* test only: switch between 9x and 12x every N seconds (leak hunting) */
+        static DWORD t0;
+        DWORD per = (DWORD)atoi(env_cached("RECOMP_SCALE_CYCLE")) * 1000u;
+        if (!t0) t0 = GetTickCount();
+        g_render_scale = per && ((GetTickCount() - t0) / per) % 2 ? 12u : 9u;
+    }
+    if ((s_vs.upscaler || s_vs.framegen) && gxs_fsr_available() && s_fsr_out_h) {
+        /* FSR 3: render at the on-screen size over the quality ratio (the
+         * internal-resolution setting does not apply), rounded to a whole
+         * multiple of the guest's 480 lines */
+        float want = (float)s_fsr_out_h / k_upscaler_ratio[(s_vs.upscaler ? s_vs.upscaler : 1) % 6] / (float)s->h;
+        uint32_t r = (uint32_t)(want + 0.5f);
+        g_render_scale = r < 1 ? 1 : r > 16 ? 16 : r;
+    }
     g_aniso = (uint32_t)s_vs.aniso;
     g_lighting_profile = (uint32_t)s_vs.lighting;
     s_ana_ar = pr_anamorphic_update();
     g_wide_ar = s_ana_ar > 0.0f ? 0.0f : pr_wanted_wide_ar();
     menu_pad();
 
-    if (FAILED(ID3D11Device_CreateShaderResourceView(s_gpu11.dev, (ID3D11Resource *)s->tex, NULL, &srv)))
-        return 0;
+    ID3D11Texture2D *shown = s->tex, *generated = NULL;
     {
         /* A widescreen surface is wider than the guest's: it is shown whole,
          * and its proportions follow from its width. */
@@ -1384,7 +1928,7 @@ static int pr_present(uint32_t guest)
         pc.prm[1] = 100.0f / (float)s_vs.gamma;
         pc.prm[2] = (float)(s_vs.filter == SF_NEAREST ? 1 : s_vs.filter == SF_SHARP ? 2
                                : s_vs.filter == SF_ENHANCED ? 3 : 0);
-        pc.prm[3] = 0.0f;
+        pc.prm[3] = s->mv && env_cached("RECOMP_MV_SHOW") ? 1.0f : 0.0f;
         pr_dest_rect(frac, &dx, &dy, &dw, &dh);
         if (s_ana_ar > 0.0f && !s->ox) {
             /* Built-in widescreen: the action area fills the window -- no bars. */
@@ -1398,22 +1942,147 @@ static int pr_present(uint32_t guest)
                 fprintf(stderr, "  [PRESENT] surface %08X %ux%u +%u cols, frac %.3f, window %dx%d -> picture %.0f,%.0f %.0fx%.0f (aspect mode %d)\n",
                         guest, s->w, s->h, s->ox, frac, s_pr.bb_w, s_pr.bb_h, dx, dy, dw, dh, s_vs.aspect);
         }
+        /* FSR 3 (Direct3D 12): the frame, its depth and motion, upscaled
+         * straight to the size the picture has on screen (render size: that
+         * over the quality ratio, see g_render_scale above). */
+        {
+            static ID3D11Texture2D *fsr_out, *fsr_gen;
+            static UINT fsr_w, fsr_h, fsr_rw;
+            static float jx, jy;                 /* jitter this frame was rendered with (pixels) */
+            static LARGE_INTEGER last;
+            LARGE_INTEGER t;
+            D3D11_TEXTURE2D_DESC td;
+            ID3D11Texture2D_GetDesc(s->tex, &td);
+            QueryPerformanceCounter(&t);
+            if ((s_vs.upscaler || s_vs.framegen) && s->mv && s->dz && gxs_fsr_available() && pc.src[2] > 0.0f &&
+                pc.src[3] > 0.0f) {
+                UINT ow = (UINT)(dw / pc.src[2] + 0.5f), oh = (UINT)(dh / pc.src[3] + 0.5f);
+                float dt = last.QuadPart ? (float)((t.QuadPart - last.QuadPart) * 1000.0 / s_pr.freq.QuadPart) : 16.7f;
+                if (ow > 16384u) ow = 16384u;
+                if (oh > 16384u) oh = 16384u;
+                s_fsr_out_h = oh;
+                if (!fsr_out || fsr_w != ow || fsr_h != oh) {
+                    D3D11_TEXTURE2D_DESC od;
+                    if (fsr_out) ID3D11Texture2D_Release(fsr_out);
+                    fsr_out = NULL;
+                    memset(&od, 0, sizeof od);
+                    od.Width = ow; od.Height = oh; od.MipLevels = od.ArraySize = 1;
+                    od.Format = DXGI_FORMAT_R8G8B8A8_UNORM; od.SampleDesc.Count = 1;
+                    od.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+                    ID3D11Device_CreateTexture2D(s_gpu11.dev, &od, NULL, &fsr_out);
+                    if (fsr_gen) ID3D11Texture2D_Release(fsr_gen);
+                    fsr_gen = NULL;
+                    ID3D11Device_CreateTexture2D(s_gpu11.dev, &od, NULL, &fsr_gen);
+                    fsr_w = ow; fsr_h = oh;
+                }
+                /* Only once the surface has the render scale FSR asked for:
+                 * the first frames after a change still have the old size,
+                 * and a context made for them (6480x4320 at the 9x setting)
+                 * cost a 13 s stall and gigabytes of video memory. */
+                if (fsr_out && ow >= td.Width / 2u && s->scale == g_render_scale &&
+                    gxs_fsr_upscale(s->tex, s->dz, s->mv, s->rx, fsr_out, s_vs.framegen ? fsr_gen : NULL, td.Width,
+                                    td.Height, ow, oh, jx, jy, dt, fsr_rw != td.Width, 0.25f)) {
+                    shown = fsr_out;
+                    if (s_vs.framegen && fsr_gen && fsr_rw == td.Width)
+                        generated = fsr_gen;          /* not on the first frame after a change */
+                }
+                fsr_rw = td.Width;
+                gxs_fsr_jitter(td.Width, ow, &jx, &jy);  /* the next frame's offset */
+                gxs_set_jitter(2.0f * jx / (float)td.Width, -2.0f * jy / (float)td.Height);
+            } else {
+                s_fsr_out_h = 0;
+                if (jx != 0.0f || jy != 0.0f) {
+                    jx = jy = 0.0f;
+                    gxs_set_jitter(0.0f, 0.0f);
+                }
+            }
+            last = t;
+        }
+        if (s->dz && env_cached("RECOMP_DZ_STATS")) {
+            /* test only: what the depth copy holds mid-screen, every 300 frames */
+            static ID3D11Texture2D *st;
+            static unsigned n;
+            if (n++ % 300 == 150) {
+                D3D11_TEXTURE2D_DESC td;
+                D3D11_MAPPED_SUBRESOURCE mm;
+                ID3D11Texture2D_GetDesc(s->dz, &td);
+                if (!st) {
+                    D3D11_TEXTURE2D_DESC sd2;
+                    memset(&sd2, 0, sizeof sd2);
+                    sd2.Width = 64; sd2.Height = 64; sd2.MipLevels = sd2.ArraySize = 1;
+                    sd2.Format = DXGI_FORMAT_R32_FLOAT; sd2.SampleDesc.Count = 1;
+                    sd2.Usage = D3D11_USAGE_STAGING; sd2.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                    ID3D11Device_CreateTexture2D(s_gpu11.dev, &sd2, NULL, &st);
+                }
+                if (st) {
+                    D3D11_BOX box = { td.Width / 2 - 32, td.Height * 2 / 3 - 32, 0, td.Width / 2 + 32, td.Height * 2 / 3 + 32, 1 };
+                    ID3D11DeviceContext_CopySubresourceRegion(s_gpu11.ctx, (ID3D11Resource *)st, 0, 0, 0, 0,
+                                                              (ID3D11Resource *)s->dz, 0, &box);
+                    if (SUCCEEDED(ID3D11DeviceContext_Map(s_gpu11.ctx, (ID3D11Resource *)st, 0, D3D11_MAP_READ, 0, &mm))) {
+                        float mn = 1e30f, mx = -1e30f, sum = 0.0f;
+                        int y, x;
+                        for (y = 0; y < 64; y++)
+                            for (x = 0; x < 64; x++) {
+                                float v = ((const float *)((const uint8_t *)mm.pData + y * mm.RowPitch))[x];
+                                if (v < mn) mn = v;
+                                if (v > mx) mx = v;
+                                sum += v;
+                            }
+                        fprintf(stderr, "  [DZ] %ux%u centre-low 64x64: min %.6f max %.6f mean %.6f  (row0: %.6f %.6f %.6f)\n",
+                                td.Width, td.Height, mn, mx, sum / 4096.0f,
+                                ((const float *)mm.pData)[0], ((const float *)mm.pData)[32], ((const float *)mm.pData)[63]);
+                        ID3D11DeviceContext_Unmap(s_gpu11.ctx, (ID3D11Resource *)st, 0);
+                    }
+                }
+            }
+        }
         /* The surface texture is scale x its guest size once the internal
          * resolution is raised; the shader's texel maths wants its real size. */
         {
             D3D11_TEXTURE2D_DESC td;
-            ID3D11Texture2D_GetDesc(s->tex, &td);
+            ID3D11Texture2D_GetDesc(shown, &td);
             pc.sz[0] = (float)td.Width; pc.sz[1] = (float)td.Height;
         }
+        /* RECOMP_MV_SHOW=1 (SDL_GPU): the motion vectors, |x| red, |y| green. */
+        if (FAILED(ID3D11Device_CreateShaderResourceView(s_gpu11.dev,
+                       (ID3D11Resource *)(s->mv && env_cached("RECOMP_MV_SHOW") ? s->mv : shown), NULL, &srv)))
+            return 0;
         pc.sz[2] = dw; pc.sz[3] = dh;
+        if (pc.prm[2] == 3.0f && env_cached("RECOMP_NO_SSDOWN")) {   /* A/B: the old 5-tap filter only */
+            pc.sz[2] = pc.sz[0] * pc.src[2]; pc.sz[3] = pc.sz[1] * pc.src[3];
+        }
     }
+    /* Frame generation: the generated frame is composed exactly like the
+     * real one (picture, HUD, overlays) into a second back buffer, presented
+     * first; the real frame follows half an interval later (gx_sdl.c). */
+    ID3D11ShaderResourceView *gen_srv = NULL;
+    ID3D11RenderTargetView *gen_rtv = NULL;
+    if (generated) {
+        ID3D11Texture2D *bb2 = NULL;
+        if (FAILED(ID3D11Device_CreateShaderResourceView(s_gpu11.dev, (ID3D11Resource *)generated, NULL, &gen_srv)) ||
+            FAILED(gxs_swapchain_bb2(s_pr.sc, &bb2)) ||
+            FAILED(ID3D11Device_CreateRenderTargetView(s_gpu11.dev, (ID3D11Resource *)bb2, NULL, &gen_rtv))) {
+            if (gen_srv) ID3D11ShaderResourceView_Release(gen_srv);
+            gen_srv = NULL;
+        }
+        if (bb2) ID3D11Texture2D_Release(bb2);
+    }
+    for (int pass = gen_srv && gen_rtv ? 0 : 1; pass < 2; pass++) {
+    ID3D11RenderTargetView *target = pass ? s_pr.bb_rtv : gen_rtv;
+    ID3D11ShaderResourceView *pic = pass ? srv : gen_srv;
     if (SUCCEEDED(ID3D11DeviceContext_Map(s_gpu11.ctx, (ID3D11Resource *)s_pr.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
         memcpy(m.pData, &pc, sizeof pc);
         ID3D11DeviceContext_Unmap(s_gpu11.ctx, (ID3D11Resource *)s_pr.cb, 0);
     }
-    ID3D11DeviceContext_OMSetRenderTargets(s_gpu11.ctx, 1, &s_pr.bb_rtv, NULL);
-    ID3D11DeviceContext_ClearRenderTargetView(s_gpu11.ctx, s_pr.bb_rtv, clear);
-    vp.TopLeftX = dx; vp.TopLeftY = dy; vp.Width = dw; vp.Height = dh; vp.MinDepth = 0; vp.MaxDepth = 1;
+    ID3D11DeviceContext_OMSetRenderTargets(s_gpu11.ctx, 1, &target, NULL);
+    ID3D11DeviceContext_ClearRenderTargetView(s_gpu11.ctx, target, clear);
+    /* Post-processing: the picture goes to an off-screen image of the size it
+     * is shown at, and bloom/grading/sharpening put it on the back buffer. */
+    ID3D11RenderTargetView *post_rtv = post_begin((UINT)(dw + 0.5f), (UINT)(dh + 0.5f));
+    if (post_rtv)
+        ID3D11DeviceContext_OMSetRenderTargets(s_gpu11.ctx, 1, &post_rtv, NULL);
+    vp.TopLeftX = post_rtv ? 0.0f : dx; vp.TopLeftY = post_rtv ? 0.0f : dy;
+    vp.Width = dw; vp.Height = dh; vp.MinDepth = 0; vp.MaxDepth = 1;
     ID3D11DeviceContext_RSSetViewports(s_gpu11.ctx, 1, &vp);
     {
         D3D11_RECT all = { 0, 0, (LONG)s_pr.bb_w, (LONG)s_pr.bb_h };
@@ -1428,12 +2097,17 @@ static int pr_present(uint32_t guest)
     ID3D11DeviceContext_GSSetShader(s_gpu11.ctx, NULL, NULL, 0);
     ID3D11DeviceContext_PSSetShader(s_gpu11.ctx, s_pr.ps, NULL, 0);
     ID3D11DeviceContext_PSSetConstantBuffers(s_gpu11.ctx, 0, 1, &s_pr.cb);
-    ID3D11DeviceContext_PSSetShaderResources(s_gpu11.ctx, 0, 1, &srv);
+    ID3D11DeviceContext_PSSetShaderResources(s_gpu11.ctx, 0, 1, &pic);
     {
         ID3D11SamplerState *smp[2] = { s_pr.lin, s_pr.pt };
         ID3D11DeviceContext_PSSetSamplers(s_gpu11.ctx, 0, 2, smp);
     }
     ID3D11DeviceContext_Draw(s_gpu11.ctx, 3, 0);
+    if (post_rtv) {
+        ID3D11ShaderResourceView *none = NULL;
+        ID3D11DeviceContext_PSSetShaderResources(s_gpu11.ctx, 0, 1, &none);
+        post_finish(target, dx, dy, s->dz, pc.src);
+    }
     {
         /* The HUD lays out against the whole surface; a side crop pushes part
          * of it past the picture's edges. */
@@ -1459,9 +2133,8 @@ static int pr_present(uint32_t guest)
             if (++secs % 10 == 0)
                 fprintf(stderr, "  [FPS] %d (scale %d, vsync %d)\n", s_pr.fps, s_vs.scale, s_vs.vsync);
         }
-        if (s_vs.show_fps) s_pr.ovl_valid = 0;
     }
-    if (s_menu_open || s_vs.show_fps) {
+    if (s_menu_open) {   /* the performance overlay is HUD layer 2 (nv2a_gpu_perfhud.inc.c) */
         if (!s_pr.ovl_valid)
             pr_build_overlay();
         if (s_pr.ovl_srv) {
@@ -1483,9 +2156,13 @@ static int pr_present(uint32_t guest)
         ID3D11ShaderResourceView *none = NULL;
         ID3D11DeviceContext_PSSetShaderResources(s_gpu11.ctx, 0, 1, &none);
     }
+    }   /* the two compositions */
     ID3D11ShaderResourceView_Release(srv);
+    if (gen_srv) ID3D11ShaderResourceView_Release(gen_srv);
+    if (gen_rtv) ID3D11RenderTargetView_Release(gen_rtv);
     pr_present_shot();
     pr_record();
+    pr_luma();
     pr_frame_limit();
 
     {
@@ -1494,9 +2171,11 @@ static int pr_present(uint32_t guest)
         /* Tearing is only allowed with VSync off and not in exclusive
          * fullscreen (DXGI rejects the flag there). */
         IDXGISwapChain1_Present(s_pr.sc, s_vs.vsync ? 1u : 0u,
-                                (!s_vs.vsync && s_pr.tearing && s_vs.mode != VM_FULLSCREEN) ? DXGI_PRESENT_ALLOW_TEARING : 0);
+                                ((!s_vs.vsync && s_pr.tearing && s_vs.mode != VM_FULLSCREEN) ? DXGI_PRESENT_ALLOW_TEARING : 0) |
+                                (gen_srv ? GX_PRESENT_PAIR : 0));
         QueryPerformanceCounter(&b);
-        perf_on_present(s_vs.scale, (float)((double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)s_perf.freq.QuadPart));
+        s_last_present_ms = (float)((double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)s_perf.freq.QuadPart);
+        perf_on_present((int)g_render_scale, s_last_present_ms);
         QueryPerformanceFrequency(&fq);
         if ((b.QuadPart - a.QuadPart) * 1000 / fq.QuadPart > 200)
             fprintf(stderr, "  [PRESENT] Present took %lld ms (thread %lu)\n",
@@ -1504,6 +2183,226 @@ static int pr_present(uint32_t guest)
     }
     return 1;
 }
+
+/* Dynamic resolution (2026-10-29): on each new reading of the GPU's busy
+ * share (perf_gpu_counter, once a second), step the internal resolution down
+ * while the GPU is nearly always busy, and back up -- as far as 16x, so the
+ * highest scale that holds the frame-rate cap -- when the next step's cost (pixels grow with the square of the
+ * scale) still leaves headroom. The load swings with the camera from one
+ * second to the next, and every step rebuilds the render targets, so going
+ * up waits for four quiet readings in a row and for 10 s after a step down,
+ * doubled (to 2 min) each time a step up had to be taken back. */
+#ifndef _WIN32
+/* Android and Linux (2026-11-01): no GPU busy counter here (s_gpuctr is Windows-only); phones (s_gpuctr never
+ * reads), so the desktop rules below never stepped down and a phone stayed at
+ * the chosen scale: an S22+ at 4x played at 23-35 FPS while the render thread
+ * waited 13-28 ms a frame for the GPU, and fell further as it heated up.
+ * Here the signal is that wait (gxs_gpu_wait_total_us: submissions that block
+ * for a free frame plus swap-chain acquires) and the frame time, both
+ * averaged over about a second. The chosen scale is the ceiling; Heat
+ * Control's first step halves it instead of dropping straight to 1x. */
+LONGLONG gxs_gpu_wait_total_us(void) __attribute__((weak));   /* gx/gx_sdl.c, when built in */
+extern volatile int g_xbox_heat_level;
+static uint32_t pr_dynres_scale(void)
+{
+    static uint32_t cur;
+    static LONGLONG win_t0, last_wait, last_down, last_up, last_step;
+    static float hold = 20.0f;
+    static unsigned frames, quiet, slow, report;
+    static double wait_sum;
+    LARGE_INTEGER now;
+    LONGLONG w = gxs_gpu_wait_total_us ? gxs_gpu_wait_total_us() : 0;
+    float f = s_perf.freq.QuadPart ? (float)s_perf.freq.QuadPart : 1.0f;
+    float budget = 1000.0f / (xbox_VideoFpsLimit() == 30 ? 30.0f : 60.0f);
+    uint32_t top = (uint32_t)s_vs.scale;
+    if (g_xbox_heat_level >= 1 && top > 1) top = (top + 1) / 2;
+    /* Render Scale is the limit. Normal play never goes under 2x: 1x stretched
+     * to a phone screen looks like a handheld port, and on an S22+ it bought no
+     * frames (2026-11-06: 1x still fell from 58 to 26 FPS, the CPU was the limit).
+     * 1x comes only from Render Scale 1x, Battery Saver or Heat Control's last
+     * step, which bypass this function (vs_scale_forced_low). */
+    uint32_t low = top < 2 ? top : 2;
+    if (top < 1) top = 1;
+    QueryPerformanceCounter(&now);
+    if (!cur) { cur = top; win_t0 = now.QuadPart; last_wait = w; return cur; }
+    {   /* no step during a boot movie: a step rebuilds the render targets on screen */
+        extern volatile long g_xbox_boot_movie_active;
+        if (g_xbox_boot_movie_active) {
+            win_t0 = now.QuadPart; last_wait = w; frames = 0; wait_sum = 0.0; slow = quiet = 0;
+            return cur;
+        }
+    }
+    if (cur > top) {                                  /* the ceiling came down (heat, menu) */
+        cur = top;
+        last_step = last_down = now.QuadPart;
+        fprintf(stderr, "  [DYNRES] ceiling %ux (heat level %d)\n", cur, g_xbox_heat_level);
+        return cur;
+    }
+    wait_sum += (double)(w - last_wait) / 1000.0;
+    last_wait = w;
+    frames++;
+    if ((float)(now.QuadPart - win_t0) < f) return cur;   /* a one-second window */
+    {
+        float ft = (float)(now.QuadPart - win_t0) * 1000.0f / f / (float)frames;   /* ms per presented frame */
+        float gw = (float)(wait_sum / frames);                                      /* GPU wait per frame */
+        int settling = (float)(now.QuadPart - last_step) < 2.0f * f;              /* a rebuild hitch inflates both */
+        win_t0 = now.QuadPart;
+        frames = 0;
+        wait_sum = 0.0;
+        if (++report >= 30) {                         /* the numbers behind the decisions below */
+            report = 0;
+            fprintf(stderr, "  [DYNRES] now %ux: %.1f ms frames, GPU wait %.1f ms\n", cur, ft, gw);
+        }
+        if (settling) return cur;
+        /* Only when the GPU is the limit. A late frame alone says nothing: the
+         * game thread is often what is late, with the wait still at 5-9 ms of a
+         * 20 ms frame (Adreno's submit costs that with the GPU idle). A really
+         * GPU-bound frame here waits 13-28 ms. Three windows in a row, and not
+         * a loading screen (a 680 ms "frame" once dropped straight to 1x). */
+        slow = ft > budget * 1.08f && ft < 100.0f && gw >= budget * 0.72f ? slow + 1 : 0;
+        if (cur > low && slow >= 3) {
+            slow = 0;
+            /* GPU-bound and late: one step to the size that fits (cost goes
+             * with the pixel count), at most halving */
+            uint32_t to = (uint32_t)((float)cur * sqrtf(budget / ft) * 0.95f);
+            if (to < cur / 2) to = cur / 2;
+            if (to >= cur) to = cur - 1;
+            if (to < low) to = low;
+            if (to < 1) to = 1;
+            if (last_up && (float)(now.QuadPart - last_up) < 30.0f * f) {
+                hold = hold * 2.0f > 120.0f ? 120.0f : hold * 2.0f;   /* went up too far: wait longer */
+            }
+            cur = to;
+            last_step = last_down = now.QuadPart;
+            quiet = 0;
+            fprintf(stderr, "  [DYNRES] %.1f ms frames, GPU wait %.1f ms: internal resolution %ux\n", ft, gw, cur);
+        } else if (cur < top) {
+            /* on time with the GPU waiting almost never: room for one more step */
+            /* Room to climb: on time (such a frame waits for the swap chain, so
+             * its wait proves nothing), or late with the GPU not what it is
+             * waiting for. `hold` keeps a step that proves too high from
+             * being tried again and again. */
+            quiet = ft <= budget * 1.03f || gw < budget * 0.4f ? quiet + 1 : 0;
+            if (quiet >= 6 && (float)(now.QuadPart - last_down) >= hold * f) {
+                cur++;
+                last_step = last_up = now.QuadPart;
+                quiet = 0;
+                fprintf(stderr, "  [DYNRES] %.1f ms frames, GPU wait %.1f ms: internal resolution %ux\n", ft, gw, cur);
+            }
+        }
+    }
+    return cur;
+}
+#else
+static uint32_t pr_dynres_scale(void)
+{
+    static uint32_t cur;
+    static LONGLONG last_step, last_down, last_up, seen;
+    static float hold = 20.0f;                      /* seconds after a step down before going up */
+    static int quiet, slow, waits;
+    static float wait_sum;
+    static uint32_t learned = 16;                   /* the most a heavy scene has held */
+    /* Auto: the chosen scale is the limit, and it never climbs past it */
+    uint32_t top = learned < (uint32_t)s_vs.scale ? learned : (uint32_t)s_vs.scale;
+    LARGE_INTEGER now;
+    float util = s_gpuctr.util, f = s_perf.freq.QuadPart ? (float)s_perf.freq.QuadPart : 1.0f;
+    if (!cur) cur = (uint32_t)s_vs.scale;           /* start from the chosen scale */
+    if (cur > (uint32_t)s_vs.scale) cur = (uint32_t)s_vs.scale;   /* the player just lowered it */
+    /* Fast path, every frame: Present blocking means the GPU is behind. The
+     * busy share is only read once a second, so a step from a light scene
+     * (menus, at 16x) into play used to drop frames for 2-3 s before it
+     * came down (the demo's commonest hitch, 2026-10-30). 20 such frames in
+     * a row -- a third of a second -- step down at once. With VSync on,
+     * Present waits for the display anyway: only long waits count there. */
+    if (s_last_present_ms > (s_vs.vsync ? 14.0f : 6.0f)) {
+        waits++;
+        wait_sum += s_last_present_ms - (s_vs.vsync ? 8.0f : 0.0f);
+    } else {
+        waits = 0;
+        wait_sum = 0.0f;
+    }
+    /* a frame or more behind (an 8x scene at 16x) shows within a few frames:
+     * 6 of those are enough; small waits take 20 to be sure */
+    /* Loading screens make Present wait too, with the GPU idle (one start
+     * fell from 9x to 3x that way): the GPU must also read busy, and this
+     * path goes no lower than half the chosen scale. */
+    if ((waits >= 20 || (waits >= 6 && wait_sum / (float)waits > 12.0f)) && cur > 1
+            && s_gpuctr.state == 1 && util >= 40.0f && cur > (uint32_t)(s_vs.scale + 1) / 2) {
+        /* Each change rebuilds the render targets (a 20-60 ms hitch): one
+         * step to the size the wait says fits -- cost goes with the pixel
+         * count -- not 4/5 at a time (16x went 12x then 9x, two hitches). */
+        float budget = 1000.0f / (s_vs.fps_limit == 30 ? 30.0f : 60.0f);
+        uint32_t to = (uint32_t)((float)cur * sqrtf(budget / (budget + wait_sum / (float)waits)) * 0.95f);
+        if (to < cur / 2) to = cur / 2;
+        if (to < (uint32_t)(s_vs.scale + 1) / 2) to = (uint32_t)(s_vs.scale + 1) / 2;
+        /* Menus and replays are light enough for 16x, play is not: climbing
+         * back there between plays meant the next snap began a frame or more
+         * behind (2026-10-30). Two steps above what fits is as high as it
+         * goes again this session. */
+        {
+            uint32_t was = cur;
+            if (to + 2 < learned) learned = to + 2;
+            if (learned >= was) learned = was > 1 ? was - 1 : 1;
+        }
+        QueryPerformanceCounter(&now);
+        cur = to < cur ? (to ? to : 1) : cur - 1;
+        last_step = last_down = now.QuadPart;
+        if (last_up && (float)(now.QuadPart - last_up) < 30.0f * f)
+            hold = hold * 2.0f > 120.0f ? 120.0f : hold * 2.0f;   /* it went up too far: wait longer next time */
+        quiet = 0;
+        fprintf(stderr, "  [DYNRES] Present waiting %.0f ms a frame: internal resolution %ux\n", wait_sum / (float)waits, cur);
+        waits = 0;
+        wait_sum = 0.0f;
+        return cur;
+    }
+    if (s_gpuctr.state != 1 || !s_perf.freq.QuadPart || s_perf.pub_t0.QuadPart == seen) return cur;
+    seen = s_perf.pub_t0.QuadPart;                  /* a new reading */
+    QueryPerformanceCounter(&now);
+    if ((float)(now.QuadPart - last_step) < 2.0f * f) return cur;   /* still settling */
+    slow = s_perf.ft_avg > 1000.0f / (s_vs.fps_limit == 30 ? 30.0f : 60.0f) * 1.5f && util < 85.0f ? slow + 1 : 0;
+    if (cur > (uint32_t)s_vs.scale && slow >= 3) {   /* 3 s in a row: not a loading screen */
+        /* far too slow without the GPU being busy above the chosen scale (one 16x
+         * run fell to 2-8 fps with the GPU idle): back to the chosen scale */
+        cur = (uint32_t)s_vs.scale;
+        last_step = last_down = now.QuadPart;
+        quiet = 0;
+        hold = 30.0f;
+        slow = 0;
+        fprintf(stderr, "  [DYNRES] %.0f ms frames, GPU %.0f%% busy: back to %ux\n", s_perf.ft_avg, util, cur);
+    } else if (cur > 1 && (util > 92.0f ||       /* GPU-bound, or nearly so while frames run late */
+                    (util > 85.0f && s_perf.ft_avg > 1000.0f / (s_vs.fps_limit == 30 ? 30.0f : 60.0f) * 1.05f))) {
+        /* well over the frame budget: one step to the size that fits (cost
+         * goes with the pixel count), not one scale a time */
+        float budget = 1000.0f / (s_vs.fps_limit == 30 ? 30.0f : 60.0f);
+        uint32_t fit = s_perf.ft_avg > budget * 1.2f
+            ? (uint32_t)((float)cur * sqrtf(budget / s_perf.ft_avg * 0.9f)) : cur - 1;
+        if (fit < cur * 3 / 5) fit = cur * 3 / 5;   /* a rebuild hitch inflates ft_avg: at most 0.6x a step */
+        cur = fit < 1 ? 1 : fit >= cur ? cur - 1 : fit;
+        if (last_up && (float)(now.QuadPart - last_up) < 30.0f * f)
+            hold = hold * 2.0f > 120.0f ? 120.0f : hold * 2.0f;   /* it went up too far: wait longer next time */
+        last_step = last_down = now.QuadPart;
+        quiet = 0;
+        fprintf(stderr, "  [DYNRES] GPU %.0f%% busy: internal resolution %ux\n", util, cur);
+    } else if (cur < top) {
+        float r = (float)(cur + 1) / (float)cur;
+        quiet = util * r * r < 65.0f ? quiet + 1 : 0;
+        if (quiet >= 6 && (float)(now.QuadPart - last_down) >= hold * f
+                && (float)(now.QuadPart - last_up) >= 20.0f * f) {
+            /* lots of headroom: toward the size the load says fits, up to 4
+             * steps. Kept well under the budget, and at most every 20 s:
+             * play is heavier than the menus and replays it is measured in,
+             * and every change is a hitch of its own. */
+            uint32_t fit = (uint32_t)((float)cur * sqrtf(60.0f / (util > 1.0f ? util : 1.0f)));
+            cur = fit > cur + 4 ? cur + 4 : fit > cur ? fit : cur + 1;
+            if (cur > top) cur = top;
+            last_step = last_up = now.QuadPart;
+            quiet = 0;
+            fprintf(stderr, "  [DYNRES] GPU %.0f%% busy: internal resolution %ux\n", util, cur);
+        }
+    }
+    return cur;
+}
+#endif
 
 /* Frame-rate cap (video settings): hold each presented frame until its
  * slot on an even 1/limit grid. The guest lock is dropped for the wait so
@@ -1542,11 +2441,15 @@ static void pr_frame_limit(void)
  * (default 5) save the frame as presented -- game picture, HUD (HTML
  * presentations) and overlays -- as <prefix>-<n>.bmp at half size. Unlike
  * RECOMP_SHOT_PREFIX (the guest surface) it shows what the player sees, and
- * unlike a screen grab it works with another window in front. */
+ * unlike a screen grab it works with another window in front.
+ * NFL2K5_PRESENT_SHOT_LIMIT defaults to 120 frames (0 explicitly unlimited).
+ * Bounded unattended captures must not fill the game's install drive. */
 static void pr_present_shot(void)
 {
     static DWORD next;
     static unsigned n;
+    static int limit_read;
+    static unsigned limit = 120;
     static ID3D11Texture2D *staging;
     static UINT sw, sh;
     const char *prefix = getenv("NFL2K5_PRESENT_SHOT");
@@ -1554,9 +2457,24 @@ static void pr_present_shot(void)
     D3D11_TEXTURE2D_DESC td;
     D3D11_MAPPED_SUBRESOURCE m;
     DWORD now = GetTickCount();
+    if (!limit_read) {
+        const char *v = getenv("NFL2K5_PRESENT_SHOT_LIMIT");
+        limit_read = 1;
+        if (v && *v) {
+            char *end; unsigned long parsed = strtoul(v, &end, 10);
+            if (*v != '-' && !*end && parsed <= 10000) limit = (unsigned)parsed;
+        }
+    }
+    if (limit && n >= limit) return;
     if (!prefix || !*prefix || (next && now < next))
         return;
-    next = now + 1000u * (getenv("NFL2K5_PRESENT_SHOT_SECONDS") ? (unsigned)atoi(getenv("NFL2K5_PRESENT_SHOT_SECONDS")) : 5u);
+    {
+        const char *v = getenv("NFL2K5_PRESENT_SHOT_SECONDS");
+        int seconds = v ? atoi(v) : 5;
+        if (seconds < 1) seconds = 1;
+        if (seconds > 3600) seconds = 3600;
+        next = now + 1000u * (unsigned)seconds;
+    }
     if (FAILED(IDXGISwapChain1_GetBuffer(s_pr.sc, 0, &IID_ID3D11Texture2D, (void **)&bb)))
         return;
     ID3D11Texture2D_GetDesc(bb, &td);
@@ -1595,6 +2513,158 @@ static void pr_present_shot(void)
     }
 }
 
+/* NFL2K5_PRESENT_LUMA=<prefix>: one row per presented frame in <prefix>.csv
+ * (milliseconds, frame, mean brightness, share of black pixels, a hash of a
+ * sample grid: a repeated frame repeats its hash), read back through a ring so
+ * the GPU never waits; finds one-frame flashes a screenshot every second
+ * misses. A frame much darker or brighter than the last one is also saved as
+ * <prefix>-<frame>.bmp at a quarter size, with the one before it (first 80). */
+extern volatile long g_xbox_boot_movie_active;   /* kernel_bridge.c */
+static void pr_luma_bmp(const char *prefix, unsigned frame, const uint8_t *data, UINT pitch, UINT sw, UINT sh)
+{
+    UINT w = sw / 4, h = sh / 4, row = (w * 3 + 3) & ~3u, x, y;
+    uint32_t size = 54 + row * h;
+    uint8_t hdr[54] = { 'B', 'M' }, *line = (uint8_t *)calloc(1, row);
+    char path[512];
+    FILE *f;
+    snprintf(path, sizeof path, "%s-%06u.bmp", prefix, frame);
+    f = fopen(path, "wb");
+    if (f && line) {
+        int32_t nh = -(int32_t)h;
+        memcpy(hdr + 2, &size, 4); hdr[10] = 54; hdr[14] = 40;
+        memcpy(hdr + 18, &w, 4); memcpy(hdr + 22, &nh, 4); hdr[26] = 1; hdr[28] = 24;
+        fwrite(hdr, 1, 54, f);
+        for (y = 0; y < h; y++) {
+            const uint8_t *src = data + (size_t)y * 4 * pitch;
+            for (x = 0; x < w; x++) memcpy(line + x * 3, src + x * 16, 3);
+            fwrite(line, 1, row, f);
+        }
+    }
+    if (f) fclose(f);
+    free(line);
+}
+
+static void pr_luma(void)
+{
+    static ID3D11Texture2D *ring[3];
+    static int filled[3], slot, off = -1, saved;
+    static unsigned stamp[3], frame, stamp_draws[3], last_draws;
+    static UINT rw, rh;
+    static FILE *csv;
+    static double last_mean = -1.0;
+    static uint8_t *prev;
+    static UINT prev_pitch;
+    static unsigned prev_frame;
+    const char *prefix;
+    ID3D11Texture2D *bb = NULL;
+    D3D11_TEXTURE2D_DESC td;
+    int i;
+    /* Android, without the variable: the boot movies only, into intro-luma.csv
+     * and a few intro-luma-*.bmp in the game folder, with a summary line in the
+     * log. The flash can only be measured where it is seen. */
+    static int movie_only, idle, shown, dark, dark_run, dark_longest, dark_blinks, jumps, repeats;
+    static uint32_t last_hash;
+    static char auto_prefix[MAX_PATH];
+    int save_limit;
+    if (off < 0) {
+        off = !(getenv("NFL2K5_PRESENT_LUMA") && *getenv("NFL2K5_PRESENT_LUMA"));
+#ifdef __ANDROID__
+        if (off) { off = 0; movie_only = 1; xbox_user_path("intro-luma", auto_prefix, sizeof auto_prefix); }
+#endif
+    }
+    if (off) return;
+    save_limit = movie_only ? 12 : 80;
+    if (movie_only) {
+        idle = g_xbox_boot_movie_active ? 0 : idle + 1;
+        if (!shown && !g_xbox_boot_movie_active) return;   /* the movies have not started */
+        if (idle > 600) {                                  /* ten seconds past the last one: done */
+            fprintf(stderr, "[MOVIE-STATS] on screen: %d frames, %d dark, %d dark flashes (runs of 6 or less), longest dark run %d, "
+                    "%d sudden brightness changes, %d repeated frames\n", shown, dark, dark_blinks, dark_longest, jumps, repeats);
+            if (csv) { fclose(csv); csv = NULL; }
+            for (i = 0; i < 3; i++) { if (ring[i]) ID3D11Texture2D_Release(ring[i]); ring[i] = NULL; }
+            free(prev); prev = NULL;
+            off = 1;
+            return;
+        }
+    }
+    prefix = movie_only ? auto_prefix : getenv("NFL2K5_PRESENT_LUMA");
+    if (FAILED(IDXGISwapChain1_GetBuffer(s_pr.sc, 0, &IID_ID3D11Texture2D, (void **)&bb)))
+        return;
+    ID3D11Texture2D_GetDesc(bb, &td);
+    if (!ring[0] || rw != td.Width || rh != td.Height) {
+        for (i = 0; i < 3; i++) { if (ring[i]) ID3D11Texture2D_Release(ring[i]); ring[i] = NULL; filled[i] = 0; }
+        td.Usage = D3D11_USAGE_STAGING; td.BindFlags = 0; td.CPUAccessFlags = D3D11_CPU_ACCESS_READ; td.MiscFlags = 0;
+        for (i = 0; i < 3; i++) ID3D11Device_CreateTexture2D(s_gpu11.dev, &td, NULL, &ring[i]);
+        rw = td.Width; rh = td.Height;
+        free(prev); prev = NULL;
+    }
+    if (!csv) {
+        char path[512];
+        snprintf(path, sizeof path, "%s.csv", prefix);
+        csv = fopen(path, "w");
+        if (csv) fputs("t_ms,frame,mean,black_pct,hash\n", csv);
+    }
+    frame++;
+    if (ring[slot]) {
+        ID3D11DeviceContext_CopyResource(s_gpu11.ctx, (ID3D11Resource *)ring[slot], (ID3D11Resource *)bb);
+        filled[slot] = 1;
+        stamp[slot] = frame;
+        stamp_draws[slot] = s_gpu11.draws - last_draws;
+        last_draws = s_gpu11.draws;
+    }
+    ID3D11Texture2D_Release(bb);
+    slot = (slot + 1) % 3;
+    if (filled[slot] && ring[slot]) {                    /* the copy from two frames ago */
+        D3D11_MAPPED_SUBRESOURCE m;
+        if (SUCCEEDED(ID3D11DeviceContext_Map(s_gpu11.ctx, (ID3D11Resource *)ring[slot], 0, D3D11_MAP_READ, 0, &m))) {
+            const uint8_t *d = (const uint8_t *)m.pData;
+            uint64_t sum = 0;
+            uint32_t hash = 2166136261u, n = 0, black = 0;
+            UINT x, y;
+            double mean;
+            for (y = rh / 96; y < rh; y += rh / 48) {
+                for (x = rw / 192; x < rw; x += rw / 96) {
+                    const uint8_t *p = d + (size_t)y * m.RowPitch + (size_t)x * 4;
+                    unsigned l = (p[0] + 2u * p[1] + p[2]) / 4u;
+                    sum += l; n++;
+                    if (l < 8) black++;
+                    hash = (hash ^ (p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16)) * 16777619u;
+                }
+            }
+            mean = n ? (double)sum / n : 0.0;
+            if (csv) {
+                LARGE_INTEGER q, f;
+                QueryPerformanceCounter(&q); QueryPerformanceFrequency(&f);
+                fprintf(csv, "%.1f,%u,%.2f,%.1f,%08X,%u,%d\n", (double)q.QuadPart * 1000.0 / (double)f.QuadPart,
+                        stamp[slot], mean, n ? 100.0 * black / n : 0.0, hash, stamp_draws[slot], (int)g_xbox_boot_movie_active);
+                if ((stamp[slot] & 63) == 0) fflush(csv);
+            }
+            shown++;
+            if (n && black * 100u >= n * 90u) {
+                dark++; dark_run++;
+                if (dark_run > dark_longest) dark_longest = dark_run;
+            } else {
+                if (dark_run && dark_run <= 6) dark_blinks++;
+                dark_run = 0;
+            }
+            if (last_mean >= 0.0 && fabs(mean - last_mean) > 12.0) jumps++;
+            if (hash == last_hash) repeats++;
+            last_hash = hash;
+            if (last_mean >= 0.0 && fabs(mean - last_mean) > 12.0 && saved < save_limit) {
+                if (prev) pr_luma_bmp(prefix, prev_frame, prev, prev_pitch, rw, rh);
+                pr_luma_bmp(prefix, stamp[slot], d, m.RowPitch, rw, rh);
+                saved++;
+            }
+            last_mean = mean;
+            if (!prev || prev_pitch != m.RowPitch) { free(prev); prev = (uint8_t *)malloc((size_t)m.RowPitch * rh); prev_pitch = m.RowPitch; }
+            if (prev && saved < save_limit) memcpy(prev, d, (size_t)m.RowPitch * rh);
+            prev_frame = stamp[slot];
+            ID3D11DeviceContext_Unmap(s_gpu11.ctx, (ID3D11Resource *)ring[slot], 0);
+        }
+        filled[slot] = 0;
+    }
+}
+
 /* Video capture: xbox_PresentRecord(seconds) records the presented frames
  * (game, HUD and overlays, half size) for that long into
  * <NFL2K5_REC prefix>-<n>.mp4 through ffmpeg (on PATH, or NFL2K5_FFMPEG).
@@ -1608,6 +2678,9 @@ void xbox_AudioRecordTap(const char *path);   /* apu_xaudio2.c */
  * ffmpeg runs in the background so the game does not wait for it. */
 static void pr_record_mux(const char *ff, const char *video, const char *raw, const char *out)
 {
+#ifndef _WIN32
+    (void)ff; (void)video; (void)raw; (void)out;   /* recording clips: Windows only */
+#else
     char cmd[2048];
     STARTUPINFOA si;
     PROCESS_INFORMATION pi;
@@ -1621,6 +2694,7 @@ static void pr_record_mux(const char *ff, const char *video, const char *raw, co
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
     }
+#endif
 }
 
 void xbox_PresentRecord(int seconds)

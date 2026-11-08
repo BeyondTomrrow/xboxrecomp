@@ -134,8 +134,8 @@ static void gpu_ps_compile(GpuPsEnt *e)
     }
     sh = gpu_vp_srchash(src);
     {   /* in the per-user cache folder (kernel_path.c xbox_user_path) */
-        char rel[64];
-        snprintf(rel, sizeof rel, "cache\\ps\\%016llX.cso", (unsigned long long)sh);
+        char rel[64];       /* per API: DXBC, SPIR-V and DXIL never share a file */
+        snprintf(rel, sizeof rel, "cache\\ps%s\\%016llX.cso", gx_cache_suffix(), (unsigned long long)sh);
         xbox_user_path(rel, path, sizeof path);
     }
     f = fopen(path, "rb");
@@ -163,8 +163,14 @@ static void gpu_ps_compile(GpuPsEnt *e)
         if (err) ID3D10Blob_Release(err);
         code = ID3D10Blob_GetBufferPointer(blob);
         size = ID3D10Blob_GetBufferSize(blob);
-        CreateDirectoryA("cache", NULL);
-        CreateDirectoryA("cache\\ps", NULL);
+        {
+            char dir[MAX_PATH], rel[32];
+            xbox_user_path("cache", dir, sizeof dir);
+            CreateDirectoryA(dir, NULL);
+            snprintf(rel, sizeof rel, "cache\\ps%s", gx_cache_suffix());
+            xbox_user_path(rel, dir, sizeof dir);
+            CreateDirectoryA(dir, NULL);
+        }
         f = fopen(path, "wb");
         if (f) { fwrite(code, 1, size, f); fclose(f); }
     }

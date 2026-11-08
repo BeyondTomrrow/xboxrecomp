@@ -15,6 +15,9 @@
  * 4. Set memory protection (read-only for .rdata)
  */
 
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 #include "xbox_memory_layout.h"
 #include "kernel.h"
 #include "recomp_icall_feedback.h"
@@ -25,9 +28,12 @@
 #endif
 #include <string.h>
 #include <setjmp.h>
+#ifdef __ANDROID__
+#include <sys/resource.h>
+#endif
 #if !defined(_WIN32)
 #include <unistd.h>   /* _exit */
-#if defined(__linux__) && defined(__x86_64__)
+#if defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))
 #include <signal.h>
 #include <sys/mman.h>
 #include <ucontext.h>
@@ -94,6 +100,25 @@ static void *g_mirror_views[XBOX_NUM_MIRRORS] = {0};
  * question. */
 static void *g_span_base = NULL;
 static size_t g_span_size = 0;
+
+/* POSIX: the whole 4 GB guest range is reserved with the RAM view (see
+ * MemoryLayoutInit), so the apertures at fixed offsets above it (contiguous
+ * window 0x80000000, tiled 0xF0000000, NV2A 0xFD000000, MCPX 0xFE800000,
+ * flash 0xFF000000) are ours to place. Before one is mapped, its slice of the
+ * reservation is handed back. Without this they raced the rest of the
+ * process for those addresses: on Android, where libraries crowd the space
+ * next to ours, every one failed (error 8) and the first NV2A access
+ * crashed (2026-10-30). */
+static void span_take(uintptr_t addr, size_t size)
+{
+#ifndef _WIN32
+    uintptr_t s = (uintptr_t)g_span_base;
+    if (g_span_base && addr >= s && addr + size <= s + g_span_size)
+        VirtualFree((LPVOID)addr, size, MEM_RELEASE);
+#else
+    (void)addr; (void)size;
+#endif
+}
 static void *g_tiled_view = NULL;
 
 /* Contiguous / physical memory window (see MemoryLayoutInit).
@@ -461,6 +486,28 @@ BOOL xbox_ac97_handle_posix_signal(int signal_number, int signal_code, uintptr_t
         context->uc_mcontext.gregs[REG_EFL] |= (greg_t)0x100u;
         return TRUE;
     }
+#elif defined(__aarch64__)
+    /* No single-step to borrow here: the store is decoded and performed with
+     * the page briefly writable, then the controller's response applied. */
+    /* Any SIGSEGV code: a Samsung S22+ (Android 14, kernel 5.10) reports a
+     * write to this read-only page as SEGV_MAPERR, not SEGV_ACCERR, and the
+     * game closed at its first AC'97 write (2026-10-30). The address alone
+     * says it is ours. */
+    (void)signal_code;
+    if (g_ac97_page && raw_context && signal_number == SIGSEGV
+            && fault_address >= (uintptr_t)g_ac97_page
+            && fault_address - (uintptr_t)g_ac97_page < AC97_TRAP_BYTES) {
+        extern int xbox_arm64_take_store(void *raw_ctx, uint64_t *ea, uint64_t vals[2], int *size, int *count);
+        uint64_t ea, v[2];
+        int size, count, i;
+        if (!xbox_arm64_take_store(raw_context, &ea, v, &size, &count)) return FALSE;
+        if (mprotect(g_ac97_page, AC97_TRAP_BYTES, PROT_READ | PROT_WRITE) != 0) _exit(3);
+        for (i = 0; i < count; i++)
+            memcpy((void *)(uintptr_t)(ea + (uint64_t)(i * size)), &v[i], (size_t)size);
+        ac97_clear_reset_bits();
+        if (mprotect(g_ac97_page, AC97_TRAP_BYTES, PROT_READ) != 0) _exit(3);
+        return TRUE;
+    }
 #else
     (void)signal_number; (void)signal_code; (void)fault_address; (void)raw_context;
 #endif
@@ -495,7 +542,7 @@ static BOOL ac97_arm_write_trap(void)
         return FALSE;
     }
 #else
-#if defined(__linux__) && defined(__x86_64__)
+#if defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))
     if (!g_ac97_posix_handler_ready || mprotect(g_ac97_page, AC97_TRAP_BYTES, PROT_READ) != 0) {
 #else
     if (1) { /* No verified single-step context implementation for this host. */
@@ -1018,7 +1065,13 @@ static void pb_exec_poll_to(volatile uint32_t *regs, uint32_t put)
 
 static void pb_exec_poll(volatile uint32_t *regs)
 {
-    pb_exec_poll_to(regs, *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT));
+    uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
+#if defined(__aarch64__)
+    /* Another thread's PUT: on ARM the commands below it are not ordered
+     * before it the way x86 orders stores, so read them only after PUT. */
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+#endif
+    pb_exec_poll_to(regs, put);
 }
 
 /* One walker at a time: the title's kickoff (xbox_Nv2aKick) and the
@@ -1067,6 +1120,9 @@ static void pb_profile_sample(LONGLONG ticks)
 
 static DWORD WINAPI pb_exec_thread(LPVOID param)
 {
+#if defined(__linux__)
+    prctl(PR_SET_NAME, "pb_poll", 0, 0, 0);   /* named in the Android [CPU] report */
+#endif
     volatile uint32_t *regs = (volatile uint32_t *)param;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
         /* This poller only exists for titles/submission paths without a
@@ -1125,9 +1181,17 @@ volatile LONG64 g_pb_exec_qpc, g_pb_qwait_qpc, g_pb_capture_qpc;
 
 static DWORD WINAPI pb_async_thread(LPVOID param)
 {
+#if defined(__linux__)
+    prctl(PR_SET_NAME, "gpu_render", 0, 0, 0);   /* named in the Android [CPU] report */
+#endif
     extern void nv2a_pb_exec_linear(const uint32_t *b, uint32_t n);
     (void)param;
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+#ifdef __ANDROID__
+    /* SetThreadPriority only records the value on POSIX. Android lets an app
+     * raise its own threads (who 0 is this thread on Linux). */
+    setpriority(PRIO_PROCESS, 0, -6);
+#endif
     for (;;) {
         PbRec *r;
         LARGE_INTEGER t0 = { 0 }, t1;
@@ -1277,8 +1341,21 @@ void xbox_Nv2aKick(void)
 
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
+#if defined(__linux__)
+    prctl(PR_SET_NAME, "nv2a_ack", 0, 0, 0);   /* named in the Android [CPU] report */
+#endif
     volatile uint32_t *regs = (volatile uint32_t *)param;
+    /* Rest between polls when nothing needed acknowledging (2026-10-29).
+     * Polling with Sleep(0) alone kept a whole CPU core busy for the whole
+     * run; now the loop spins only while the title is touching these
+     * registers and otherwise sleeps ~0.5 ms on a high-resolution timer.
+     * RECOMP_ACK_SPIN=1 restores the old constant spin. */
+    HANDLE rest = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+    const char *spin_env = getenv("RECOMP_ACK_SPIN");
+    int always_spin = spin_env && *spin_env == '1';
+    unsigned quiet = 0;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        int busy = 0;
         {
             volatile uint32_t *pcrtc =
                 (volatile uint32_t *)((char *)regs + NV2A_PCRTC_INTR_0_OFS);
@@ -1287,6 +1364,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             if (*pcrtc) {          /* the handler wrote its ack */
                 *pcrtc = 0;
                 *pmc &= ~NV2A_PMC_INTR_PCRTC;
+                busy = 1;
             }
         }
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
@@ -1294,17 +1372,23 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
             if (*r & NV2A_ACK[i].busy_mask) {
                 *r &= ~NV2A_ACK[i].busy_mask;
+                busy = 1;
             }
         }
         for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_IDLE[i].offset);
             if (pb_async_behind()) {
-                /* RECOMP_GPU_ASYNC: a submission is still being drawn. */
-                if (*r & NV2A_IDLE[i].idle_mask)
+                /* RECOMP_GPU_ASYNC: a submission is still being drawn. Only
+                 * the change of state counts as activity: the render thread
+                 * being behind is a steady state, not a register write. */
+                if (*r & NV2A_IDLE[i].idle_mask) {
                     *r &= ~NV2A_IDLE[i].idle_mask;
+                    busy = 1;
+                }
             } else if ((*r & NV2A_IDLE[i].idle_mask) != NV2A_IDLE[i].idle_mask) {
                 *r |= NV2A_IDLE[i].idle_mask;
+                busy = 1;
             }
         }
         {
@@ -1366,8 +1450,17 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
         *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
                                + g_memory_offset) = GetTickCount();
 
-        Sleep(0);  /* yield; the waiter is spinning on another core */
+        quiet = busy ? 0 : quiet + 1;
+        if (always_spin || !rest || quiet < 64) {
+            Sleep(0);  /* yield; the waiter is spinning on another core */
+        } else {
+            LARGE_INTEGER due;
+            due.QuadPart = -5000;                  /* 0.5 ms, relative, 100 ns units */
+            SetWaitableTimer(rest, &due, 0, NULL, NULL, FALSE);
+            WaitForSingleObject(rest, 2);
+        }
     }
+    if (rest) CloseHandle(rest);
     return 0;
 }
 
@@ -1867,8 +1960,12 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         /* The POSIX shim can release individual slices of a reservation.
          * Windows MEM_RELEASE requires size zero and releases the whole
          * reservation; use the fixed-base views below on Windows. */
-        g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
+        g_span_size = 0x100000000ull;   /* all 32-bit guest addresses: RAM, mirrors and apertures */
         g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
+        if (!g_span_base) {             /* the old, smaller reservation: RAM and mirrors only */
+            g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
+            g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
+        }
         if (g_span_base) {
             VirtualFree(g_span_base, g_memory_size, MEM_RELEASE);
             g_memory_base = MapViewOfFileEx(g_mapping_handle,
@@ -2363,6 +2460,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      */
     {
         uintptr_t contig_native = XBOX_CONTIG_BASE + g_memory_offset;
+        span_take(contig_native, XBOX_CONTIG_SIZE);
         g_contig_mapping = CreateFileMappingW(
             INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
             0, (DWORD)XBOX_CONTIG_SIZE, NULL);
@@ -2408,6 +2506,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      */
     {
         uintptr_t nv2a_native = XBOX_NV2A_BASE + g_memory_offset;
+        span_take(nv2a_native, XBOX_NV2A_SIZE);
         g_nv2a_memory = VirtualAlloc(
             (LPVOID)nv2a_native,
             XBOX_NV2A_SIZE,
@@ -2454,6 +2553,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      */
     {
         uintptr_t mcpx_native = XBOX_MCPX_BASE + g_memory_offset;
+        span_take(mcpx_native, XBOX_MCPX_SIZE);
         g_mcpx_memory = VirtualAlloc(
             (LPVOID)mcpx_native,
             XBOX_MCPX_SIZE,
@@ -2551,6 +2651,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     /* Flash ROM aperture -- see XBOX_FLASH_BASE for why. */
     {
         uintptr_t flash_native = XBOX_FLASH_BASE + g_memory_offset;
+        span_take(flash_native, XBOX_FLASH_SIZE);
 
         g_flash_memory = VirtualAlloc(
             (LPVOID)flash_native,
@@ -2591,8 +2692,9 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * 0x80010000 sits inside it - so just use that storage. */
         g_kernel_memory = g_contig_memory
             ? (void *)kernel_native
-            : VirtualAlloc((LPVOID)kernel_native, KERNEL_PAGE_SIZE,
-                           MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            : (span_take(kernel_native, KERNEL_PAGE_SIZE),
+               VirtualAlloc((LPVOID)kernel_native, KERNEL_PAGE_SIZE,
+                            MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
         if (g_kernel_memory) {
             /* Zero-fill then set e_lfanew = 0x80 (offset to PE header).
              * With the rest zeroed, NumberOfSections = 0 and the INIT
@@ -2656,6 +2758,20 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                         m + 1, (unsigned)XBOX_TILED_BASE);
                 continue;
             }
+            /* Same for the contiguous window, mapped above. With 128 MB of
+             * RAM (mod packs) mirror 16 lands exactly on 0x80000000. On
+             * Windows the view then simply fails; on POSIX the VirtualFree
+             * below unmapped the window first and the mirror took its place,
+             * so contiguous memory aliased guest RAM 0 (over the XBE image)
+             * and the tiled aperture no longer matched it. */
+            if (g_contig_memory &&
+                guest_lo < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE &&
+                (uint64_t)XBOX_CONTIG_BASE < guest_hi) {
+                fprintf(stderr, "  Mirror %d: skipped, overlaps the contiguous"
+                                " window at 0x%08X\n",
+                        m + 1, (unsigned)XBOX_CONTIG_BASE);
+                continue;
+            }
             /* Inside the reservation this hands back the slice we are about
              * to use; outside it (no reservation) this is a no-op on an
              * address we never held. */
@@ -2717,6 +2833,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          */
         if (tiled_size > XBOX_CONTIG_SIZE)
             tiled_size = XBOX_CONTIG_SIZE;
+        span_take(tiled_native, tiled_size);
         g_tiled_view = g_contig_mapping
             ? MapViewOfFileEx(
                 g_contig_mapping,
@@ -2769,6 +2886,20 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         }
     }
 
+#if defined(__ANDROID__)
+    {   /* the guest's 4 GB as mapped now, from 0xF0000000 up (the apertures) */
+        FILE *mf = fopen("/proc/self/maps", "r");
+        char ml[512];
+        uintptr_t lo0 = (uintptr_t)g_memory_offset + 0xF0000000u, hi0 = (uintptr_t)g_memory_offset + 0x100000000ull;
+        while (mf && fgets(ml, sizeof ml, mf)) {
+            unsigned long lo = 0, hi = 0;
+            if (sscanf(ml, "%lx-%lx", &lo, &hi) == 2 && hi > lo0 && lo < hi0)
+                fprintf(stderr, "  [MAPS] guest 0x%08lX-0x%08lX %s", (unsigned long)(lo - (uintptr_t)g_memory_offset),
+                        (unsigned long)(hi - (uintptr_t)g_memory_offset), ml);
+        }
+        if (mf) fclose(mf);
+    }
+#endif
     fprintf(stderr, "xbox_MemoryLayoutInit: complete\n");
     return TRUE;
 }

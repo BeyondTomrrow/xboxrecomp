@@ -16,8 +16,13 @@
 
 #define _GNU_SOURCE   /* FNM_CASEFOLD */
 #include "kernel.h"
+#include "kernel_pack.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+#if defined(_WIN32)
+#include <dbghelp.h>
+#endif
 
 #if !defined(_WIN32)
 #include <fcntl.h>
@@ -114,6 +119,57 @@ static DWORD xbox_share_to_win32(ULONG Share)
     return result;
 }
 
+/* Host paths of open directory handles. A UWP app cannot ask Windows for a
+ * handle's path (GetFinalPathNameByHandleW fails with access denied for every
+ * name type: it needs the folders above LocalState), so save directories
+ * listed as empty and every save failed (2026-10-31). The path the directory
+ * was opened with is kept here instead. */
+#define MAX_DIR_PATHS 128
+static struct { HANDLE h; WCHAR path[MAX_PATH]; } s_dir_paths[MAX_DIR_PATHS];
+static SRWLOCK s_dir_paths_lock = SRWLOCK_INIT;
+
+static void dir_path_remember(HANDLE h, const WCHAR *path)
+{
+    int slot = -1;
+    AcquireSRWLockExclusive(&s_dir_paths_lock);
+    for (int i = 0; i < MAX_DIR_PATHS; i++) {   /* a reused handle value replaces its entry */
+        if (s_dir_paths[i].h == h) { slot = i; break; }
+        if (!s_dir_paths[i].h && slot < 0) slot = i;
+    }
+    if (slot >= 0) {
+        s_dir_paths[slot].h = h;
+        wcsncpy_s(s_dir_paths[slot].path, MAX_PATH, path, _TRUNCATE);
+    }
+    ReleaseSRWLockExclusive(&s_dir_paths_lock);
+}
+
+static void dir_path_forget(HANDLE h)
+{
+    AcquireSRWLockExclusive(&s_dir_paths_lock);
+    for (int i = 0; i < MAX_DIR_PATHS; i++)
+        if (s_dir_paths[i].h == h) s_dir_paths[i].h = NULL;
+    ReleaseSRWLockExclusive(&s_dir_paths_lock);
+}
+
+/* GetFinalPathNameByHandleW, or the remembered path of a directory handle. */
+static DWORD handle_path(HANDLE h, WCHAR *buf, DWORD n, DWORD flags)
+{
+    DWORD used = GetFinalPathNameByHandleW(h, buf, n, flags);
+    if (used && used < n)
+        return used;
+    used = 0;
+    AcquireSRWLockShared(&s_dir_paths_lock);
+    for (int i = 0; i < MAX_DIR_PATHS; i++) {
+        if (s_dir_paths[i].h == h) {
+            size_t len = wcslen(s_dir_paths[i].path);
+            if (len < n) { wcscpy_s(buf, n, s_dir_paths[i].path); used = (DWORD)len; }
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&s_dir_paths_lock);
+    return used;
+}
+
 /* Translate an Xbox OBJECT_ATTRIBUTES path to a Win32 wide path */
 static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
                                WCHAR* win_path, DWORD buf_size)
@@ -124,7 +180,7 @@ static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
     if (ObjectAttributes->RootDirectory && xbox_path[0] != '\\' &&
         !(xbox_path[0] && xbox_path[1] == ':')) {
         /* XDeleteSaveGame opens each child relative to its save directory. */
-        DWORD used = GetFinalPathNameByHandleW(ObjectAttributes->RootDirectory,
+        DWORD used = handle_path(ObjectAttributes->RootDirectory,
             win_path, buf_size, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
         if (!used || used >= buf_size || used + 1 >= buf_size) return FALSE;
         if (win_path[used - 1] != L'\\') win_path[used++] = L'\\';
@@ -193,13 +249,34 @@ NTSTATUS __stdcall xbox_NtCreateFile(
             xbox_share_to_win32(ShareAccess), NULL, OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS, NULL);
     } else {
-        if ((CreateOptions & XBOX_FILE_NO_INTERMEDIATE_BUFFERING) && !xbox_overlay_wants(win_path))
-            flags_and_attrs |= FILE_FLAG_NO_BUFFERING;
+        /* The title opens its data unbuffered, as an Xbox streams from DVD.
+         * Passed on to Windows that bypassed the file cache: every read of the
+         * packed data went to the disk, ~0.5 s each from a USB hard disk, with
+         * the game waiting (2026-10-29). The cache is used now; opens that can
+         * write (saves, the utility-drive cache) write through to the disk so
+         * what the title wrote is still on disk if the process dies.
+         * RECOMP_NO_BUFFERING=1 restores the old flag. */
+        if ((CreateOptions & XBOX_FILE_NO_INTERMEDIATE_BUFFERING) && !xbox_overlay_wants(win_path)) {
+            if (getenv("RECOMP_NO_BUFFERING"))
+                flags_and_attrs |= FILE_FLAG_NO_BUFFERING;
+            else if (xbox_access_to_win32(DesiredAccess) &
+                     (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA | FILE_APPEND_DATA))
+                flags_and_attrs |= FILE_FLAG_WRITE_THROUGH;
+        }
         if (FileAttributes & XBOX_FILE_ATTRIBUTE_READONLY)
             flags_and_attrs |= FILE_ATTRIBUTE_READONLY;
         h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
             xbox_share_to_win32(ShareAccess), NULL,
             xbox_disposition_to_win32(CreateDisposition), flags_and_attrs, NULL);
+        /* The data folder packed into one .xbpak (kernel_pack.c): a file that
+         * is not on disk is read from the pack, when it holds it. */
+        if (h == INVALID_HANDLE_VALUE && xbox_pack_active() &&
+            (CreateDisposition == XBOX_FILE_OPEN || CreateDisposition == XBOX_FILE_OPEN_IF)) {
+            DWORD err = GetLastError();
+            HANDLE ph = xbox_pack_open(win_path);
+            if (ph != INVALID_HANDLE_VALUE) h = ph;
+            else SetLastError(err);
+        }
     }
 
     if (h == INVALID_HANDLE_VALUE) {
@@ -231,12 +308,108 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     *FileHandle = h;
     if (!(CreateOptions & XBOX_FILE_DIRECTORY_FILE))
         xbox_overlay_attach(h, win_path);
+    else
+        dir_path_remember(h, win_path);
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_SUCCESS;
         IoStatusBlock->Information = (CreateDisposition == XBOX_FILE_CREATE) ? 2 : 1;
     }
     XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile: %S -> handle=%p", win_path, h);
     return STATUS_SUCCESS;
+}
+
+/* ---- warming the file cache (2026-10-29) ----------------------------------
+ * The title reads its packed data (vc_53450030\0..G, ~6 GB) in small pieces
+ * at random places during play. From a USB hard disk one 20 KB read took up
+ * to 0.76 s, and the game thread waited for it: a frozen frame mid-play.
+ * This thread reads those files once, front to back, at background I/O
+ * priority, so Windows keeps them in its file cache and play reads come from
+ * RAM. Only when free memory is ample (twice the data plus 4 GB); on an SSD
+ * it finishes in seconds. NFL2K5_NO_PREFETCH=1 turns it off. */
+static wchar_t s_prefetch_root[MAX_PATH];
+
+static ULONGLONG prefetch_dir(const wchar_t *dir, int read, void *buf, size_t cap)
+{
+    wchar_t pat[MAX_PATH + 4];
+    WIN32_FIND_DATAW fd;
+    HANDLE f;
+    ULONGLONG total = 0;
+    _snwprintf(pat, MAX_PATH + 3, L"%s\\*", dir);
+    f = FindFirstFileW(pat, &fd);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    do {
+        wchar_t path[MAX_PATH];
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        total += ((ULONGLONG)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+        if (!read) continue;
+        _snwprintf(path, MAX_PATH - 1, L"%s\\%s", dir, fd.cFileName);
+        path[MAX_PATH - 1] = 0;
+        {
+            /* No FILE_FLAG_SEQUENTIAL_SCAN: it tells the cache the data will not
+             * be read again, and the pages were the first to be reused. */
+            HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+            FILE_IO_PRIORITY_HINT_INFO hint;
+            DWORD got;
+            if (h == INVALID_HANDLE_VALUE) continue;
+            hint.PriorityHint = IoPriorityHintLow;      /* the game's own reads go first */
+            SetFileInformationByHandle(h, FileIoPriorityHintInfo, &hint, sizeof hint);
+            while (ReadFile(h, buf, (DWORD)cap, &got, NULL) && got) {}
+            CloseHandle(h);
+        }
+    } while (FindNextFileW(f, &fd));
+    FindClose(f);
+    return total;
+}
+
+static DWORD WINAPI prefetch_thread(LPVOID arg)
+{
+    static const wchar_t *const dirs[] = { L"vc_53450030", L"CACHE", L"" };
+    MEMORYSTATUSEX ms;
+    ULONGLONG need = 0;
+    size_t i, cap = 4u << 20;
+    void *buf;
+    DWORD t0 = GetTickCount();
+    (void)arg;
+    for (i = 0; i < sizeof dirs / sizeof dirs[0]; i++) {
+        wchar_t d[MAX_PATH];
+        _snwprintf(d, MAX_PATH - 1, dirs[i][0] ? L"%s\\%s" : L"%s%s", s_prefetch_root, dirs[i]);
+        d[MAX_PATH - 1] = 0;
+        need += prefetch_dir(d, 0, NULL, 0);
+    }
+    memset(&ms, 0, sizeof ms);
+    ms.dwLength = sizeof ms;
+    if (!GlobalMemoryStatusEx(&ms) || ms.ullAvailPhys < need * 2 + (4ull << 30)) {
+        fprintf(stderr, "  [PREFETCH] skipped: %llu MB of data, %llu MB free\n",
+                need >> 20, ms.ullAvailPhys >> 20);
+        return 0;
+    }
+    buf = VirtualAlloc(NULL, cap, MEM_COMMIT, PAGE_READWRITE);
+    if (!buf) return 0;
+    /* Not THREAD_MODE_BACKGROUND_BEGIN: besides low I/O priority it gives the
+     * pages read the lowest memory priority, and Windows dropped them from its
+     * cache first (0.5 s misses after the warm-up, 2026-10-29). Low I/O
+     * priority is set per handle above instead. */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    for (i = 0; i < sizeof dirs / sizeof dirs[0]; i++) {
+        wchar_t d[MAX_PATH];
+        _snwprintf(d, MAX_PATH - 1, dirs[i][0] ? L"%s\\%s" : L"%s%s", s_prefetch_root, dirs[i]);
+        d[MAX_PATH - 1] = 0;
+        prefetch_dir(d, 1, buf, cap);
+    }
+    VirtualFree(buf, 0, MEM_RELEASE);
+    fprintf(stderr, "  [PREFETCH] %llu MB of game data cached in %lu s\n", need >> 20, (GetTickCount() - t0) / 1000);
+    return 0;
+}
+
+void xbox_PrefetchGameData(const char *root)
+{
+    const char *off = getenv("NFL2K5_NO_PREFETCH");
+    HANDLE t;
+    if (!root || (off && *off == '1')) return;
+    MultiByteToWideChar(CP_UTF8, 0, root, -1, s_prefetch_root, MAX_PATH);
+    t = CreateThread(NULL, 0, prefetch_thread, NULL, 0, NULL);
+    if (t) CloseHandle(t);
 }
 
 /* Time and bytes spent in guest file reads (frame statistics: the hitch log
@@ -261,6 +434,18 @@ NTSTATUS __stdcall xbox_NtReadFile(
     InterlockedAdd64(&g_xbox_read_qpc, b.QuadPart - a.QuadPart);
     InterlockedAdd64(&g_xbox_read_bytes, Length);
     InterlockedIncrement64(&g_xbox_read_count);
+    {   /* name the reads that stall a frame (first 40 over 30 ms) */
+        static LARGE_INTEGER fq;
+        static volatile LONG told;
+        if (!fq.QuadPart) QueryPerformanceFrequency(&fq);
+        if ((b.QuadPart - a.QuadPart) * 1000 / fq.QuadPart > 30 && InterlockedIncrement(&told) <= 40) {
+            wchar_t name[MAX_PATH];
+            DWORD n = GetFinalPathNameByHandleW(FileHandle, name, MAX_PATH, 0);
+            fprintf(stderr, "  [SLOWREAD] %lld ms, %lu bytes at %lld: %ls\n",
+                    (long long)((b.QuadPart - a.QuadPart) * 1000 / fq.QuadPart), (unsigned long)Length,
+                    ByteOffset ? (long long)ByteOffset->QuadPart : -1LL, n && n < MAX_PATH ? name : L"?");
+        }
+    }
     return st;
 }
 
@@ -280,6 +465,16 @@ static NTSTATUS xbox_NtReadFile_impl(
     {
         ULONG got;
         if (xbox_overlay_read(FileHandle, Buffer, Length, ByteOffset, &got)) {
+            IoStatusBlock->Information = got;
+            if (got == 0 && Length > 0) {
+                IoStatusBlock->Status = STATUS_END_OF_FILE;
+                return STATUS_END_OF_FILE;
+            }
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            if (Event) SetEvent(Event);
+            return STATUS_SUCCESS;
+        }
+        if (xbox_pack_read(FileHandle, Buffer, Length, ByteOffset, &got)) {
             IoStatusBlock->Information = got;
             if (got == 0 && Length > 0) {
                 IoStatusBlock->Status = STATUS_END_OF_FILE;
@@ -362,6 +557,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
         xbox_release_dir_context(Handle);
         xbox_overlay_detach(Handle);
+        xbox_pack_close(Handle);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
@@ -413,6 +609,8 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
             info->AllocationSize.QuadPart = ((LONGLONG)fi.nFileSizeHigh << 32) | fi.nFileSizeLow;
             info->AllocationSize.QuadPart = (info->AllocationSize.QuadPart + 4095) & ~4095LL;
             info->EndOfFile.QuadPart = ((LONGLONG)fi.nFileSizeHigh << 32) | fi.nFileSizeLow;
+            if (xbox_pack_size(FileHandle, &info->EndOfFile.QuadPart))
+                info->AllocationSize.QuadPart = (info->EndOfFile.QuadPart + 4095) & ~4095LL;
             if (xbox_overlay_size(FileHandle, &info->EndOfFile.QuadPart))
                 info->AllocationSize.QuadPart = (info->EndOfFile.QuadPart + 4095) & ~4095LL;
             info->NumberOfLinks = fi.nNumberOfLinks;
@@ -446,6 +644,7 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
             info->LastWriteTime.HighPart  = fi.ftLastWriteTime.dwHighDateTime;
             info->ChangeTime = info->LastWriteTime;
             info->EndOfFile.QuadPart = ((LONGLONG)fi.nFileSizeHigh << 32) | fi.nFileSizeLow;
+            xbox_pack_size(FileHandle, &info->EndOfFile.QuadPart);
             xbox_overlay_size(FileHandle, &info->EndOfFile.QuadPart);
             info->AllocationSize.QuadPart = (info->EndOfFile.QuadPart + 4095) & ~4095LL;
             info->FileAttributes = fi.dwFileAttributes;
@@ -558,19 +757,85 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
     }
 }
 
+/* Free space as a title sees it: the host volume the handle lives on.
+ *
+ * The handle is what the title opened for the query (XAPI's GetDiskFreeSpaceEx
+ * opens the drive root, e.g. U:\, with FILE_OPEN_FOR_FREE_SPACE_QUERY), so
+ * its own volume is the right one: saves can live on a different drive from
+ * the working directory (NFL2K5_ROOT). The working directory is only the
+ * fallback.
+ *
+ * Clamped to XBOX_FREE_BYTES_MAX. Xbox titles were written for an 8 GB disk
+ * and do their own arithmetic on the result: NFL 2K5 divides the 64-bit byte
+ * count by its 16 KB block and then keeps only the low 32 bits as a signed
+ * int, and other code linked into titles (CRI's cvFsGetFreeSize, dashboard
+ * helpers) works in 32-bit bytes. Keeping the byte count below 2^31 is safe
+ * for every one of those, and 2 GB is still 131,071 blocks -- the game shows
+ * anything over 50,000 as "50000+ blocks" and its largest save is ~100.
+ *
+ * RECOMP_FREE_SPACE_MB=<n> overrides the host value (testing a full disk). */
+#include <stdlib.h>   /* getenv, strtoul */
+#define XBOX_FREE_BYTES_MAX 0x7FFFC000ull   /* 2 GB - one 16 KB cluster */
+static BOOL host_volume_space(HANDLE h, ULONGLONG *free_out, ULONGLONG *total_out)
+{
+    ULARGE_INTEGER avail, total, total_free;
+    WCHAR path[MAX_PATH + 8];
+    const char *fake = getenv("RECOMP_FREE_SPACE_MB");
+    BOOL ok = FALSE;
+    DWORD n = 0;
+
+    if (h && h != INVALID_HANDLE_VALUE)
+        n = handle_path(h, path, MAX_PATH,
+                                      FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (n && n < MAX_PATH) {
+        if (path[n - 1] != L'\\' && n + 1 < MAX_PATH) { path[n++] = L'\\'; path[n] = 0; }
+        ok = GetDiskFreeSpaceExW(path, &avail, &total, &total_free);
+        if (!ok) {   /* a file handle: ask for its directory */
+            WCHAR *slash;
+            path[n - 1] = 0;
+            slash = wcsrchr(path, L'\\');
+            if (slash) { slash[1] = 0; ok = GetDiskFreeSpaceExW(path, &avail, &total, &total_free); }
+        }
+    }
+    if (!ok)
+        ok = GetDiskFreeSpaceExW(NULL, &avail, &total, &total_free);
+    if (!ok)
+        return FALSE;
+    *free_out = avail.QuadPart;
+    *total_out = total.QuadPart;
+    if (fake && *fake)
+        *free_out = (ULONGLONG)strtoul(fake, NULL, 10) * 1024ull * 1024ull;
+    if (*free_out > XBOX_FREE_BYTES_MAX)
+        *free_out = XBOX_FREE_BYTES_MAX;
+    if (*total_out > XBOX_FREE_BYTES_MAX)
+        *total_out = XBOX_FREE_BYTES_MAX;
+    if (*total_out < *free_out)
+        *total_out = *free_out;
+    return TRUE;
+}
+
 NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FsInformation, ULONG Length, XBOX_FS_INFORMATION_CLASS FsInformationClass)
 {
-    (void)FileHandle; (void)Length;
+    (void)Length;
     if (!IoStatusBlock || !FsInformation)
         return STATUS_INVALID_PARAMETER;
 
     switch (FsInformationClass) {
         case XboxFileFsSizeInformation: {
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
-            ULARGE_INTEGER free_bytes, total_bytes, total_free;
-            if (GetDiskFreeSpaceExW(NULL, &free_bytes, &total_bytes, &total_free)) {
+            ULONGLONG free_q, total_q;
+            if (host_volume_space(FileHandle, &free_q, &total_q)) {
+                ULARGE_INTEGER free_bytes, total_bytes;
+                static int logged;
+                free_bytes.QuadPart = free_q;
+                total_bytes.QuadPart = total_q;
+                if (logged++ < 4) {
+                    fprintf(stderr, "  [FILE] volume free space: %llu MB reported (%llu blocks)\n",
+                            free_q >> 20, free_q / (XBOX_BYTES_PER_SECTOR * XBOX_SECTORS_PER_CLUSTER));
+                    fflush(stderr);
+                }
                 info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
                 info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
@@ -579,8 +844,10 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
             } else {
                 info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
                 info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
-                info->TotalAllocationUnits.QuadPart = 1048576;
-                info->AvailableAllocationUnits.QuadPart = 524288;
+                /* the clamp, not 8 GB: see XBOX_FREE_BYTES_MAX */
+                info->TotalAllocationUnits.QuadPart =
+                    XBOX_FREE_BYTES_MAX / (XBOX_BYTES_PER_SECTOR * XBOX_SECTORS_PER_CLUSTER);
+                info->AvailableAllocationUnits.QuadPart = info->TotalAllocationUnits.QuadPart;
             }
             IoStatusBlock->Status = STATUS_SUCCESS;
             IoStatusBlock->Information = sizeof(XBOX_FILE_FS_SIZE_INFORMATION);
@@ -617,9 +884,18 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
 
     if (!GetFileAttributesExW(win_path, GetFileExInfoStandard, &fad)) {
         DWORD err = GetLastError();
-        if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)
+        LONGLONG psize;
+        if (xbox_pack_path_size(win_path, &psize)) {
+            /* in the data pack (kernel_pack.c) */
+            memset(&fad, 0, sizeof fad);
+            fad.dwFileAttributes = FILE_ATTRIBUTE_READONLY;
+            fad.nFileSizeHigh = (DWORD)((ULONGLONG)psize >> 32);
+            fad.nFileSizeLow = (DWORD)psize;
+        } else if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
             return STATUS_OBJECT_NAME_NOT_FOUND;
-        return STATUS_UNSUCCESSFUL;
+        } else {
+            return STATUS_UNSUCCESSFUL;
+        }
     }
 
     FileInformation->CreationTime.LowPart    = fad.ftCreationTime.dwLowDateTime;
@@ -657,6 +933,7 @@ static BOOL s_dir_cs_init = FALSE;
  * reuses: a later directory could continue another one's listing. */
 void xbox_release_dir_context(HANDLE FileHandle)
 {
+    dir_path_forget(FileHandle);
     if (!s_dir_cs_init || !FileHandle) return;
     EnterCriticalSection(&s_dir_cs);
     for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
@@ -723,9 +1000,10 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         }
         WCHAR search_path[MAX_PATH];
         WCHAR dir_path[MAX_PATH];
-        DWORD path_len = GetFinalPathNameByHandleW(FileHandle, dir_path, MAX_PATH,
+        DWORD path_len = handle_path(FileHandle, dir_path, MAX_PATH,
                                                    FILE_NAME_NORMALIZED);
         if (path_len == 0 || path_len >= MAX_PATH) {
+            fprintf(stderr, "  [FILE] directory listing: no path for handle %p (err %lu)\n", FileHandle, GetLastError());
             IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
             return STATUS_UNSUCCESSFUL;
         }
@@ -742,6 +1020,26 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
             swprintf_s(search_path, MAX_PATH, L"%s\\*", clean_path);
         }
         ctx->find_handle = FindFirstFileW(search_path, &ctx->find_data);
+        {   /* NFL2K5_DIRTRACE=1 (study): which recompiled functions list a directory */
+            static int on = -1, n;
+            if (on < 0) on = getenv("NFL2K5_DIRTRACE") != NULL;
+            if (on && n < 30) {
+                void *frames[24];
+                USHORT k, got = CaptureStackBackTrace(0, 24, frames, NULL);
+                char storage[sizeof(SYMBOL_INFO) + 128];
+                SYMBOL_INFO *sym = (SYMBOL_INFO *)storage;
+                n++;
+                fprintf(stderr, "[DIRTRACE] %ls:", search_path);
+                for (k = 1; k < got; k++) {
+                    DWORD64 disp = 0;
+                    memset(storage, 0, sizeof storage);
+                    sym->SizeOfStruct = sizeof(SYMBOL_INFO); sym->MaxNameLen = 127;
+                    if (SymFromAddr(GetCurrentProcess(), (DWORD64)(uintptr_t)frames[k], &disp, sym))
+                        fprintf(stderr, " %s", sym->Name);
+                }
+                fprintf(stderr, "\n");
+            }
+        }
         if (ctx->find_handle == INVALID_HANDLE_VALUE) {
             ctx->find_handle = NULL;
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
@@ -776,6 +1074,11 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     int name_len = WideCharToMultiByte(CP_ACP, 0, ctx->find_data.cFileName, -1,
                                        filename_ansi, MAX_PATH, NULL, NULL);
     if (name_len > 0) name_len--;
+    {
+        static int on = -1;
+        if (on < 0) on = getenv("NFL2K5_DIRTRACE") != NULL;
+        if (on) fprintf(stderr, "[DIRTRACE] entry %s\n", filename_ansi);
+    }
 
     entry->NextEntryOffset = 0;
     entry->FileIndex = 0;
@@ -802,7 +1105,20 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
 
 /* ======================================================================== */
 #else /* !_WIN32 */
+/* Windows reads the game data into the file cache at start (above); here
+ * the kernel's own read-ahead does. */
+void xbox_PrefetchGameData(const char *root) { (void)root; }
+volatile LONG64 g_xbox_read_qpc, g_xbox_read_bytes, g_xbox_read_count;   /* the hitch log's disc reads */
+
 /* ====================  POSIX backend  =================================== */
+
+/* Mod pack disc overlays (kernel_overlay.c, POSIX half). */
+int  xbox_overlay_load(const char *dir, const char *disc);
+void xbox_overlay_attach_path(HANDLE h, const char *host_path);
+void xbox_overlay_detach(HANDLE h);
+int  xbox_overlay_read(HANDLE h, void *buf, ULONG len, const LARGE_INTEGER *off, ULONG *got);
+int  xbox_overlay_size(HANDLE h, LONGLONG *size);
+int  xbox_overlay_path_size_a(const char *host_path, LONGLONG *size);
 /* ======================================================================== */
 
 /* Convert Xbox access mask + disposition to POSIX open() flags. */
@@ -916,6 +1232,8 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     }
 
     *FileHandle = w32_open_handle(fd, host_path);
+    if (!(CreateOptions & XBOX_FILE_DIRECTORY_FILE))
+        xbox_overlay_attach_path(*FileHandle, host_path);
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_SUCCESS;
         IoStatusBlock->Information = (CreateDisposition == XBOX_FILE_CREATE) ? 2 : 1;
@@ -932,6 +1250,20 @@ NTSTATUS __stdcall xbox_NtReadFile(
     (void)ApcRoutine; (void)ApcContext;
     if (!IoStatusBlock)
         return STATUS_INVALID_PARAMETER;
+
+    {
+        ULONG got;
+        if (xbox_overlay_read(FileHandle, Buffer, Length, ByteOffset, &got)) {
+            IoStatusBlock->Information = got;
+            if (got == 0 && Length > 0) {
+                IoStatusBlock->Status = STATUS_END_OF_FILE;
+                return STATUS_END_OF_FILE;
+            }
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            if (Event) SetEvent(Event);
+            return STATUS_SUCCESS;
+        }
+    }
 
     int fd = w32_handle_fd(FileHandle);
     if (fd < 0) {
@@ -996,6 +1328,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
+        xbox_overlay_detach(Handle);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
@@ -1047,7 +1380,8 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
         case XboxFileStandardInformation: {
             PXBOX_FILE_STANDARD_INFORMATION info = (PXBOX_FILE_STANDARD_INFORMATION)FileInformation;
             info->EndOfFile.QuadPart = st.st_size;
-            info->AllocationSize.QuadPart = (st.st_size + 4095) & ~4095LL;
+            xbox_overlay_size(FileHandle, &info->EndOfFile.QuadPart);
+            info->AllocationSize.QuadPart = (info->EndOfFile.QuadPart + 4095) & ~4095LL;
             info->NumberOfLinks = (ULONG)st.st_nlink;
             info->DeletePending = FALSE;
             info->Directory = S_ISDIR(st.st_mode) ? TRUE : FALSE;
@@ -1071,7 +1405,8 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
             unix_to_filetime(st.st_mtime, 0, &info->LastWriteTime);
             info->ChangeTime = info->LastWriteTime;
             info->EndOfFile.QuadPart = st.st_size;
-            info->AllocationSize.QuadPart = (st.st_size + 4095) & ~4095LL;
+            xbox_overlay_size(FileHandle, &info->EndOfFile.QuadPart);
+            info->AllocationSize.QuadPart = (info->EndOfFile.QuadPart + 4095) & ~4095LL;
             info->FileAttributes = mode_to_xbox_attrs(st.st_mode);
             IoStatusBlock->Status = STATUS_SUCCESS;
             IoStatusBlock->Information = sizeof(XBOX_FILE_NETWORK_OPEN_INFORMATION);
@@ -1208,7 +1543,8 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
     unix_to_filetime(st.st_mtime, 0, &FileInformation->LastWriteTime);
     FileInformation->ChangeTime = FileInformation->LastWriteTime;
     FileInformation->EndOfFile.QuadPart = st.st_size;
-    FileInformation->AllocationSize.QuadPart = (st.st_size + 4095) & ~4095LL;
+    xbox_overlay_path_size_a(host_path, &FileInformation->EndOfFile.QuadPart);
+    FileInformation->AllocationSize.QuadPart = (FileInformation->EndOfFile.QuadPart + 4095) & ~4095LL;
     FileInformation->FileAttributes = mode_to_xbox_attrs(st.st_mode);
     return STATUS_SUCCESS;
 }

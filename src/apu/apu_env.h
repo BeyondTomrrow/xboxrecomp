@@ -16,6 +16,9 @@
 #endif
 #include <stdlib.h>
 #include <stdint.h>
+#if defined(_MSC_VER) && !defined(__clang__) && !defined(__sync_synchronize)
+#define __sync_synchronize() MemoryBarrier()   /* GCC builtin; MSVC has none */
+#endif
 
 static const char *apu_env_cached(const char *name)
 {
