@@ -18,6 +18,7 @@
 #include <string.h>
 #include <SDL3/SDL.h>
 #include <stdarg.h>
+#include <unistd.h>   /* access: RECOMP_SDLGPU_TOGGLE_DIR */
 
 #define SG_MAX_SURFACES 8
 
@@ -40,9 +41,31 @@ typedef struct {
     SDL_GPUTexture *depth;
     int depth_ready; /* depth/stencil hold data (else clear before use) */
     uint32_t last_use; /* s_sg.tick when last bound, for eviction */
+    /* Internal resolution: color/depth are (w*k) x (h*k). Guest RAM is
+     * always 1x, so copies to and from it go through `low`, a w x h
+     * texture, with a scaling blit on the GPU (sgdocs: surface.inc.c). */
+    uint32_t k;
+    SDL_GPUTexture *low;
+    /* What the last download wrote to guest RAM, rows packed. While guest
+     * RAM still matches it, the GPU copy is current too (nothing drew on
+     * the GPU since, or owner would be GPU), so a GPU draw needs no upload.
+     * Render-to-texture downloads every frame; without this each one was
+     * followed by a full re-upload, which at k > 1 also threw away the
+     * high-resolution image for a stretched 1x one. */
+    uint8_t *shadow;
+    int shadow_valid;
+    /* Render-to-texture without a guest-RAM round trip. `rtt` is a 1x
+     * R8G8B8A8 copy of the rendered colour (SDL blit converts from the
+     * target's B8G8R8A8 and downscales k>1), sampled directly when the
+     * title reads this surface as a texture. `version` counts content
+     * changes; rtt is refreshed when it lags. See sg_surface_rtt(). */
+    SDL_GPUTexture *rtt;
+    uint32_t version;
+    uint32_t rtt_version;
 } SgSurface;
 
-#define SG_MAX_PIPELINES 1024
+#define SG_MAX_PIPELINES 4096   /* fragment variants multiply states */
+#define SG_PIPE_HASH     8192   /* power of two, > SG_MAX_PIPELINES */
 
 /* XfVert z and the depth clear value are in Z24 units: s_zbuf holds
  * 0..2^24-1 (zbuf_clear_bits). The GPU stores z / SG_DEPTH_MAX. */
@@ -73,6 +96,7 @@ typedef struct {
     uint32_t stencil; /* test, compare, fail/zfail/pass ops */
     uint32_t masks; /* stencil compare mask, write mask */
     uint32_t vs;
+    uint32_t fs;    /* fragment variant slot + 1 (sdlgpu_fscache.inc.c), 0 = generic */
 } SgPipeKey;
 
 typedef struct {
@@ -84,6 +108,7 @@ typedef struct {
 static struct {
     int tried; /* device creation attempted */
     SDL_GPUDevice *dev;
+    SDL_GPUShaderFormat shader_format; /* SPIRV, or MSL via SPIRV-Cross */
     SDL_GPUTextureFormat depth_format;
     SgSurface surf[SG_MAX_SURFACES];
     uint32_t tick;
@@ -100,12 +125,14 @@ static struct {
     SDL_GPUShader *xf_vs, *xf_fs;
     SgPipeline pipes[SG_MAX_PIPELINES];
     int pipe_count;
+    uint16_t pipe_hash[SG_PIPE_HASH]; /* index + 1 into pipes, open addressing */
     SDL_GPUBuffer *vertices;
     uint32_t vertices_size;
     SDL_GPUBuffer         *indices;      /* index data of the flush being drawn */
     uint32_t               indices_size;
     SDL_GPUSampler *point; /* texelFetch ignores it; SDL needs a pair */
     SDL_GPUTexture *white; /* bound when a batch has no texture */
+    SDL_GPUTexture *white_cube; /* ...and in cube slots of stages without a cube map */
 } s_sg;
 
 
@@ -121,8 +148,8 @@ typedef struct {
     SDL_GPUGraphicsPipeline *pipe;
     uint32_t vertex_offset;
     uint32_t vertex_count;
-    SDL_GPUTexture *tex[4];
-    SDL_GPUSampler *sampler[4];
+    SDL_GPUTexture *tex[8];       /* 3D: 0..3 2D stages, 4..7 the same stages as cubes */
+    SDL_GPUSampler *sampler[8];
     int tex_count;
     SDL_Rect scissor;
     SDL_FColor blend_constant;
@@ -137,6 +164,7 @@ typedef struct {
 typedef struct {
     SDL_GPUTexture *tex;
     uint32_t w, h;
+    uint32_t layers; /* 6 for a cube map: one w x h face after another */
     uint32_t offset; /* into the queue's texture data */
 } SgQueuedUpload;
 
@@ -235,6 +263,13 @@ static int sg_wanted(void) {
     return wanted;
 }
 
+/* RECOMP_SDLGPU_TOGGLE_DIR: A/B switches while the game runs. The presenter
+ * checks the directory twice a second; a file named `novp` keeps vertex
+ * programs on the CPU, `nospec` uses the generic fragment shader. */
+static volatile int s_sg_toggle_novp, s_sg_toggle_nospec, s_sg_toggle_no3d, s_sg_toggle_nomip, s_sg_toggle_nofloor;
+
+#include "sdlgpu_msl.inc.c"
+
 /* Lazily create the device once the game window exists. SDL's video
  * subsystem is started by the window thread, and SDL_WasInit() already
  * reports it while that start-up is still running: a device requested then
@@ -246,11 +281,23 @@ static int sg_ready(void) {
     if (!sg_wanted() || s_sg.tried || !xbox_FramebufferWindowHwnd())
         return 0;
     s_sg.tried = 1;
-    s_sg.dev = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_SPIRV,
+    s_sg.dev = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_SPIRV
+#ifdef SG_HAVE_SPIRV_CROSS
+                                   | SDL_GPU_SHADERFORMAT_MSL
+#endif
+                                   ,
                                getenv("RECOMP_SDLGPU_DEBUG") != NULL,   // <- remove for release
                                NULL);
     if (!s_sg.dev) {
         fprintf(stderr, "  [SDLGPU] no GPU device (%s); software rendering\n", SDL_GetError());
+        return 0;
+    }
+    s_sg.shader_format = sg_pick_shader_format(s_sg.dev);
+    if (!s_sg.shader_format) {
+        fprintf(stderr, "  [SDLGPU] %s takes no shader format this build can make; software rendering\n",
+                SDL_GetGPUDeviceDriver(s_sg.dev));
+        SDL_DestroyGPUDevice(s_sg.dev);
+        s_sg.dev = NULL;
         return 0;
     }
     /* 32-bit float depth keeps the software path's float comparisons
@@ -273,6 +320,7 @@ static int sg_ready(void) {
 #include "sdlgpu_draw.inc.c"
 #include "sdlgpu_present.inc.c"
 #include "sdlgpu_xf.inc.c"
+#include "sdlgpu_fscache.inc.c"
 
 
 static void sg_cpu_access(void) {
@@ -289,7 +337,7 @@ static int sg_draw_batch(int flat2d) {
         static int no3d = -1;
         if (no3d < 0)
             no3d = getenv("RECOMP_SDLGPU_NO3D") != NULL;
-        if (no3d)
+        if (no3d || s_sg_toggle_no3d)
             return sg_fallback(SG_FB_DISABLED, 1);
         return sg_ready() && sg_draw_xf();
     }

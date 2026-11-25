@@ -11,12 +11,18 @@
 #include <sys/uio.h>
 #include <unistd.h>
 #include <string.h>
+#elif defined(__APPLE__)
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #else
-#error "Checked guest-memory copies require Windows or Linux"
+#error "Checked guest-memory copies require Windows, Linux or macOS"
 #endif
 
 
-#if !defined(_WIN32)
+#if defined(__linux__)
 /* getpid() is a system call; the process never forks, so ask once. */
 static pid_t self_pid(void)
 {
@@ -25,6 +31,10 @@ static pid_t self_pid(void)
         pid = getpid();
     return pid;
 }
+#endif
+
+#if defined(__APPLE__)
+static bool range_has_prot_rw(uintptr_t start, uintptr_t end);
 #endif
 
 static bool copy_bounds(uintptr_t base, uint64_t address, const void *buffer,
@@ -54,10 +64,21 @@ bool xbox_guest_memory_read(uintptr_t base, uint64_t address, void *destination,
         memcpy(destination, (const void *)host, size);
         return true;
     }
+#if defined(__APPLE__)
+    /* Mach's checked copy: an unmapped or unreadable page fails the call
+     * with KERN_INVALID_ADDRESS / KERN_PROTECTION_FAILURE instead of
+     * faulting, the same contract process_vm_readv gives on Linux. */
+    mach_vm_size_t copied = 0;
+    kern_return_t kr = mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)host,
+                                              (mach_vm_size_t)size,
+                                              (mach_vm_address_t)(uintptr_t)destination, &copied);
+    return kr == KERN_SUCCESS && copied == size;
+#else
     struct iovec local = {destination,size};
     struct iovec remote = {(void *)host,size};
     ssize_t copied = process_vm_readv(self_pid(),&local,1,&remote,1,0);
     return copied >= 0 && (size_t)copied == size;
+#endif
 #endif
 }
 
@@ -75,10 +96,22 @@ bool xbox_guest_memory_write(uintptr_t base, uint64_t address, const void *sourc
         memcpy((void *)host, source, size);
         return true;
     }
+#if defined(__APPLE__)
+    /* Not direct (a device aperture, or a page not known writable): ask
+     * the VM map, then copy. Same refusal as process_vm_writev for a
+     * missing or read-only page. */
+    {
+        if (!range_has_prot_rw(host, host + size))
+            return false;
+        memcpy((void *)host, source, size);
+        return true;
+    }
+#else
     struct iovec local = {(void *)source,size};
     struct iovec remote = {(void *)host,size};
     ssize_t copied = process_vm_writev(self_pid(),&local,1,&remote,1,0);
     return copied >= 0 && (size_t)copied == size;
+#endif
 #endif
 }
 
@@ -169,7 +202,54 @@ static bool range_readable(uintptr_t start, uintptr_t end, size_t page)
 }
 #endif
 
-#if defined(__linux__)
+#if defined(__APPLE__)
+#include <stdatomic.h>
+
+static atomic_uint s_protection_generation = 1;
+
+/* Is every byte of [start, end) mapped with at least `need` protection?
+ * mach_vm_region returns the region at or after `at`; a region starting
+ * past `at` means a hole. Regions are walked, not pages, so a 64 MB guest
+ * span is a handful of calls. */
+static bool range_has_prot(uintptr_t start, uintptr_t end, vm_prot_t need)
+{
+    mach_vm_address_t at = start;
+    while (at < end) {
+        mach_vm_address_t addr = at;
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t object = MACH_PORT_NULL;
+        if (mach_vm_region(mach_task_self(), &addr, &size, VM_REGION_BASIC_INFO_64,
+                           (vm_region_info_t)&info, &count, &object) != KERN_SUCCESS)
+            return false;
+        if (object != MACH_PORT_NULL)
+            mach_port_deallocate(mach_task_self(), object);
+        if (addr > at || (info.protection & need) != need)
+            return false;
+        at = addr + size;
+    }
+    return true;
+}
+
+static bool range_readable(uintptr_t start, uintptr_t end, size_t page)
+{
+    (void)page;
+    return range_has_prot(start, end, VM_PROT_READ);
+}
+
+static bool range_writable(uintptr_t start, uintptr_t end)
+{
+    return range_has_prot(start, end, VM_PROT_READ | VM_PROT_WRITE);
+}
+
+static bool range_has_prot_rw(uintptr_t start, uintptr_t end)
+{
+    return range_writable(start, end);
+}
+#endif
+
+#if defined(__linux__) || defined(__APPLE__)
 /* Pages already found accessible, one entry per guest page below the
  * device apertures: (protection generation << 2) | 1 readable | 2 writable.
  * An entry from an older generation does not count, so VirtualAlloc/Free/
@@ -213,7 +293,7 @@ static void pages_remember(uint32_t first, uint32_t last, bool writable, unsigne
 
 bool xbox_guest_memory_direct(uintptr_t base, uint64_t address, size_t size, bool writable)
 {
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
     static size_t page;
     uintptr_t host, start, end;
 
@@ -243,7 +323,7 @@ bool xbox_guest_memory_direct(uintptr_t base, uint64_t address, size_t size, boo
 
 void xbox_guest_memory_protection_changed(void)
 {
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
     atomic_fetch_add(&s_protection_generation, 1);
 #endif
 }

@@ -52,12 +52,7 @@ typedef struct {
 #ifdef SG_HAVE_SHADERS
 static SDL_GPUShader *sg_shader(const void *code, size_t size, SDL_GPUShaderStage stage,
                                 Uint32 samplers) {
-    SDL_GPUShaderCreateInfo info = {
-        .code = (const Uint8 *) code, .code_size = size, .entrypoint = "main",
-        .format = SDL_GPU_SHADERFORMAT_SPIRV, .stage = stage,
-        .num_samplers = samplers, .num_uniform_buffers = 1,
-    };
-    return SDL_CreateGPUShader(s_sg.dev, &info);
+    return sg_shader_from_spirv((const uint32_t *) code, size, stage, samplers, 1);
 }
 #endif
 
@@ -74,6 +69,7 @@ static int sg_draw_init(void) {
         .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER, .width = 1, .height = 1,
         .layer_count_or_depth = 1, .num_levels = 1,
     };
+    uint32_t white_pixel = 0xFFFFFFFFu;
 
     if (s_sg.draw_ready || tried)
         return s_sg.draw_ready;
@@ -81,10 +77,37 @@ static int sg_draw_init(void) {
     s_sg.flat2d_vs = sg_shader(k_sg_flat2d_vert, sizeof k_sg_flat2d_vert, SDL_GPU_SHADERSTAGE_VERTEX, 0);
     s_sg.flat2d_fs = sg_shader(k_sg_flat2d_frag, sizeof k_sg_flat2d_frag, SDL_GPU_SHADERSTAGE_FRAGMENT, 1);
     s_sg.xf_vs = sg_shader(k_sg_xf_vert, sizeof k_sg_xf_vert, SDL_GPU_SHADERSTAGE_VERTEX, 0);
-    s_sg.xf_fs = sg_shader(k_sg_xf_frag, sizeof k_sg_xf_frag, SDL_GPU_SHADERSTAGE_FRAGMENT, 4);
+    s_sg.xf_fs = sg_shader(k_sg_xf_frag, sizeof k_sg_xf_frag, SDL_GPU_SHADERSTAGE_FRAGMENT, 8);
     s_sg.point = SDL_CreateGPUSampler(s_sg.dev, &point);
     s_sg.white = SDL_CreateGPUTexture(s_sg.dev, &white);
-    if (!s_sg.flat2d_vs || !s_sg.flat2d_fs || !s_sg.xf_vs || !s_sg.xf_fs || !s_sg.point || !s_sg.white) {
+    white.type = SDL_GPU_TEXTURETYPE_CUBE;
+    white.layer_count_or_depth = 6;
+    s_sg.white_cube = SDL_CreateGPUTexture(s_sg.dev, &white);
+    /* Upload white pixel to both white textures so fallback sampling is opaque white. */
+    {
+        SDL_GPUTransferBuffer *tb = SDL_CreateGPUTransferBuffer(s_sg.dev,
+            &(SDL_GPUTransferBufferCreateInfo){.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = 4});
+        if (tb) {
+            uint8_t *m = (uint8_t *)SDL_MapGPUTransferBuffer(s_sg.dev, tb, true);
+            if (m) { memcpy(m, &white_pixel, 4); SDL_UnmapGPUTransferBuffer(s_sg.dev, tb); }
+            SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(s_sg.dev);
+            if (cmd) {
+                SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(cmd);
+                SDL_GPUTransferBufferLocation from = {.transfer_buffer = tb, .offset = 0};
+                SDL_GPUTextureRegion to = {.texture = s_sg.white, .w = 1, .h = 1, .d = 1};
+                SDL_UploadToGPUTexture(cp, &from, &to, false);
+                for (int f = 0; f < 6; f++) {
+                    SDL_GPUTextureRegion tof = {.texture = s_sg.white_cube, .layer = f, .w = 1, .h = 1, .d = 1};
+                    SDL_UploadToGPUTexture(cp, &from, &tof, false);
+                }
+                SDL_EndGPUCopyPass(cp);
+                SDL_SubmitGPUCommandBuffer(cmd);
+            }
+            SDL_ReleaseGPUTransferBuffer(s_sg.dev, tb);
+        }
+    }
+    if (!s_sg.flat2d_vs || !s_sg.flat2d_fs || !s_sg.xf_vs || !s_sg.xf_fs || !s_sg.point || !s_sg.white
+            || !s_sg.white_cube) {
         fprintf(stderr, "  [SDLGPU] drawing unavailable: %s\n", SDL_GetError());
         return 0;
     }
@@ -143,6 +166,12 @@ static void *sg_grow(void *p, uint32_t *cap, uint32_t need, size_t elem) {
     uint32_t n;
     void *grown;
 
+    /* Never hand back NULL for "nothing needed": callers read NULL as out of
+     * memory, and an empty buffer (no indices yet, no texture uploads yet)
+     * is still NULL -- which sent every unindexed batch to software until
+     * an indexed one happened to grow the buffer first. */
+    if (need == 0)
+        need = 1;
     if (need <= *cap)
         return p;
     n = *cap ? *cap : 64;
@@ -165,22 +194,23 @@ static int sg_queue_draw(const SgDraw *d) {
 
     if (q->surface && q->surface != d->surface)
         sg_queue_flush(); /* one target per queue */
-    if (q->count == SG_QUEUE_MAX_DRAWS || q->vbytes + d->vertex_bytes > (64u << 20) ||
+    /* + 8: room for the draw's window-clip copies (below) */
+    if (q->count + 8 > SG_QUEUE_MAX_DRAWS || q->vbytes + d->vertex_bytes > (64u << 20) ||
             q->ubytes > (32u << 20))
                 sg_queue_flush();
 
     for (i = 0; i < (uint32_t) d->tex_count; i++)
         if (d->tex[i].upload)
-            tex_bytes += d->tex[i].w * d->tex[i].h * 4;
+            tex_bytes += d->tex[i].w * d->tex[i].h * 4 * (d->tex[i].cube ? 6u : 1u);
 
 
-    if (!(g = sg_grow(q->draws, &q->cap, q->count + 1, sizeof *q->draws))) return 0;
+    if (!(g = sg_grow(q->draws, &q->cap, q->count + 8, sizeof *q->draws))) return 0;
     q->draws = (SgQueuedDraw *) g;
     if (!(g = sg_grow(q->vdata, &q->vcap, q->vbytes + d->vertex_bytes, 1))) return 0;
     q->vdata = (uint8_t *) g;
     if (!(g = sg_grow(q->tdata, &q->tcap, q->tbytes + tex_bytes, 1))) return 0;
     q->tdata = (uint8_t *) g;
-    if (!(g = sg_grow(q->uploads, &q->upload_cap, q->upload_count + 4, sizeof *q->uploads))) return 0;
+    if (!(g = sg_grow(q->uploads, &q->upload_cap, q->upload_count + 8, sizeof *q->uploads))) return 0;
     q->uploads = (SgQueuedUpload *) g;
 
     if (!(g = sg_grow(q->idata, &q->icap, q->ibytes + ibytes, 1))) return 0;
@@ -190,7 +220,7 @@ static int sg_queue_draw(const SgDraw *d) {
 
     if (!q->surface) {
         q->surface = d->surface;
-        q->upload_surface = d->surface->owner == SG_OWNER_GUEST;
+        q->upload_surface = d->surface->owner == SG_OWNER_GUEST && !sg_surface_reclaim(d->surface);
     }
 
     qd = &q->draws[q->count];
@@ -222,12 +252,13 @@ static int sg_queue_draw(const SgDraw *d) {
     qd->tex_count = d->tex_count;
     for (i = 0; i < (uint32_t) d->tex_count; i++) {
         SgTextureUse *t = &d->tex[i];
-         qd->tex[i] = t->tex ? t->tex : s_sg.white;      /* the stage's texture */
+        qd->tex[i] = t->tex ? t->tex : (i >= 4 ? s_sg.white_cube : s_sg.white);   /* the stage's texture */
         qd->sampler[i] = t->sampler ? t->sampler : s_sg.point;     /* ...and its sampler */
         if (t->upload) {
-            uint32_t bytes = t->w * t->h * 4;
+            uint32_t layers = t->cube ? 6u : 1u;
+            uint32_t bytes = t->w * t->h * 4 * layers;
             memcpy(q->tdata + q->tbytes, t->upload, bytes);
-            q->uploads[q->upload_count++] = (SgQueuedUpload){t->tex, t->w, t->h, q->tbytes};
+            q->uploads[q->upload_count++] = (SgQueuedUpload){t->tex, t->w, t->h, layers, q->tbytes};
             q->tbytes += bytes;
             sg_texture_commit(t); /* uploaded before any queued draw runs */
         }
@@ -245,9 +276,49 @@ static int sg_queue_draw(const SgDraw *d) {
     memcpy(qd->fs, d->fs_uniform, d->fs_uniform_size);
     q->count++;
 
+    /* NV2A window clips (SET_WINDOW_CLIP_*): with the inclusive type, the
+     * draw is visible only inside the union of up to eight rectangles, each
+     * intersected with the surface clip -- how NFL 2K5 cuts its play-call
+     * screen into three play-art panels. SDL has one scissor per draw, so
+     * the draw is replayed once per rectangle (they do not overlap there),
+     * as the D3D11 path sets several scissor rectangles. Exclusive clips and
+     * all-empty rectangles keep the plain surface clip, as D3D11 does. */
+    if (!s_gpu.window_clip_type) {
+        SDL_Rect rc[8];
+        int n = 0, k;
+        int sl = (int) s_gpu.clip_x, sr = (int) (s_gpu.clip_x + s_gpu.clip_w);
+        int st = (int) s_gpu.clip_y, sb = (int) (s_gpu.clip_y + s_gpu.clip_h);
+        for (k = 0; k < 8; k++) {
+            uint32_t wx = s_gpu.window_clip_x[k], wy = s_gpu.window_clip_y[k];
+            int l = (int) (wx & 0xFFF), r = (int) ((wx >> 16) & 0xFFF);
+            int t = (int) (wy & 0xFFF), b = (int) ((wy >> 16) & 0xFFF), j, dup = 0;
+            if (l < sl) l = sl;
+            if (r > sr) r = sr;
+            if (t < st) t = st;
+            if (b > sb) b = sb;
+            if (r <= l || b <= t)
+                continue;
+            for (j = 0; j < n; j++)     /* replicated slots repeat the last rectangle */
+                if (rc[j].x == l && rc[j].y == t && rc[j].w == r - l && rc[j].h == b - t)
+                    dup = 1;
+            if (!dup)
+                rc[n++] = (SDL_Rect){l, t, r - l, b - t};
+        }
+        if (n > 0) {
+            SgQueuedDraw *first = &q->draws[q->count - 1];
+            first->scissor = rc[0];
+            for (k = 1; k < n; k++) {
+                q->draws[q->count] = *first;
+                q->draws[q->count].scissor = rc[k];
+                q->count++;
+            }
+        }
+    }
+
     /* The GPU copy will be the newer one. Anything that reads the surface on
      * the CPU flushes the queue first (sg_cpu_access, sg_flip). */
     d->surface->owner = SG_OWNER_GPU;
+    d->surface->version++;   /* content changed: a render-to-texture copy is stale */
     return 1;
 }
 
@@ -305,21 +376,27 @@ static int sg_queue_flush(void) {
                     .transfer_buffer = s_sg.upload,
                     .offset = q->vbytes + q->ibytes
                 };
-                SDL_GPUTextureRegion dst = {.texture = s->color, .w = s->w, .h = s->h, .d = 1};
+                SDL_GPUTextureRegion dst = {.texture = sg_surface_upload_target(s), .w = s->w, .h = s->h, .d = 1};
                 SDL_UploadToGPUTexture(copy, &src, &dst, false);
             }
             for (i = 0; i < q->upload_count; i++) {
                 const SgQueuedUpload *u = &q->uploads[i];
-                SDL_GPUTextureTransferInfo src = {
-                    .transfer_buffer = s_sg.upload, .offset = q->vbytes + q->ibytes + sbytes + u->offset
-                };
-                SDL_GPUTextureRegion dst = {.texture = u->tex, .w = u->w, .h = u->h, .d = 1};
-                SDL_UploadToGPUTexture(copy, &src, &dst, false);
+                uint32_t f;
+                for (f = 0; f < u->layers; f++) {          /* cube maps: one face per layer */
+                    SDL_GPUTextureTransferInfo src = {
+                        .transfer_buffer = s_sg.upload,
+                        .offset = q->vbytes + q->ibytes + sbytes + u->offset + f * u->w * u->h * 4
+                    };
+                    SDL_GPUTextureRegion dst = {.texture = u->tex, .layer = f, .w = u->w, .h = u->h, .d = 1};
+                    SDL_UploadToGPUTexture(copy, &src, &dst, false);
+                }
             }
             SDL_EndGPUCopyPass(copy);
             for (i = 0; i < q->upload_count; i++)
-                if (q->uploads[i].w > 1 || q->uploads[i].h > 1)    /* 1x1: one level, nothing to generate */
+                if (q->uploads[i].layers == 1 && (q->uploads[i].w > 1 || q->uploads[i].h > 1))   /* 1x1 and cubes: one level */
                     SDL_GenerateMipmapsForGPUTexture(cmd, q->uploads[i].tex);
+            if (sbytes)
+                sg_surface_upscale(cmd, s);   /* 1x guest copy -> scaled target */
         }
         {
             SDL_GPUColorTargetInfo target = {
@@ -327,14 +404,16 @@ static int sg_queue_flush(void) {
             };
             SDL_GPUDepthStencilTargetInfo depth = sg_depth_target(s, 0, 0);
             SDL_GPURenderPass *pass = SDL_BeginGPURenderPass(cmd, &target, 1, &depth);
-            SDL_GPUViewport view = {0, 0, (float) s->w, (float) s->h, 0.0f, 1.0f};
+            SDL_AddAtomicInt(&s_sg_stat_passes, 1);
+            SDL_AddAtomicInt(&s_sg_stat_draws, (int) q->count);
+            SDL_GPUViewport view = {0, 0, (float) (s->w * s->k), (float) (s->h * s->k), 0.0f, 1.0f};
             SDL_GPUGraphicsPipeline *bound = NULL;
 
             SDL_SetGPUViewport(pass, &view);
             for (i = 0; i < q->count; i++) {
                 const SgQueuedDraw *qd = &q->draws[i];
                 SDL_GPUBufferBinding vb = {.buffer = s_sg.vertices, .offset = qd->vertex_offset};
-                SDL_GPUTextureSamplerBinding tb[4];
+                SDL_GPUTextureSamplerBinding tb[8];   /* 3D: 2D stages + cube slots */
                 int k;
 
                 if (qd->pipe != bound) {
@@ -350,7 +429,12 @@ static int sg_queue_flush(void) {
                             fprintf(stderr, "  [SDLGPU] draw %u stage %d: texture %p sampler %p (of %u)\n",
                                     i, k, (void *)tb[k].texture, (void *)tb[k].sampler, qd->tex_count);
                     }
-                SDL_SetGPUScissor(pass, &qd->scissor);
+                {
+                    SDL_Rect sc = qd->scissor;   /* guest pixels -> target pixels */
+                    sc.x *= (int) s->k; sc.y *= (int) s->k;
+                    sc.w *= (int) s->k; sc.h *= (int) s->k;
+                    SDL_SetGPUScissor(pass, &sc);
+                }
                 SDL_SetGPUBlendConstants(pass, qd->blend_constant);
                 SDL_SetGPUStencilReference(pass, qd->stencil_ref);
                 SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
@@ -438,7 +522,7 @@ static int sg_draw_flat2d(void) {
     s = sg_surface_current();
     if (!s)
         return sg_fallback(SG_FB_TARGET, 0);
-    pipe = sg_pipeline_current(0, 0);
+    pipe = sg_pipeline_current(0, 0, 0);
     if (!pipe)
         return sg_fallback(SG_FB_BLEND, 0);
     if (s_gpu.tex.valid && !sg_texture_stage0(&tex))

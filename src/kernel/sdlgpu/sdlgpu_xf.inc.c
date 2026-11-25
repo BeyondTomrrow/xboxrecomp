@@ -31,7 +31,12 @@ typedef struct {
     uint32_t mode[4]; /* texture-shader mode per stage (sg_stage_mode) */
     uint32_t rect[4]; /* stage coordinates in texels (linear texture) */
     uint32_t depth[4];
+    uint32_t dotmap[4]; /* per stage: SET_DOT_RGBMAPPING (NV_PGRAPH_SHADERCTL) */
+    uint32_t sinput[4]; /* per stage: earlier stage a dot-product mode reads */
+    uint32_t cube[4];   /* per stage: bound as a cube map */
 } SgXfShade;
+
+static uint32_t sg_fs_variant(const SgXfShade *sh);   /* sdlgpu_fscache.inc.c */
 
 /* std140 mirror of `Viewport` in shaders/xf.vert. */
 typedef struct {
@@ -45,7 +50,7 @@ typedef struct {
 * with the state that decides its colour there. The last one printed is
 * what the pixel shows. A diagnostic for surfaces drawn wrong or not at all. */
 static struct {
-    int on, x, y;
+    int on, oneshot, x, y;
     uint32_t frame; /* s_sg_frame being captured; 0 = none */
     uint64_t last_ms;
     int hit; /* the current batch covers the pixel */
@@ -66,6 +71,33 @@ static void sg_probe_init(void) {
 /* Called once per flip, after s_sg_frame advances: start a capture every 10 s. */
 static void sg_probe_flip(void) {
     uint64_t now;
+    /* One-shot capture on request: write "x y" to <RECOMP_SDLGPU_TOGGLE_DIR>/watch
+     * and the next frame's batches at that pixel are reported (GPU and
+     * software alike), then the file is removed. */
+    {
+        static const char *dir;
+        static int looked;
+        if (!looked) { dir = getenv("RECOMP_SDLGPU_TOGGLE_DIR"); looked = 1; }
+        if (dir) {
+            char f[1024];
+            FILE *w;
+            int x, y;
+            snprintf(f, sizeof f, "%s/watch", dir);
+            if ((w = fopen(f, "r")) != NULL) {
+                if (fscanf(w, "%d %d", &x, &y) == 2) {
+                    s_probe.x = x;
+                    s_probe.y = y;
+                    s_probe.oneshot = 1;
+                    s_probe.frame = s_sg_frame;
+                    fprintf(stderr, "  [PROBE] ===== one-shot frame %u, pixel %d,%d =====\n",
+                            s_sg_frame, x, y);
+                }
+                fclose(w);
+                remove(f);
+                return;
+            }
+        }
+    }
     if (!s_probe.on)
         return;
     now = SDL_GetTicks();
@@ -78,7 +110,7 @@ static void sg_probe_flip(void) {
 }
 
 static int sg_probe_active(void) {
-    return s_probe.on && s_probe.frame == s_sg_frame;
+    return (s_probe.on || s_probe.oneshot) && s_probe.frame == s_sg_frame;
 }
 
 static void sg_probe_print(void) {
@@ -171,6 +203,25 @@ static void sg_collect_xf(void *ctx, const XfVert *a, const XfVert *b, const XfV
 
     if (!a->ok || !b->ok || !c->ok)
         return;
+    {   /* RECOMP_SDLGPU_COLHIST: brightness of oD0 (max of RGB), 10 buckets */
+        static int on = -1;
+        static unsigned hist[11], tris;
+        if (on < 0) on = getenv("RECOMP_SDLGPU_COLHIST") != NULL;
+        if (on) {
+            for (k = 0; k < 3; k++) {
+                float m = t[k]->col[0];
+                if (t[k]->col[1] > m) m = t[k]->col[1];
+                if (t[k]->col[2] > m) m = t[k]->col[2];
+                hist[(int) (m * 10.0f)]++;
+            }
+            if (++tris % 20000 == 0) {
+                fprintf(stderr, "  [COLHIST]");
+                for (k = 0; k <= 10; k++) fprintf(stderr, " %u", hist[k]);
+                fprintf(stderr, "\n");
+                memset(hist, 0, sizeof hist);
+            }
+        }
+    }
     /* Back-face culling, exactly as raster_triangle_xf does it (on with
      * RECOMP_CULL=1 for now, as there). Winding as the NV2A sees it: its
      * window space has y growing upward, so in these y-down screen
@@ -317,6 +368,38 @@ static void sg_xf_shade_fill(SgXfShade *sh, uint32_t sampled) {
     for (st = 0; st < 4; st++) {
         sh->mode[st] = sg_stage_mode(st);
         sh->rect[st] = !tex_size_from_format(sg_stage_texture(st)->color);
+        sh->cube[st] = ((sampled >> st) & 1u) && sg_stage_is_cube(st);
+    }
+    {   /* As xemu psh.c / the D3D11 path read NV_PGRAPH_SHADERCTL. */
+        uint32_t ctl = s_comb.shaderctl;
+        sh->dotmap[0] = 0;
+        sh->dotmap[1] = ctl & 0xF;
+        sh->dotmap[2] = (ctl >> 4) & 0xF;
+        sh->dotmap[3] = (ctl >> 8) & 0xF;
+        sh->sinput[0] = sh->sinput[1] = 0;
+        sh->sinput[2] = (ctl >> 16) & 0xF;
+        sh->sinput[3] = (ctl >> 20) & 0xF;
+    }
+    {   /* RECOMP_SDLGPU_MODELOG: each new stage-mode combination, once */
+        static int on = -1;
+        static uint32_t seen[256];
+        static int n;
+        uint32_t key = (sh->mode[0] | sh->mode[1] << 8 | sh->mode[2] << 16 | sh->mode[3] << 24)
+                     ^ sh->prog[0] * 31u ^ sh->prog[2] * 131u ^ sh->prog[3] * 1031u
+                     ^ sh->color_icw[0] * 7u ^ sh->color_ocw[0] * 17u ^ sh->color_icw[1] * 71u, i;
+        if (on < 0) on = getenv("RECOMP_SDLGPU_MODELOG") != NULL;
+        if (on && n < 256) {
+            for (i = 0; i < (uint32_t) n && seen[i] != key; i++) ;
+            if (i == (uint32_t) n) {
+                seen[n++] = key;
+                fprintf(stderr, "  [MODES] %02X %02X %02X %02X  comb %08X final %08X/%08X"
+                        " s0 %08X/%08X a %08X/%08X s1 %08X/%08X spec %s\n",
+                        sh->mode[0], sh->mode[1], sh->mode[2], sh->mode[3], sh->prog[0],
+                        sh->prog[2], sh->prog[3], sh->color_icw[0], sh->color_ocw[0],
+                        sh->alpha_icw[0], sh->alpha_ocw[0], sh->color_icw[1], sh->color_ocw[1],
+                        s_vp.specular_enable ? "on" : "off");
+            }
+        }
     }
 
     {
@@ -325,7 +408,8 @@ static void sg_xf_shade_fill(SgXfShade *sh, uint32_t sampled) {
         float cmin = ranged ? s_vp.clip_min : 0.0f;
         float cmax = ranged ? s_vp.clip_max : zmax;
         sh->depth[0] = ((s_vp.control0 >> 16) & 1u)
-                     | ((((s_vp.zminmax >> 4) & 0xFu) == 0) ? 2u : 0u);
+                     | ((((s_vp.zminmax >> 4) & 0xFu) == 0) ? 2u : 0u)
+                     | (!(s_vp.control0 & 0x1000u) && !s_sg_toggle_nofloor ? 4u : 0u);
         memcpy(&sh->depth[1], &zmax, sizeof zmax);
         memcpy(&sh->depth[2], &cmin, sizeof cmin);
         memcpy(&sh->depth[3], &cmax, sizeof cmax);
@@ -352,7 +436,7 @@ static int sg_vp_wanted(void) {
     static int on = -1;
     if (on < 0)
         on = getenv("RECOMP_SDLGPU_NOVP") == NULL;
-    return on;
+    return on && !s_sg_toggle_novp;
 }
 
 /* in[] slot of guest vertex `index`, fetching its inputs on first use. */
@@ -379,10 +463,11 @@ static uint32_t sg_vp_vertex(uint32_t index) {
 /* Draw the batch with its vertex program on the GPU. Returns 0 to use the
  * CPU path instead: program still compiling or not translatable, points or
  * lines, or out of memory. */
-static int sg_draw_vp(SgSurface *s, SgTextureUse tex[4], uint32_t sampled) {
+static int sg_draw_vp(SgSurface *s, SgTextureUse tex[8], uint32_t sampled) {
     const uint16_t *src = s_gpu.idx;
     uint32_t n = s_gpu.idx_count, i, ni = 0, slot = 0;
     SDL_GPUGraphicsPipeline *pipe;
+    SgXfShade shade;
 
     if (!sg_vp_wanted())
         return 0;
@@ -399,7 +484,8 @@ static int sg_draw_vp(SgSurface *s, SgTextureUse tex[4], uint32_t sampled) {
     }
     if (!sg_vp_program(&slot))
         return 0; /* compiling (or cannot): CPU this time */
-    pipe = sg_pipeline_current(1, slot + 1);
+    sg_xf_shade_fill(&shade, sampled);
+    pipe = sg_pipeline_current(1, slot + 1, sg_fs_variant(&shade));
     if (!pipe)
         return 0;
 
@@ -465,14 +551,13 @@ static int sg_draw_vp(SgSurface *s, SgTextureUse tex[4], uint32_t sampled) {
 
     {
         static SgVpUniforms u; /* 3 KB: not on the stack */
-        SgXfShade shade;
         float zmax = SG_DEPTH_MAX;
         SgDraw d = {
             .surface = s, .pipe = pipe,
             .vertices = s_sgvp.in, .vertex_bytes = s_sgvp.nv * (uint32_t) sizeof *s_sgvp.in,
             .vertex_count = s_sgvp.nv,
             .indices = s_sgvp.ix, .index_count = ni,
-            .tex = tex, .tex_count = 4,
+            .tex = tex, .tex_count = 8,
             .vs_uniform = &u, .vs_uniform_size = sizeof u,
             .fs_uniform = &shade, .fs_uniform_size = sizeof shade,
         };
@@ -496,7 +581,6 @@ static int sg_draw_vp(SgSurface *s, SgTextureUse tex[4], uint32_t sampled) {
         u.lightp[1] = (s_vp.light_control & (1u << 17)) ? 1.0f : 0.0f;
         u.lightp[2] = u.lightp[3] = 0.0f;
 
-        sg_xf_shade_fill(&shade, sampled);
         if (!sg_queue_draw(&d))
             return 0;
         s_sg_stats.gpuvp++;
@@ -508,7 +592,7 @@ static int sg_draw_vp(SgSurface *s, SgTextureUse tex[4], uint32_t sampled) {
 /* gpu_draw_batch(0). Returns 0 to leave the batch to the software path. */
 static int sg_draw_xf(void) {
     static SgXfList list;
-    SgTextureUse tex[4] = { 0 };
+    SgTextureUse tex[8] = { 0 };   /* 0..3 2D stages, 4..7 cube-map stages */
     uint32_t sampled = 0;
     SDL_GPUGraphicsPipeline *pipe;
     SgSurface *s;
@@ -532,9 +616,10 @@ static int sg_draw_xf(void) {
     s = sg_surface_current();
     if (!s)
         return sg_fallback(SG_FB_TARGET, 1);
-    pipe = sg_pipeline_current(1, 0);
-    if (!pipe)
-        return sg_fallback(SG_FB_BLEND, 1); /* blend state SDL cannot express */
+    /* Blend state SDL cannot express: checked up front (with the generic
+     * shader) so such batches go to software before any GPU work. */
+    if (!sg_pipeline_current(1, 0, 0))
+        return sg_fallback(SG_FB_BLEND, 1);
 
     /* Stage 0 is sampled whenever enabled; stages 1..3 only feed the
      * combiners, and only when their stage program is set (as in
@@ -545,6 +630,12 @@ static int sg_draw_xf(void) {
             if (!sg_texture_for_stage(st, &tex[st]))
                 return sg_fallback(SG_FB_TEXTURE, 1);
             sampled |= 1u << st;
+        }
+    /* Cube maps bind in the stage's cube slot (xf.frag cube0..3). */
+    for (st = 0; st < 4; st++)
+        if (tex[st].cube) {
+            tex[4 + st] = tex[st];
+            memset(&tex[st], 0, sizeof tex[st]);
         }
 
     /* The vertex program on the GPU when its shader is ready; otherwise */
@@ -565,20 +656,52 @@ static int sg_draw_xf(void) {
     {
         SgXfShade shade;
         SgXfViewport view = {{(float) s->w, (float) s->h}, 1.0f / SG_DEPTH_MAX, 0.0f};
+        sg_xf_shade_fill(&shade, sampled);
+        pipe = sg_pipeline_current(1, 0, sg_fs_variant(&shade));
+        if (!pipe)
+            return sg_fallback(SG_FB_BLEND, 1);
         SgDraw d = {
             .surface = s, .pipe = pipe,
             .vertices = list.v, .vertex_bytes = list.count * (uint32_t) sizeof(SgXfVertex),
             .vertex_count = list.count,
-            .tex = tex, .tex_count = 4,
+            .tex = tex, .tex_count = 8,
             .vs_uniform = &view, .vs_uniform_size = sizeof view,
             .fs_uniform = &shade, .fs_uniform_size = sizeof shade,
         };
-        sg_xf_shade_fill(&shade, sampled);
         if (!sg_queue_draw(&d))
             return sg_fallback(SG_FB_RESOURCES, 1);
-        fprintf(stderr, "  [SDLGPU] xf resources: pipeline\n");   /* or: queue, or: vertex grow */
         s_sg_stats.gpu3d++;
         sg_probe_watch(s, 0);
         return 1;
     }
+}
+
+
+/* Software-drawn 3D batches during a probe capture: the pixel after each one
+ * that changed it, from guest RAM (where software draws). Called by
+ * raster_batch_xf after the CPU rasteriser. */
+static void sg_sw_watch(void)
+{
+    static uint32_t last, last_frame;
+    uint32_t px, va;
+    if (!sg_probe_active() || surface_bpp() != 4)
+        return;
+    if (last_frame != s_sg_frame) {
+        last_frame = s_sg_frame;
+        last = 0xDEADBEEFu;
+    }
+    va = dma_resolve(s_gpu.color_offset);
+    memcpy(&px, (uint8_t *)xbox_GetMemoryOffset() + va + (size_t)s_probe.y * s_gpu.pitch
+                + (size_t)s_probe.x * 4u, 4);
+    if (px == last)
+        return;
+    last = px;
+    fprintf(stderr, "  [WATCH] pixel -> %08X after SW batch: tex %08X %ux%u prog %08X final %08X/%08X"
+                    " | blend %u %04X/%04X | depth %u %04X mask %u | stencil %u func %04X"
+                    " | alpha %u %04X %02X\n",
+            px, s_gpu.tex.valid ? s_gpu.tex.offset : 0, s_gpu.tex.width, s_gpu.tex.height,
+            s_comb.stage_prog, s_comb.final0, s_comb.final1, s_gpu.blend, s_gpu.blend_sf,
+            s_gpu.blend_df, s_vp.depth_test, s_vp.depth_func, s_vp.depth_mask,
+            s_vp.stencil_test, s_vp.stencil_func, s_gpu.alpha_test, s_gpu.alpha_func,
+            s_gpu.alpha_ref & 0xFF);
 }

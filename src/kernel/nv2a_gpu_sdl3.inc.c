@@ -6,7 +6,7 @@
 
 #include <SDL3/SDL.h>
 #include "../input/xinput_xbox.h"
-#if defined(__linux__)
+#if !defined(_WIN32)
 #include "../platform/guest_memory.h"
 #endif
 
@@ -288,7 +288,7 @@ static struct {
     SDL_GPUTexture       *fb_tex;
     SDL_GPUTransferBuffer*fb_tbuf;
     uint32_t              fb_w, fb_h;
-#if defined(__linux__)
+#if !defined(_WIN32)
     uint8_t              *fb_staging;
     size_t                fb_staging_capacity;
 #endif
@@ -350,7 +350,7 @@ static void sdl_pr_flip(void)
      * allocation or guest-address arithmetic can wrap. */
     if (row_bytes > pitch || height > UINT32_MAX / row_bytes) return;
     size_t frame_bytes = (size_t)(row_bytes * height);
-#if defined(__linux__)
+#if !defined(_WIN32)
     if (s_sdl_pr.fb_staging_capacity < frame_bytes) {
         uint8_t *replacement = (uint8_t *)realloc(s_sdl_pr.fb_staging, frame_bytes);
         if (!replacement) return;
@@ -396,7 +396,7 @@ static void sdl_pr_flip(void)
 
     uint8_t *mapped = (uint8_t *)SDL_MapGPUTransferBuffer(s_sdl_pr.gpu, s_sdl_pr.fb_tbuf, true);
     if (!mapped) return;
-#if defined(__linux__)
+#if !defined(_WIN32)
     memcpy(mapped, s_sdl_pr.fb_staging, frame_bytes);
 #else
     {

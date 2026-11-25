@@ -25,7 +25,7 @@
  * <prefix>NNN.bmp, so the result can be looked at without a display.
  */
 #include "platform/xbox_winnt.h"
-#if defined(__linux__)
+#if !defined(_WIN32)
 #include "platform/guest_memory.h"
 #endif
 #include <float.h>
@@ -493,7 +493,7 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4]) {
     const uint8_t *p;
     uint32_t i;
     size_t bytes;
-#if defined(__linux__)
+#if !defined(_WIN32)
     union {
         float floats[4];
         uint8_t bytes[16];
@@ -534,7 +534,7 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4]) {
     } else {
         if (!a->offset)
             return 0;
-#if defined(__linux__)
+#if !defined(_WIN32)
         uint64_t address = (uint64_t) a->offset + (uint64_t) index * a->stride;
         if (!xbox_guest_memory_read((uintptr_t) mem, address, sampled.bytes, bytes))
             return 0;
@@ -622,7 +622,7 @@ static uint32_t surface_bpp(void) {
  * format every viewer reads and it is 30 lines; PNG would need a dependency.
  */
 static int pb_diagnostic_read(uint64_t address, void *output, size_t bytes) {
-#if defined(__linux__)
+#if !defined(_WIN32)
     return xbox_guest_memory_read((uintptr_t) xbox_GetMemoryOffset(), address, output, bytes);
 #else
     memcpy(output, (const uint8_t *) xbox_GetMemoryOffset() + address, bytes);
@@ -640,7 +640,7 @@ static void dump_surface_bmp(void) {
     uint32_t row_bytes, pad, filesz;
     uint8_t hdr[54];
     FILE *f;
-#if defined(__linux__)
+#if !defined(_WIN32)
     uint8_t *staged_row;
     if ((uint64_t) w * 3 > UINT32_MAX - 3 ||
         (uint64_t) 54 + (((uint64_t) w * 3 + 3) & ~UINT64_C(3)) * h > UINT32_MAX)
@@ -658,7 +658,7 @@ static void dump_surface_bmp(void) {
     f = fopen(path, "wb");
     if (!f)
         return;
-#if defined(__linux__)
+#if !defined(_WIN32)
     staged_row = (uint8_t *) malloc((size_t) w * bpp);
     if (!staged_row) {
         fclose(f);
@@ -681,7 +681,7 @@ static void dump_surface_bmp(void) {
 
     /* BMP rows run bottom-up. */
     for (y = h; y-- > 0;) {
-#if defined(__linux__)
+#if !defined(_WIN32)
         uint64_t row_index = (uint64_t) s_gpu.clip_y + y;
         uint64_t row_offset = (row_index <= UINT32_MAX ? row_index : 0) * s_gpu.pitch;
         uint64_t address = dma_resolve(s_gpu.drawn_offset ? s_gpu.drawn_offset : s_gpu.color_offset)
@@ -705,7 +705,7 @@ static void dump_surface_bmp(void) {
             uint8_t bgr[3];
             if (bpp == 4) {
                 uint32_t v = ((const uint32_t *) row)[
-#if defined(__linux__)
+#if !defined(_WIN32)
                     x
 #else
                     s_gpu.clip_x + x
@@ -716,7 +716,7 @@ static void dump_surface_bmp(void) {
                 bgr[2] = (uint8_t) (v >> 16);
             } else {
                 uint16_t v = ((const uint16_t *) row)[
-#if defined(__linux__)
+#if !defined(_WIN32)
                     x
 #else
                     s_gpu.clip_x + x
@@ -734,7 +734,7 @@ static void dump_surface_bmp(void) {
         }
     }
     fclose(f);
-#if defined(__linux__)
+#if !defined(_WIN32)
     free(staged_row);
 #endif
     if (seq == 1)
@@ -995,7 +995,7 @@ static uint32_t linear_twin(uint32_t fmt) {
 }
 
 static Texture s_stage[4];
-#if defined(__linux__)
+#if !defined(_WIN32)
 typedef struct {
     uint8_t *pixels;
     size_t bytes; /* of pixels: the texture's footprint in guest RAM */
@@ -1098,7 +1098,7 @@ static int snapshot_textures(void) {
 #endif
 
 static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb) {
-#if !defined(__linux__)
+#if defined(_WIN32)
     const uint8_t *mem = (const uint8_t *) xbox_GetMemoryOffset();
 #endif
     const uint8_t *p;
@@ -1106,7 +1106,7 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb) {
 
     if (!s_gpu.tex.valid)
         return 0;
-#if defined(__linux__)
+#if !defined(_WIN32)
     if (!s_texture_snapshot[s_sampler_stage].ready) return 0;
     const uint8_t *image = s_texture_snapshot[s_sampler_stage].pixels;
 #else
@@ -1127,7 +1127,7 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb) {
         if (!s_gpu.tex.palette)
             return 0;
         idx = image[swizzle_offset(u, v, s_gpu.tex.width, s_gpu.tex.height)];
-#if defined(__linux__)
+#if !defined(_WIN32)
         *argb = s_texture_snapshot[s_sampler_stage].palette[idx];
 #else
         *argb = *(const uint32_t *) (mem + s_gpu.tex.palette + (size_t) idx * 4u);
@@ -1256,7 +1256,7 @@ static void dump_texture_bmp(uint32_t seq) {
 
     if (!prefix || !w || !h || w > 4096 || h > 4096)
         return;
-#if defined(__linux__)
+#if !defined(_WIN32)
     snapshot_texture(0, &s_gpu.tex);
     s_sampler_stage = 0;
     if (!s_texture_snapshot[0].ready) return;
@@ -1318,7 +1318,7 @@ static void dump_texture_bmp(uint32_t seq) {
  * This is not a micro-optimisation for its own sake: the loader's video
  * paces on frames actually presented, so the rasteriser's throughput is the
  * playback rate. */
-#if defined(__linux__)
+#if !defined(_WIN32)
 static uint32_t *s_surface_first, *s_surface_end;
 static uint32_t s_surface_base, s_surface_rows, s_surface_pitch, s_surface_bpp;
 /* Linux: the staged surface is guest RAM itself (readable and writable,
@@ -1328,7 +1328,7 @@ static int s_surface_direct;
 #endif
 
 static void surface_stage_reset(void) {
-#if defined(__linux__)
+#if !defined(_WIN32)
     if (!s_surface_direct)
         free(s_surface);
     s_surface_direct = 0;
@@ -1342,7 +1342,7 @@ static void surface_stage_reset(void) {
 
 static int surface_stage_begin(const uint8_t *mem) {
     uint32_t base = dma_resolve(s_gpu.color_offset);
-#if defined(__linux__)
+#if !defined(_WIN32)
     uint64_t right = (uint64_t) s_gpu.clip_x + s_gpu.clip_w;
     uint64_t bottom = (uint64_t) s_gpu.clip_y + s_gpu.clip_h;
     uint32_t bpp = surface_bpp();
@@ -1398,7 +1398,7 @@ static int surface_stage_begin(const uint8_t *mem) {
 }
 
 static void surface_stage_dirty(uint32_t y, uint32_t first, uint32_t end) {
-#if defined(__linux__)
+#if !defined(_WIN32)
     if (!s_surface || s_surface_direct || y >= s_surface_rows || first >= end) return;
     if (first < s_surface_first[y]) s_surface_first[y] = first;
     if (end > s_surface_end[y]) s_surface_end[y] = end;
@@ -1408,7 +1408,7 @@ static void surface_stage_dirty(uint32_t y, uint32_t first, uint32_t end) {
 }
 
 static int surface_stage_flush(const uint8_t *mem) {
-#if defined(__linux__)
+#if !defined(_WIN32)
     uint32_t y;
     if (!s_surface || s_surface_direct) return 1; /* drawn in place */
     for (y = 0; y < s_surface_rows; y++)
@@ -1985,12 +1985,12 @@ static int sample_stage(int st, uint32_t u, uint32_t v, uint32_t *argb) {
         return sample_texture(u, v, argb);
     saved = s_gpu.tex;
     s_gpu.tex = s_stage[st];
-#if defined(__linux__)
+#if !defined(_WIN32)
     int saved_stage = s_sampler_stage;
     s_sampler_stage = st;
 #endif
     r = sample_texture(u, v, argb);
-#if defined(__linux__)
+#if !defined(_WIN32)
     s_sampler_stage = saved_stage;
 #endif
     s_gpu.tex = saved;
@@ -3425,6 +3425,9 @@ static void raster_batch_xf(void) {
     if (s_gpu.tex.valid)
         note_texture_use();
     batch_triangles_xf(raster_xf_cb, NULL);
+#if !defined(_WIN32)
+    sg_sw_watch();   /* probe capture: the pixel after this software batch */
+#endif
 }
 
 /* Count constant arrays once per batch, never from the per-vertex fetch path.
@@ -3605,7 +3608,7 @@ static void draw_primitive(void) {
 
     if (!s_gpu.prim || !s_gpu.idx_count)
         return;
-#if defined(__linux__)
+#if !defined(_WIN32)
     surface_stage_reset();
     if (!snapshot_textures()) {
         static unsigned failures;
@@ -3843,7 +3846,7 @@ static void draw_primitive(void) {
                     uint32_t nz = 0;
                     if (!at->offset || !at->size)
                         continue;
-#if defined(__linux__)
+#if !defined(_WIN32)
                     uint8_t bytes[64];
                     if (!pb_diagnostic_read(at->offset, bytes, sizeof bytes)) {
                         fprintf(stderr, "  [GPU] attr%u bytes unavailable\n", a);
@@ -3866,7 +3869,7 @@ static void draw_primitive(void) {
                 const uint8_t *mem = (const uint8_t *) xbox_GetMemoryOffset();
                 uint32_t k;
                 fprintf(stderr, "  [GPU]   bytes @0x%08X:", s_gpu.attr[0].offset);
-#if defined(__linux__)
+#if !defined(_WIN32)
                 uint8_t bytes[32];
                 if (pb_diagnostic_read(s_gpu.attr[0].offset, bytes, sizeof bytes)) {
                     for (k = 0; k < sizeof bytes; ++k) fprintf(stderr, " %02X", bytes[k]);
@@ -4305,11 +4308,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param) {
         /* Texture offset 0: the FORMAT word that follows is the header's
          * Format field ({Common, Data, Lock, Format, Size}); find every
          * header in guest memory with that Format and Data == 0. */
-#if defined(__linux__)
+#if !defined(_WIN32)
         {
             static int pending, dumps;
             static uint32_t zva[8], zdraw[8], nz, zdone;
-            extern volatile uint32_t g_nv2a_pb_last_word_va;
+            extern uint32_t g_nv2a_pb_last_word_va;
             if (method == 0x1B00 && param == 0 && nz < 8) {
                 zva[nz] = g_nv2a_pb_last_word_va;
                 zdraw[nz] = s_gpu.draws;
@@ -4590,7 +4593,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param) {
                     s_gpu.draw_arrays_active = 0;
                 }
                 if (getenv("RECOMP_PB_DRAW_TRACE") && s_gpu.inline_count < 8) {
-                    extern volatile uint32_t g_nv2a_pb_last_word_va;
+                    extern uint32_t g_nv2a_pb_last_word_va;
                     fprintf(stderr, "  [GPU] INLINE[%u]=%08X prim=%u src_va=0x%08X\n",
                             s_gpu.inline_count, param, s_gpu.prim,
                             g_nv2a_pb_last_word_va);
@@ -4756,7 +4759,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param) {
                         hdr[28] = 32;
                         fwrite(hdr, 1, 54, f);
                         for (y = 0; y < h; y++) {
-#if defined(__linux__)
+#if !defined(_WIN32)
                             uint32_t row[4096];
                             if (!pb_diagnostic_read((uint64_t) base + (uint64_t) y * s_gpu.pitch, row,
                                                     (size_t) w * 4)) {
@@ -4874,7 +4877,7 @@ static void find_quad_vertices(void) {
     const uint32_t H = 0x43F00000u; /* 480.0f */
     const uint32_t *ram = (const uint32_t *) xbox_GetMemoryOffset();
     uint32_t i, hits = 0;
-#if defined(__linux__)
+#if !defined(_WIN32)
     uint32_t staged[1024 + 8], begin = UINT32_MAX;
     ram = staged;
 #endif
@@ -4882,7 +4885,7 @@ static void find_quad_vertices(void) {
     fprintf(stderr, "[GPU] searching guest RAM for 640.0f/480.0f pairs...\n");
     for (i = 0x1000 / 4; i < (0x04000000u / 4) - 8 && hits < 12; i++) {
         uint32_t at = i;
-#if defined(__linux__)
+#if !defined(_WIN32)
         if (begin == UINT32_MAX || i >= begin + 1024) {
             begin = i & ~1023u;
             size_t count = 0x04000000u / 4 - begin;
@@ -4934,7 +4937,7 @@ static void find_nan_matrices(void) {
     const uint32_t NAN_NEG = 0xFFC00000u;
     const uint32_t *ram = (const uint32_t *) xbox_GetMemoryOffset();
     uint32_t i, hits = 0;
-#if defined(__linux__)
+#if !defined(_WIN32)
     uint32_t staged[1024 + 20], begin = UINT32_MAX;
     ram = staged;
 #endif
@@ -4942,7 +4945,7 @@ static void find_nan_matrices(void) {
     fprintf(stderr, "[GPU] searching guest RAM for NaN matrices...\n");
     for (i = 0x1000 / 4; i < (0x04000000u / 4) - 20 && hits < 10; i++) {
         uint32_t at = i;
-#if defined(__linux__)
+#if !defined(_WIN32)
         if (begin == UINT32_MAX || i >= begin + 1024) {
             begin = i & ~1023u;
             size_t count = 0x04000000u / 4 - begin;

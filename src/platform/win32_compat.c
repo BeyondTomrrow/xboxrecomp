@@ -38,6 +38,7 @@ size_t view_take(const void *addr);
 #include <sys/sysctl.h>
 #include <sys/stat.h>
 #include <mach/mach.h>
+#include <mach/mach_time.h>
 #include <mach/mach_vm.h>
 #else
 #include <sys/sysinfo.h>
@@ -1496,20 +1497,39 @@ VOID GetLocalTime(LPSYSTEMTIME st)
     fill_systemtime(st, &tm, ts.tv_nsec);
 }
 
-ULONGLONG GetTickCount64(void)
+/* Monotonic nanoseconds. Darwin's clock_gettime(CLOCK_MONOTONIC) derives
+ * boot time through gettimeofday on every call; titles poll the clock
+ * constantly (GetTickCount spin-waits, and the global guest lock checks QPC
+ * at every preemption point), and on macOS that was ~30% of a guest thread.
+ * mach_absolute_time is a commpage read with no system call. Like Linux
+ * CLOCK_MONOTONIC, it does not advance while the machine sleeps. */
+static inline uint64_t mono_ns(void)
 {
+#if defined(__APPLE__)
+    static mach_timebase_info_data_t tb;
+    uint64_t t = mach_absolute_time();
+    if (!tb.denom)
+        mach_timebase_info(&tb);
+    if (tb.numer == tb.denom)
+        return t;
+    return (uint64_t)((__uint128_t)t * tb.numer / tb.denom);
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (ULONGLONG)ts.tv_sec * 1000ULL + (ULONGLONG)ts.tv_nsec / 1000000ULL;
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+#endif
+}
+
+ULONGLONG GetTickCount64(void)
+{
+    return (ULONGLONG)(mono_ns() / 1000000ULL);
 }
 
 DWORD GetTickCount(void) { return (DWORD)GetTickCount64(); }
 
 BOOL QueryPerformanceCounter(PLARGE_INTEGER count)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    count->QuadPart = (LONGLONG)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    count->QuadPart = (LONGLONG)mono_ns();
     return TRUE;
 }
 

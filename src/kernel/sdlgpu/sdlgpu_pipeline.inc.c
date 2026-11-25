@@ -16,6 +16,8 @@
  * (shaders/xf.*), told apart by SG_COLOR_XF.
  */
 
+static SDL_GPUShader *sg_fs_shader(uint32_t slot);   /* sdlgpu_fscache.inc.c */
+
 /* SgPipeKey.color */
 #define SG_COLOR_BLEND   (1u << 0)        /* bits 1-4: write mask R G B A */
 #define SG_COLOR_XF      (1u << 30)       /* 3D pipeline: xf shaders, SgXfVertex */
@@ -218,7 +220,7 @@ static SDL_GPUGraphicsPipeline *sg_pipeline_create(const SgPipeKey *key) {
     };
     SDL_GPUGraphicsPipelineCreateInfo info = {
         .vertex_shader = vp ? s_sg_vp[key->vs - 1].vs : xf ? s_sg.xf_vs : s_sg.flat2d_vs,
-        .fragment_shader = xf ? s_sg.xf_fs : s_sg.flat2d_fs,
+        .fragment_shader = !xf ? s_sg.flat2d_fs : key->fs ? sg_fs_shader(key->fs) : s_sg.xf_fs,
         .vertex_input_state = {
             .vertex_buffer_descriptions = &buffer, .num_vertex_buffers = 1,
             .vertex_attributes = vp ? vp_attrs : xf ? xf_attrs : flat_attrs,
@@ -277,18 +279,33 @@ static SDL_GPUGraphicsPipeline *sg_pipeline_create(const SgPipeKey *key) {
 }
 
 /* The pipeline for the current state; NULL when it cannot be drawn on the GPU. */
-static SDL_GPUGraphicsPipeline *sg_pipeline_current(int xf, uint32_t vs) {
+static SDL_GPUGraphicsPipeline *sg_pipeline_current(int xf, uint32_t vs, uint32_t fs) {
     SgPipeKey key;
     SgPipeline *p;
     int i;
+    uint32_t slot = 0;
 
     if (!sg_pipeline_key(xf, vs, &key))
         return NULL;
-    for (i = 0; i < s_sg.pipe_count; i++)
-        if (memcmp(&s_sg.pipes[i].key, &key, sizeof key) == 0)
-            return s_sg.pipes[i].pipe;
-    if (s_sg.pipe_count == SG_MAX_PIPELINES)
-        return NULL; /* more states than any title uses */
+    key.fs = fs;
+    {   /* hash lookup: a frame makes ~1000 of these */
+        const uint32_t *w = (const uint32_t *) &key;
+        uint32_t h = 2166136261u, k;
+        for (k = 0; k < sizeof key / 4; k++)
+            h = (h ^ w[k]) * 16777619u;
+        for (i = 0; i < SG_PIPE_HASH; i++) {
+            uint32_t at = (h + (uint32_t) i) & (SG_PIPE_HASH - 1);
+            int idx = s_sg.pipe_hash[at];
+            if (!idx) {
+                if (s_sg.pipe_count == SG_MAX_PIPELINES)
+                    return fs ? sg_pipeline_current(xf, vs, 0) : NULL; /* full: generic shader */
+                slot = at;   /* claimed once the pipeline exists */
+                break;
+            }
+            if (memcmp(&s_sg.pipes[idx - 1].key, &key, sizeof key) == 0)
+                return s_sg.pipes[idx - 1].pipe;
+        }
+    }
     p = &s_sg.pipes[s_sg.pipe_count];
     p->pipe = sg_pipeline_create(&key);
     if (!p->pipe) {
@@ -298,5 +315,6 @@ static SDL_GPUGraphicsPipeline *sg_pipeline_current(int xf, uint32_t vs) {
     }
     p->key = key;
     s_sg.pipe_count++;
+    s_sg.pipe_hash[slot] = (uint16_t) s_sg.pipe_count;
     return p->pipe;
 }

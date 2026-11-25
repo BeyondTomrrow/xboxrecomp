@@ -69,6 +69,17 @@ else()
                 VERBATIM)
             list(APPEND _sg_headers ${_sg_out}/${_sg_name}.h)
         endforeach()
+        # xf.frag's source as well: specialised variants are compiled from
+        # it at run time (sdlgpu/sdlgpu_fscache.inc.c).
+        add_custom_command(
+            OUTPUT ${_sg_out}/xf_frag_src.h
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${_sg_out}
+            COMMAND ${CMAKE_COMMAND} -DIN=${_sg_src}/xf.frag -DOUT=${_sg_out}/xf_frag_src.h
+                    -DNAME=k_sg_xf_frag_src -P ${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/embed_text.cmake
+            DEPENDS ${_sg_src}/xf.frag ${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/embed_text.cmake
+            COMMENT "embed: xf.frag source"
+            VERBATIM)
+        list(APPEND _sg_headers ${_sg_out}/xf_frag_src.h)
         add_custom_target(xbox_sdlgpu_shaders DEPENDS ${_sg_headers})
         add_dependencies(xbox_kernel xbox_sdlgpu_shaders)
         target_include_directories(xbox_kernel PRIVATE ${_sg_out})
@@ -85,6 +96,27 @@ else()
         target_compile_definitions(xbox_kernel PRIVATE SG_HAVE_GLSLANG=1)
     else()
         message(STATUS "glslang library not found: vertex programs stay on the CPU")
+    endif()
+
+    # SPIRV-Cross: the Metal backend (macOS) takes MSL, not SPIR-V. The
+    # renderer cross-compiles its SPIR-V at run time (sdlgpu/sdlgpu_msl.inc.c).
+    # Each component ships its own config, none pulls in the others, and
+    # spirv_cross_c refuses to load until the targets it names exist: find
+    # them first, in dependency order.
+    foreach(_spvc core glsl hlsl msl cpp reflect c)
+        find_package(spirv_cross_${_spvc} CONFIG QUIET)
+    endforeach()
+    if(spirv_cross_c_FOUND)
+        target_link_libraries(xbox_kernel PRIVATE spirv-cross-c)
+        if(APPLE)
+            target_link_libraries(xbox_kernel PRIVATE c++)   # static C++ library from a C target
+        else()
+            target_link_libraries(xbox_kernel PRIVATE stdc++)
+        endif()
+        target_compile_definitions(xbox_kernel PRIVATE SG_HAVE_SPIRV_CROSS=1)
+        message(STATUS "SPIRV-Cross found: SDL3 GPU renderer can use Metal (MSL)")
+    elseif(APPLE)
+        message(STATUS "SPIRV-Cross not found: the SDL3 GPU renderer is unavailable on Metal (brew install spirv-cross)")
     endif()
 endif()
 
