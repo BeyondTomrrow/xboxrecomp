@@ -351,11 +351,10 @@ static int SDLCALL fb_thread_sdl(void *data) {
                     );
                     fb_texture_opaque(g_fb.fallback_texture);
                 }
-                if (!presenter(win, g_fb.ultrawide)) {
-                    SDL_SetAtomicPointer((void **)&g_fb.presenter, NULL);
-                    SDL_SetAtomicInt(&g_fb.gpu_present, 0);   /* back to the SDL_Renderer */
-                    gpu_expected_until = 0;
-                }
+                /* presenter is NULL on this branch: no GPU presenter to call.
+                 * (Calling it here was a NULL call; clang turns it into a
+                 * trap, which killed the window as soon as it drew.) */
+                gpu_expected_until = 0;
 
                 fb_draw_sdl_fallback();
             }
@@ -363,6 +362,12 @@ static int SDLCALL fb_thread_sdl(void *data) {
 
         if (dump_path && ++dump_frames == 60)
             xbox_FramebufferDumpBmp(dump_path);
+        if (dump_path && dump_frames % 15 == 0) {   /* on request: touch <path>.req */
+            char req[1024];
+            snprintf(req, sizeof req, "%s.req", dump_path);
+            if (remove(req) == 0)
+                xbox_FramebufferDumpBmp(dump_path);
+        }
 
         SDL_Delay(SDL_GetAtomicPointer((void **)&g_fb.presenter) ? 1
                 : SDL_GetAtomicInt(&g_fb.gpu_present) ? 8 : 16);
@@ -392,10 +397,41 @@ static int SDLCALL fb_thread_sdl(void *data) {
     return 0;
 }
 
+#if defined(__APPLE__)
+/* Cocoa owns windows and events on the main thread only: SDL_Init(VIDEO)
+ * anywhere else fails with "No available video device". On macOS the host
+ * runs the game on a secondary thread and parks the main thread in
+ * xbox_FramebufferMainThreadRun(), which runs the window loop below when the
+ * game asks for a window. */
+#include <pthread.h>
+static pthread_mutex_t s_fb_main_mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  s_fb_main_cv = PTHREAD_COND_INITIALIZER;
+static int s_fb_main_request;
+
+void xbox_FramebufferMainThreadRun(void) {
+    for (;;) {
+        pthread_mutex_lock(&s_fb_main_mx);
+        while (!s_fb_main_request)
+            pthread_cond_wait(&s_fb_main_cv, &s_fb_main_mx);
+        s_fb_main_request = 0;
+        pthread_mutex_unlock(&s_fb_main_mx);
+        fb_thread_sdl(NULL);   /* returns only when the window failed to open */
+        SDL_Delay(250);        /* the game retries every frame; don't spin */
+    }
+}
+#endif
+
 static void fb_window_start(void) {
     if (SDL_GetAtomicInt(&g_fb.closing))
         return; /* the user closed the window: the game is ending */
     if (SDL_CompareAndSwapAtomicInt(&g_fb.running, 0, 1)) {
+#if defined(__APPLE__)
+        pthread_mutex_lock(&s_fb_main_mx);
+        s_fb_main_request = 1;
+        pthread_cond_signal(&s_fb_main_cv);
+        pthread_mutex_unlock(&s_fb_main_mx);
+        return;
+#endif
         g_fb.thread = SDL_CreateThread(fb_thread_sdl, "fb_thread", NULL);
         if (!g_fb.thread) {
             SDL_SetAtomicInt(&g_fb.running, 0);

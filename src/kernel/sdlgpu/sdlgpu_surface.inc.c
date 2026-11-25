@@ -12,11 +12,19 @@
 
 static void sg_download(SgSurface *s);
 
+/* RECOMP_SDLGPU_FPS: per-second flips, downloads (each a full GPU sync)
+ * and surface uploads, printed by sg_present_flip. */
+static SDL_AtomicInt s_sg_stat_flips, s_sg_stat_downloads, s_sg_stat_uploads, s_sg_stat_passes, s_sg_stat_draws;
+static SDL_AtomicInt s_sg_stat_drain_us, s_sg_stat_dl_us;   /* download: prior GPU work, then the copy itself */
+
 static uint8_t *sg_guest_bytes(uint32_t va) {
     return (uint8_t *) xbox_GetMemoryOffset() + va;
 }
 
 static void sg_surface_release(SgSurface *s) {
+    free(s->shadow);
+    if (s->low)
+        SDL_ReleaseGPUTexture(s_sg.dev, s->low);
     if (s->color)
         SDL_ReleaseGPUTexture(s_sg.dev, s->color);
     if (s->depth)
@@ -24,19 +32,82 @@ static void sg_surface_release(SgSurface *s) {
     memset(s, 0, sizeof *s);
 }
 
+/* Internal-resolution multiplier for a new w x h surface: the video
+ * settings' scale (F1 > Video, "Internal resolution"), or
+ * RECOMP_SDLGPU_SCALE, kept under 8192 px a side. */
+static uint32_t sg_scale_for(uint32_t w, uint32_t h) {
+    static int env = -1;
+    int k;
+    if (env < 0) {
+        const char *e = getenv("RECOMP_SDLGPU_SCALE");
+        env = e ? atoi(e) : 0;
+    }
+    k = env > 0 ? env : s_vs.scale;
+    if (k < 1) k = 1;
+    if (k > 8) k = 8;
+    while (k > 1 && ((uint32_t) k * w > 8192u || (uint32_t) k * h > 8192u))
+        k--;
+    return (uint32_t) k;
+}
+
+/* The surface's 1x staging texture, created on first need. */
+static SDL_GPUTexture *sg_surface_low(SgSurface *s) {
+    if (!s->low) {
+        SDL_GPUTextureCreateInfo info = {
+            .type = SDL_GPU_TEXTURETYPE_2D,
+            .format = SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM,
+            .usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER,
+            .width = s->w, .height = s->h, .layer_count_or_depth = 1, .num_levels = 1,
+        };
+        s->low = SDL_CreateGPUTexture(s_sg.dev, &info);
+        if (!s->low)
+            sg_gpu_error("surface staging texture");
+    }
+    return s->low;
+}
+
+static void sg_blit(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *src, uint32_t sw, uint32_t sh,
+                    SDL_GPUTexture *dst, uint32_t dw, uint32_t dh) {
+    SDL_GPUBlitInfo b;
+    SDL_zero(b);
+    b.source.texture = src;
+    b.source.w = sw;
+    b.source.h = sh;
+    b.destination.texture = dst;
+    b.destination.w = dw;
+    b.destination.h = dh;
+    b.load_op = SDL_GPU_LOADOP_DONT_CARE;
+    b.filter = SDL_GPU_FILTER_LINEAR;
+    SDL_BlitGPUTexture(cmd, &b);
+}
+
+/* Where a guest-RAM upload of s lands: color itself at 1x, else `low`,
+ * which sg_surface_upscale() then stretches into color. */
+static SDL_GPUTexture *sg_surface_upload_target(SgSurface *s) {
+    SDL_AddAtomicInt(&s_sg_stat_uploads, 1);
+    s->shadow_valid = 0;   /* the GPU copy is about to become the guest's */
+    return s->k > 1 ? sg_surface_low(s) : s->color;
+}
+
+static void sg_surface_upscale(SDL_GPUCommandBuffer *cmd, SgSurface *s) {
+    if (s->k > 1 && s->low)
+        sg_blit(cmd, s->low, s->w, s->h, s->color, s->w * s->k, s->h * s->k);
+}
+
 /* Colour and depth-stencil textures for a new w x h surface. */
 static int sg_surface_create(SgSurface *s, uint32_t w, uint32_t h) {
+    uint32_t k = sg_scale_for(w, h);
     SDL_GPUTextureCreateInfo color = {
         .type = SDL_GPU_TEXTURETYPE_2D,
         .format = SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM,
         .usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER,
-        .width = w, .height = h, .layer_count_or_depth = 1, .num_levels = 1,
+        .width = w * k, .height = h * k, .layer_count_or_depth = 1, .num_levels = 1,
     };
     SDL_GPUTextureCreateInfo depth = {
         .type = SDL_GPU_TEXTURETYPE_2D,
         .format = s_sg.depth_format,
         .usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET,
-        .width = w, .height = h, .layer_count_or_depth = 1, .num_levels = 1,
+        .width = w * k, .height = h * k, .layer_count_or_depth = 1, .num_levels = 1,
     };
     s->color = SDL_CreateGPUTexture(s_sg.dev, &color);
     s->depth = s->color ? SDL_CreateGPUTexture(s_sg.dev, &depth) : NULL;
@@ -45,6 +116,10 @@ static int sg_surface_create(SgSurface *s, uint32_t w, uint32_t h) {
         sg_surface_release(s);
         return 0;
     }
+    s->k = k;
+    s->low = NULL;
+    s->shadow = NULL;
+    s->shadow_valid = 0;
     return 1;
 }
 
@@ -120,14 +195,37 @@ static void sg_download(SgSurface *s) {
             return; /* keeps GPU ownership; the next attempt retries */
     }
 
+    static int timing = -1;
+    Uint64 t_drain = 0, t_dl = 0;
+    if (timing < 0) timing = getenv("RECOMP_SDLGPU_FPS") != NULL;
+    if (timing) {   /* drain earlier GPU work first, so the two costs separate */
+        SDL_GPUCommandBuffer *c0 = SDL_AcquireGPUCommandBuffer(s_sg.dev);
+        SDL_GPUFence *f0;
+        t_drain = SDL_GetTicksNS();
+        if (c0 && (f0 = SDL_SubmitGPUCommandBufferAndAcquireFence(c0))) {
+            SDL_WaitForGPUFences(s_sg.dev, true, &f0, 1);
+            SDL_ReleaseGPUFence(s_sg.dev, f0);
+        }
+        t_dl = SDL_GetTicksNS();
+        SDL_AddAtomicInt(&s_sg_stat_drain_us, (int) ((t_dl - t_drain) / 1000));
+    }
     cmd = SDL_AcquireGPUCommandBuffer(s_sg.dev);
     if (!cmd) {
         sg_gpu_error("download: command buffer");
         return; /* keeps GPU ownership */
     }
+    SDL_AddAtomicInt(&s_sg_stat_downloads, 1);
+    /* Scaled: shrink to 1x on the GPU first; guest RAM is 1x. */
+    if (s->k > 1) {
+        if (!sg_surface_low(s)) {
+            SDL_CancelGPUCommandBuffer(cmd);
+            return;
+        }
+        sg_blit(cmd, s->color, s->w * s->k, s->h * s->k, s->low, s->w, s->h);
+    }
     copy = SDL_BeginGPUCopyPass(cmd);
     {
-        SDL_GPUTextureRegion from = {.texture = s->color, .w = s->w, .h = s->h, .d = 1};
+        SDL_GPUTextureRegion from = {.texture = s->k > 1 ? s->low : s->color, .w = s->w, .h = s->h, .d = 1};
         SDL_GPUTextureTransferInfo to = {.transfer_buffer = s_sg.download};
         SDL_DownloadFromGPUTexture(copy, &from, &to);
     }
@@ -139,6 +237,8 @@ static void sg_download(SgSurface *s) {
     }
     SDL_WaitForGPUFences(s_sg.dev, true, &done, 1);
     SDL_ReleaseGPUFence(s_sg.dev, done);
+    if (timing)
+        SDL_AddAtomicInt(&s_sg_stat_dl_us, (int) ((SDL_GetTicksNS() - t_dl) / 1000));
 
     src = (const uint8_t *) SDL_MapGPUTransferBuffer(s_sg.dev, s_sg.download, false);
     if (!src) {
@@ -148,8 +248,31 @@ static void sg_download(SgSurface *s) {
     dst = sg_guest_bytes(s->guest);
     for (y = 0; y < s->h; y++)
         memcpy(dst + (size_t) y * s->pitch, src + (size_t) y * row, row);
+    if (!s->shadow)
+        s->shadow = (uint8_t *) malloc(bytes);
+    if (s->shadow) {
+        memcpy(s->shadow, src, bytes);
+        s->shadow_valid = 1;
+    }
     SDL_UnmapGPUTransferBuffer(s_sg.dev, s_sg.download);
     s->owner = SG_OWNER_GUEST;
+}
+
+/* Guest-owned, but guest RAM is byte-for-byte what the last download left
+ * there: the GPU copy is still current, so take it back without an upload. */
+static int sg_surface_reclaim(SgSurface *s) {
+    const uint8_t *g;
+    uint32_t row = s->w * 4, y;
+    if (s->owner != SG_OWNER_GUEST || !s->shadow_valid || !s->shadow)
+        return 0;
+    g = sg_guest_bytes(s->guest);
+    for (y = 0; y < s->h; y++)
+        if (memcmp(g + (size_t) y * s->pitch, s->shadow + (size_t) y * row, row) != 0) {
+            s->shadow_valid = 0;   /* the title or a software draw wrote it */
+            return 0;
+        }
+    s->owner = SG_OWNER_GPU;
+    return 1;
 }
 
 /* The guest copy of a surface, rows packed tight, for uploading when the

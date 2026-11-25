@@ -13,6 +13,7 @@
  */
 
 #define SG_VP_CACHE 1024               /* power of two */
+#define SG_VP_JOBS  (SG_VP_CACHE + 512) /* + fragment variants (SG_FS_CACHE) */
 
 enum { SG_VP_EMPTY, SG_VP_COMPILING, SG_VP_SPIRV, SG_VP_READY, SG_VP_FAILED };
 
@@ -23,6 +24,9 @@ typedef struct {
     char          *src;                /* GLSL, handed to the worker */
     uint32_t      *spirv;              /* the worker's result */
     size_t         words;
+    char          *msl;                /* ...converted, when the device takes MSL */
+    int            frag;               /* a fragment variant (sdlgpu_fscache.inc.c) */
+    uint32_t       fkey[61];           /* its full key (SG_FS_KEY) */
     SDL_GPUShader *vs;                 /* READY */
 } SgVpProg;
 
@@ -32,7 +36,7 @@ static struct {
     SDL_Thread    *thread;
     SDL_Mutex     *lock;
     SDL_Condition *wake;
-    SgVpProg      *jobs[SG_VP_CACHE];  /* never more jobs than entries */
+    SgVpProg      *jobs[SG_VP_JOBS];   /* never more jobs than entries */
     unsigned       head, tail;
     int            tried;
 } s_sg_vpq;
@@ -89,12 +93,23 @@ static int SDLCALL sg_vp_worker(void *arg)
         SDL_LockMutex(s_sg_vpq.lock);
         while (s_sg_vpq.head == s_sg_vpq.tail)
             SDL_WaitCondition(s_sg_vpq.wake, s_sg_vpq.lock);
-        p = s_sg_vpq.jobs[s_sg_vpq.head++ % SG_VP_CACHE];
+        p = s_sg_vpq.jobs[s_sg_vpq.head++ % SG_VP_JOBS];
         SDL_UnlockMutex(s_sg_vpq.lock);
 
-        p->spirv = sg_glsl_to_spirv(p->src, 1, &p->words);
+        p->spirv = sg_glsl_to_spirv(p->src, !p->frag, &p->words);
         free(p->src);
         p->src = NULL;
+#ifdef SG_HAVE_SPIRV_CROSS
+        /* Metal: cross-compile here too, so the draw thread only creates. */
+        if (p->spirv && s_sg.shader_format == SDL_GPU_SHADERFORMAT_MSL) {
+            p->msl = sg_spirv_to_msl(p->spirv, p->words, !p->frag);
+            free(p->spirv);
+            p->spirv = NULL;
+            p->words = 0;
+            SDL_SetAtomicInt(&p->state, p->msl ? SG_VP_SPIRV : SG_VP_FAILED);
+            continue;
+        }
+#endif
         SDL_SetAtomicInt(&p->state, p->spirv ? SG_VP_SPIRV : SG_VP_FAILED);
     }
     return 0;
@@ -149,7 +164,7 @@ static SDL_GPUShader *sg_vp_program(uint32_t *slot_out)
             p->src = src;
             SDL_SetAtomicInt(&p->state, SG_VP_COMPILING);
             SDL_LockMutex(s_sg_vpq.lock);
-            s_sg_vpq.jobs[s_sg_vpq.tail++ % SG_VP_CACHE] = p;
+            s_sg_vpq.jobs[s_sg_vpq.tail++ % SG_VP_JOBS] = p;
             SDL_SignalCondition(s_sg_vpq.wake);
             SDL_UnlockMutex(s_sg_vpq.lock);
             return NULL;
@@ -159,12 +174,18 @@ static SDL_GPUShader *sg_vp_program(uint32_t *slot_out)
 
         if (st == SG_VP_SPIRV) {
             /* Compiled: make the SDL shader here, on the draw thread. */
-            SDL_GPUShaderCreateInfo info = {
-                .code = (const Uint8 *)p->spirv, .code_size = p->words * sizeof *p->spirv,
-                .entrypoint = "main", .format = SDL_GPU_SHADERFORMAT_SPIRV,
-                .stage = SDL_GPU_SHADERSTAGE_VERTEX, .num_uniform_buffers = 1,
-            };
-            p->vs = SDL_CreateGPUShader(s_sg.dev, &info);
+            if (p->msl) {
+                p->vs = sg_shader_from_msl(p->msl, SDL_GPU_SHADERSTAGE_VERTEX, 0, 1);
+                free(p->msl);
+                p->msl = NULL;
+            } else {
+                SDL_GPUShaderCreateInfo info = {
+                    .code = (const Uint8 *)p->spirv, .code_size = p->words * sizeof *p->spirv,
+                    .entrypoint = "main", .format = SDL_GPU_SHADERFORMAT_SPIRV,
+                    .stage = SDL_GPU_SHADERSTAGE_VERTEX, .num_uniform_buffers = 1,
+                };
+                p->vs = SDL_CreateGPUShader(s_sg.dev, &info);
+            }
             free(p->spirv);
             p->spirv = NULL;
             if (!p->vs)

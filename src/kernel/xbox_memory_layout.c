@@ -32,6 +32,11 @@
 #include <sys/mman.h>
 #include <ucontext.h>
 #endif
+#if defined(__APPLE__) && defined(__aarch64__)
+#include <signal.h>
+#include <sys/mman.h>
+#include "../platform/mmio_decode_arm64.h"
+#endif
 #endif
 
 /* XBE header field offsets (per xboxdevwiki.net/Xbe) */
@@ -429,6 +434,39 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
 }
 
 #else
+#if defined(__APPLE__) && defined(__aarch64__)
+/* The trap covers a whole host page: 16 KB on Apple Silicon, not 4. */
+static size_t ac97_trap_span(void)
+{
+    size_t page = (size_t)getpagesize();
+    return page > AC97_TRAP_BYTES ? page : AC97_TRAP_BYTES;
+}
+
+static bool ac97_a64_read(void *dev, uintptr_t host, int size, uint64_t *out)
+{
+    uint64_t v = 0;
+    (void)dev;
+    memcpy(&v, (const void *)host, (size_t)size);   /* PROT_READ: no fault */
+    *out = v;
+    return true;
+}
+
+static bool ac97_a64_write(void *dev, uintptr_t host, uint64_t val, int size)
+{
+    (void)dev;
+    if (host < (uintptr_t)g_ac97_page
+            || host + (uintptr_t)size > (uintptr_t)g_ac97_page + ac97_trap_span())
+        return false;
+    if (mprotect(g_ac97_page, ac97_trap_span(), PROT_READ | PROT_WRITE) != 0)
+        return false;
+    memcpy((void *)host, &val, (size_t)size);
+    ac97_clear_reset_bits();
+    if (mprotect(g_ac97_page, ac97_trap_span(), PROT_READ) != 0)
+        _exit(3); /* Cannot safely resume with writable reset registers. */
+    return true;
+}
+#endif
+
 void xbox_ac97_set_posix_handler_ready(BOOL ready)
 {
     /* Startup registration only; no page is protected until both dispatchers exist. */
@@ -461,6 +499,17 @@ BOOL xbox_ac97_handle_posix_signal(int signal_number, int signal_code, uintptr_t
         context->uc_mcontext.gregs[REG_EFL] |= (greg_t)0x100u;
         return TRUE;
     }
+#elif defined(__APPLE__) && defined(__aarch64__)
+    /* No user-mode single step on AArch64, so emulate the store instead of
+     * stepping it: open the page, perform it, clear the reset bits, close the
+     * page, PC += 4. The page is PROT_READ, so only writes fault here. Darwin
+     * reports a protection fault as SIGBUS as often as SIGSEGV. */
+    (void)signal_code;
+    if (!g_ac97_page || !raw_context) return FALSE;
+    if ((signal_number == SIGSEGV || signal_number == SIGBUS)
+            && fault_address >= (uintptr_t)g_ac97_page
+            && fault_address - (uintptr_t)g_ac97_page < ac97_trap_span())
+        return a64_mmio_emulate(raw_context, NULL, ac97_a64_read, ac97_a64_write) ? TRUE : FALSE;
 #else
     (void)signal_number; (void)signal_code; (void)fault_address; (void)raw_context;
 #endif
@@ -497,6 +546,8 @@ static BOOL ac97_arm_write_trap(void)
 #else
 #if defined(__linux__) && defined(__x86_64__)
     if (!g_ac97_posix_handler_ready || mprotect(g_ac97_page, AC97_TRAP_BYTES, PROT_READ) != 0) {
+#elif defined(__APPLE__) && defined(__aarch64__)
+    if (!g_ac97_posix_handler_ready || mprotect(g_ac97_page, ac97_trap_span(), PROT_READ) != 0) {
 #else
     if (1) { /* No verified single-step context implementation for this host. */
 #endif
@@ -2516,10 +2567,20 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                  * what was written. Each window's last page (GPRST/EPRST at
                  * +0xFFFC) stays trapped. */
                 if (g_apu_mmio_trapped) {
-                    VirtualProtect((char *)g_mcpx_memory + 0x30000u, 0xF000u,
-                                   PAGE_READWRITE, &old_protect);
-                    VirtualProtect((char *)g_mcpx_memory + 0x50000u, 0xF000u,
-                                   PAGE_READWRITE, &old_protect);
+                    /* mprotect rounds the length up to a host page. With 16 KB
+                     * pages (Apple Silicon) that would open GPRST/EPRST too, so
+                     * open only the host pages wholly inside the window; the
+                     * arm64 APU handler shadows the remainder. */
+                    SIZE_T win = 0xF000u;
+#if !defined(_WIN32)
+                    win &= ~(SIZE_T)(getpagesize() - 1);
+#endif
+                    if (win) {
+                        VirtualProtect((char *)g_mcpx_memory + 0x30000u, win,
+                                       PAGE_READWRITE, &old_protect);
+                        VirtualProtect((char *)g_mcpx_memory + 0x50000u, win,
+                                       PAGE_READWRITE, &old_protect);
+                    }
                 }
                 if (g_apu_mmio_trapped)
                     fprintf(stderr, "  APU: 0x%08X..0x%08X trapped for MMIO\n",

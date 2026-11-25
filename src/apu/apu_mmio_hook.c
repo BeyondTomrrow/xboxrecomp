@@ -417,3 +417,97 @@ bool apu_hook_handle_mmio(void *raw_ctx, uintptr_t fault_addr,
 }
 
 #endif
+#if defined(__APPLE__) && defined(__aarch64__)
+/* ---- arm64 macOS: AArch64 load/store emulation --------------------------
+ *
+ * Same contract as the x86-64 handler above: the APU's 512K is PAGE_NOACCESS,
+ * the SIGSEGV/SIGBUS handler in the game target calls in here, and the access
+ * is answered by the emulated APU instead of memory. The instruction decoding
+ * is mmio_decode_arm64.h.
+ *
+ * The GP/EP DSP memory windows (0x30000..0x3EFFF, 0x50000..0x5EFFF) are plain
+ * memory on a 4 KB-page host. Apple Silicon pages are 16 KB, so the window's
+ * last host page also holds the trapped GPRST/EPRST page, and the layout code
+ * leaves that whole host page trapped. Window bytes that land in it are kept
+ * in a shadow here, so they still read back what was written. */
+#include "../platform/mmio_decode_arm64.h"
+#include <string.h>
+
+#define APU_GP_WIN   0x30000u
+#define APU_EP_WIN   0x50000u
+#define APU_WIN_SIZE 0xF000u
+static uint8_t s_apu_win_shadow[2][APU_WIN_SIZE];
+
+typedef struct { uintptr_t host_minus_va; } ApuA64Dev;
+
+static uint8_t *apu_window_byte(uint32_t off)
+{
+    if (off >= APU_GP_WIN && off < APU_GP_WIN + APU_WIN_SIZE)
+        return &s_apu_win_shadow[0][off - APU_GP_WIN];
+    if (off >= APU_EP_WIN && off < APU_EP_WIN + APU_WIN_SIZE)
+        return &s_apu_win_shadow[1][off - APU_EP_WIN];
+    return NULL;
+}
+
+static bool apu_a64_read(void *dev, uintptr_t host, int size, uint64_t *out)
+{
+    uint64_t va = (uint64_t)(host - ((ApuA64Dev *)dev)->host_minus_va);
+    if (va < APU_MMIO_BASE || va + (uint64_t)size > APU_MMIO_BASE + APU_MMIO_SIZE)
+        return false;
+    uint32_t off = (uint32_t)(va - APU_MMIO_BASE);
+    uint8_t *w = apu_window_byte(off);
+    if (w && apu_window_byte(off + (uint32_t)size - 1u)) {
+        uint64_t v = 0;
+        memcpy(&v, w, (size_t)size);
+        *out = v;
+    } else if (size == 8) {
+        *out = (mcpx_apu_mmio_read(g_apu_state, off, 4) & 0xFFFFFFFFull)
+             | (mcpx_apu_mmio_read(g_apu_state, off + 4u, 4) << 32);
+    } else {
+        *out = mcpx_apu_mmio_read(g_apu_state, off, (unsigned)size);
+    }
+    g_apu_mmio_read_count++;
+    return true;
+}
+
+static bool apu_a64_write(void *dev, uintptr_t host, uint64_t val, int size)
+{
+    uint64_t va = (uint64_t)(host - ((ApuA64Dev *)dev)->host_minus_va);
+    if (va < APU_MMIO_BASE || va + (uint64_t)size > APU_MMIO_BASE + APU_MMIO_SIZE)
+        return false;
+    uint32_t off = (uint32_t)(va - APU_MMIO_BASE);
+    uint8_t *w = apu_window_byte(off);
+    if (w && apu_window_byte(off + (uint32_t)size - 1u)) {
+        memcpy(w, &val, (size_t)size);
+    } else if (size == 8) {
+        mcpx_apu_mmio_write(g_apu_state, off, val & 0xFFFFFFFFull, 4);
+        mcpx_apu_mmio_write(g_apu_state, off + 4u, val >> 32, 4);
+    } else {
+        mcpx_apu_mmio_write(g_apu_state, off, val, (unsigned)size);
+    }
+    g_apu_mmio_write_count++;
+    return true;
+}
+
+bool apu_hook_handle_mmio(void *raw_ctx, uintptr_t fault_addr,
+                          uint32_t fault_xbox_va, int is_write)
+{
+    if (!g_apu_state) return false;
+    ApuA64Dev dev = { fault_addr - (uintptr_t)fault_xbox_va };
+    bool ok = a64_mmio_emulate(raw_ctx, &dev, apu_a64_read, apu_a64_write);
+    if (!ok && g_apu_mmio_decode_fail++ < 8) {
+        ucontext_t *uc = (ucontext_t *)raw_ctx;
+        fprintf(stderr, "  [APUMMIO] arm64 decode failed: insn %08X at %p (%s 0x%08X)\n",
+                *(const uint32_t *)(uintptr_t)uc->uc_mcontext->__ss.__pc,
+                (void *)(uintptr_t)uc->uc_mcontext->__ss.__pc,
+                is_write ? "write" : "read", fault_xbox_va);
+    }
+    if (getenv("RECOMP_APU_TRACE")) {
+        static unsigned n;
+        if (n++ < 400)
+            fprintf(stderr, "  [APUMMIO] %s 0x%05X%s\n", is_write ? "write" : "read ",
+                    fault_xbox_va - APU_MMIO_BASE, ok ? "" : "  (decode failed)");
+    }
+    return ok;
+}
+#endif

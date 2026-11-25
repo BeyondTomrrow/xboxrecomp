@@ -30,6 +30,12 @@ layout(set = 2, binding = 0) uniform sampler2D tex0;
 layout(set = 2, binding = 1) uniform sampler2D tex1;
 layout(set = 2, binding = 2) uniform sampler2D tex2;
 layout(set = 2, binding = 3) uniform sampler2D tex3;
+// Cube-map stages (SET_TEXTURE_FORMAT bit 2): the same stage's texture as a
+// real cube. Unused slots get a 1x1 white cube.
+layout(set = 2, binding = 4) uniform samplerCube cube0;
+layout(set = 2, binding = 5) uniform samplerCube cube1;
+layout(set = 2, binding = 6) uniform samplerCube cube2;
+layout(set = 2, binding = 7) uniform samplerCube cube3;
 
 // The combiner program and per-batch state. Layout must match SgXfShade in
 // sdlgpu_xf.inc.c (std140: every member here is a uvec4 or array of them).
@@ -49,7 +55,36 @@ layout(set = 3, binding = 0, std140) uniform Shade {
     uvec4 mode;           // per stage: texture-shader mode (stage program, 5 bits each)
     uvec4 rect;           // per stage: 1 = coordinates in texels (linear texture), 0 = normalised
     uvec4 depth;
+    uvec4 dotmap;         // per stage: SET_DOT_RGBMAPPING (NV_PGRAPH_SHADERCTL)
+    uvec4 sinput;         // per stage: the earlier stage a dot-product mode reads
+    uvec4 cube;           // per stage: the texture is a cube map (cube0..3)
 } sh;
+
+// ---- control words: uniforms, or constants in a specialised variant ----
+// The renderer compiles a variant per distinct combiner setup
+// (sdlgpu_fscache.inc.c), prepending SG_SPEC and these as constants. The
+// compiler then unrolls the stage loop, folds every branch below and
+// resolves the register-file indices, which the generic shader -- an
+// interpreter -- pays for on every pixel. P_NO_FRAGDEPTH (variant only):
+// no w-buffer and no clip range, so the rasterised depth is already right
+// and not writing gl_FragDepth keeps early depth testing / hidden-surface
+// removal on (tile-based GPUs turn it off for shaders that write depth).
+#ifndef SG_SPEC
+#define P_PROG       sh.prog
+#define P_SAMPLED    sh.misc.z
+#define P_ALPHA_ON   sh.alpha.x
+#define P_ALPHA_FUNC sh.alpha.y
+#define P_CICW       sh.color_icw
+#define P_COCW       sh.color_ocw
+#define P_AICW       sh.alpha_icw
+#define P_AOCW       sh.alpha_ocw
+#define P_MODE       sh.mode
+#define P_RECT       sh.rect
+#define P_DEPTHX     sh.depth.x
+#define P_DOTMAP     sh.dotmap
+#define P_INPUT      sh.sinput
+#define P_CUBE       sh.cube
+#endif
 
 // Same nudge as flat2d.frag: exact texel boundaries land on the same texel
 // as the software path despite interpolation rounding.
@@ -105,16 +140,25 @@ vec4 tex2d(int s, vec2 nuv)
 // texture, normalised otherwise (D3D11 tex2dc).
 vec4 tex2dc(int s, vec2 uv)
 {
-    if (sh.rect[s] != 0u)
+    if (P_RECT[s] != 0u)
     uv /= vec2(sh.tex[s].xy);
     return tex2d(s, uv);
 }
 
-// A direction looked up on a 2D texture: remapped onto the face it points
-// at (xemu remapCubeTo2D, D3D11 texdir). Real cube textures are sampled the
-// same way on their first face until cube sampling lands.
+vec4 texcube(int s, vec3 d)
+{
+    if (s == 0) return texture(cube0, d);
+    if (s == 1) return texture(cube1, d);
+    if (s == 2) return texture(cube2, d);
+    return texture(cube3, d);
+}
+
+// A direction: the cube map itself when the stage has one, else remapped
+// onto the face of a 2D texture it points at (xemu remapCubeTo2D, D3D11
+// texdir).
 vec4 texdir(int s, vec3 d)
 {
+    if (P_CUBE[s] != 0u) return texcube(s, d);
     vec3 a = max(abs(d), vec3(1e-8));
     vec2 uv;
     if (a.x > a.y && a.x > a.z)      uv = (d.x > 0.0 ? vec2(-d.z, d.y) : vec2(d.z, d.y)) / a.x;
@@ -123,18 +167,69 @@ vec4 texdir(int s, vec3 d)
     return tex2d(s, uv * 0.5 + 0.5);
 }
 
-// One stage's value for the combiners. on: a texture is bound to the stage.
-vec4 stage_sample(int s, vec4 pt, uint m, bool on)
+// Dot-product mappings of an earlier stage's texel (SET_DOT_RGBMAPPING),
+// as nv2a_gpu_d3d11.hlsl dotmapf; the HILO modes are unimplemented, as in xemu.
+float sign1(float x) { x *= 255.0; return (x - 128.0) / 127.0; }
+float sign2(float x) { x *= 255.0; return x >= 128.0 ? (x - 255.5) / 127.5 : (x + 0.5) / 127.5; }
+float sign3(float x) { x *= 255.0; return x >= 128.0 ? (x - 256.0) / 127.0 : x / 127.0; }
+vec3 dotmapf(uint m, vec4 c)
 {
-    if (m == 0u) return vec4(0.0, 0.0, 0.0, 1.0);                // NONE
-    if (m == 4u) return pt;                                       // PASSTHRU
-    if (!on)     return vec4(1.0);                                // no texture
-    if (m == 1u || m == 2u || m == 6u || m == 7u) {               // PROJECT2D/3D, BUMPENV (plain)
-                                                                  float w = ((m == 1u || m == 2u) && pt.w != 0.0) ? pt.w : 1.0;
-                                                                  return tex2dc(s, pt.xy / w);
+    if (m == 1u) return vec3(sign1(c.r), sign1(c.g), sign1(c.b));
+    if (m == 2u) return vec3(sign2(c.r), sign2(c.g), sign2(c.b));
+    if (m == 3u) return vec3(sign3(c.r), sign3(c.g), sign3(c.b));
+    return c.rgb;
+}
+
+// All four texture stages, as nv2a_gpu_d3d11.hlsl shade(): plain, cube and
+// passthrough modes, and the dot-product modes the field and player models
+// light with (DOT_RFLCT_DIFF / DOT_RFLCT_SPEC read cube maps through normals
+// built from earlier stages). Treated as plain 2D -- or as black, as this
+// shader did before -- those passes lit nothing, and players looked flat.
+void stage_all(inout vec4 t[4])
+{
+    vec4 T[4] = vec4[4](v_t0, v_t1, v_t2, v_t3);
+    float dt[4] = float[4](0.0, 0.0, 0.0, 0.0);
+    for (int s = 0; s < 4; s++) {
+        uint m = P_MODE[s];
+        vec4 pt = T[s];
+        bool on = ((P_SAMPLED >> uint(s)) & 1u) != 0u;
+        vec4 prev = t[min(int(P_INPUT[s]), 3)];
+        int sp = max(s - 1, 0);
+        if (m == 0u)       t[s] = vec4(0.0, 0.0, 0.0, 1.0);                     // NONE
+        else if (m == 4u)  t[s] = pt;                                            // PASSTHRU
+        else if (m == 1u || m == 2u || m == 6u || m == 7u) {                     // PROJECT2D/3D, BUMPENV (plain)
+            float w = ((m == 1u || m == 2u) && pt.w != 0.0) ? pt.w : 1.0;
+            t[s] = !on ? vec4(1.0) : (P_CUBE[s] != 0u ? texcube(s, pt.xyz) : tex2dc(s, pt.xy / w));
+        }
+        else if (m == 3u)  t[s] = on ? texdir(s, pt.xyz) : vec4(1.0);            // CUBEMAP
+        else if (m == 0x11u) {                                                   // DOTPRODUCT
+            dt[s] = dot(pt.xyz, dotmapf(P_DOTMAP[s], prev));
+            t[s] = vec4(0.0);
+        }
+        else if (m == 0x09u) {                                                   // DOT_ST
+            dt[s] = dot(pt.xyz, dotmapf(P_DOTMAP[s], prev));
+            t[s] = tex2dc(s, vec2(dt[sp], dt[s]));
+        }
+        else if (m == 0x0Bu) {                                                   // DOT_RFLCT_DIFF
+            dt[s] = dot(pt.xyz, dotmapf(P_DOTMAP[s], prev));
+            float dn = dot(T[3].xyz, dotmapf(P_DOTMAP[3], t[min(int(P_INPUT[3]), 3)]));
+            t[s] = texdir(s, vec3(dt[sp], dt[s], dn));
+        }
+        else if (m == 0x0Cu) {                                                   // DOT_RFLCT_SPEC
+            dt[s] = dot(pt.xyz, dotmapf(P_DOTMAP[s], prev));
+            vec3 n = vec3(dt[1], dt[2], dt[3]);
+            vec3 e = vec3(T[1].w, T[2].w, T[3].w);
+            vec3 r = 2.0 * n * dot(n, e) / max(dot(n, n), 1e-8) - e;
+            t[s] = texdir(s, r);
+        }
+        else if (m == 0x0Du || m == 0x0Eu) {                                     // DOT_STR_3D / CUBE
+            dt[s] = dot(pt.xyz, dotmapf(P_DOTMAP[s], prev));
+            t[s] = texdir(s, vec3(dt[1], dt[2], dt[3]));
+        }
+        else if (m == 0x0Fu) t[s] = tex2d(s, prev.ar);                          // DEPENDENT_AR
+        else if (m == 0x10u) t[s] = tex2d(s, prev.gb);                          // DEPENDENT_GB
+        else                 t[s] = vec4(0.0, 0.0, 0.0, 1.0);                   // unimplemented
     }
-    if (m == 3u) return texdir(s, pt.xyz);                        // CUBEMAP
-    return vec4(0.0, 0.0, 0.0, 1.0);   // dot-product modes: part 2
 }
 
 // ---- register combiners -----------------------------------------------
@@ -203,7 +298,7 @@ void comb_stage(uint icw, uint ocw, bool is_alpha)
     vec3 cd = (!is_alpha && (flags & 1u) != 0u) ? vec3(C.x * D.x + C.y * D.y + C.z * D.z) : C * D;
 
     // The mux picks AB or CD by r0.a: its top bit (MUX_MSB) or its low bit.
-    bool mux_cd = (sh.prog.x & 0x100u) != 0u ? src_r[12].a >= 0.5
+    bool mux_cd = (P_PROG.x & 0x100u) != 0u ? src_r[12].a >= 0.5
                                               : (uint(src_r[12].a * 255.0 + 0.5) & 1u) != 0u;
     vec3 ms = (flags & 4u) != 0u ? (mux_cd ? cd : ab) : ab + cd;
 
@@ -226,8 +321,8 @@ void comb_stage(uint icw, uint ocw, bool is_alpha)
 // All general stages, then the final combiner. Returns RGBA clamped to 0..1.
 vec4 comb_eval(vec4 t0, vec4 v0, vec4 v1, vec4 tn[3])
 {
-    uint control = sh.prog.x, stage_prog = sh.prog.y;
-    uint final0 = sh.prog.z, final1 = sh.prog.w;
+    uint control = P_PROG.x, stage_prog = P_PROG.y;
+    uint final0 = P_PROG.z, final1 = P_PROG.w;
     int stages = min(int(control & 0xFFu), 8);
 
     for (int i = 0; i < 16; i++)
@@ -249,8 +344,8 @@ vec4 comb_eval(vec4 t0, vec4 v0, vec4 v1, vec4 tn[3])
         src_r[1] = unpack_argb(value8(sh.factor0, c0));
         src_r[2] = unpack_argb(value8(sh.factor1, c1));
         dst_r = src_r;
-        comb_stage(value8(sh.color_icw, s), value8(sh.color_ocw, s), false);
-        comb_stage(value8(sh.alpha_icw, s), value8(sh.alpha_ocw, s), true);
+        comb_stage(value8(P_CICW, s), value8(P_COCW, s), false);
+        comb_stage(value8(P_AICW, s), value8(P_AOCW, s), true);
         src_r = dst_r;
     }
 
@@ -288,7 +383,7 @@ uvec4 to8(vec4 c) { return uvec4(clamp(c, 0.0, 1.0) * 255.0 + 0.5); }
 bool alpha_pass(uint a)
 {
     uint r = sh.alpha.z;
-    switch (sh.alpha.y) {
+    switch (P_ALPHA_FUNC) {
     case 0x0200u: return false;
     case 0x0201u: return a <  r;
     case 0x0202u: return a == r;
@@ -302,16 +397,16 @@ bool alpha_pass(uint a)
 
 void main()
 {
-    bool sampled0 = (sh.misc.z & 1u) != 0u;
-    vec4 t0 = stage_sample(0, v_t0, sh.mode.x, sampled0);
+    bool sampled0 = (P_SAMPLED & 1u) != 0u;
+    vec4 ts[4] = vec4[4](vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0),
+                         vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0));
+    stage_all(ts);
+    vec4 t0 = ts[0];
     uvec4 c8;
 
-    if (sh.prog.x != 0u) {
+    if (P_PROG.x != 0u) {
         // Combiners active. Stages 1..3 read 1.0 unless they are sampled.
-        vec4 tn[3];
-        tn[0] = stage_sample(1, v_t1, sh.mode.y, (sh.misc.z & 2u) != 0u);
-        tn[1] = stage_sample(2, v_t2, sh.mode.z, (sh.misc.z & 4u) != 0u);
-        tn[2] = stage_sample(3, v_t3, sh.mode.w, (sh.misc.z & 8u) != 0u);
+        vec4 tn[3] = vec4[3](ts[1], ts[2], ts[3]);
         c8 = to8(comb_eval(t0, v_col, v_spec, tn));
     } else if (sampled0) {
         // modulate(texel, argb): (t * c + 127) / 255 per channel, in integers.
@@ -320,13 +415,22 @@ void main()
         c8 = to8(v_col);
     }
 
-    if (sh.alpha.x != 0u && !alpha_pass(c8.a))
+    if (P_ALPHA_ON != 0u && !alpha_pass(c8.a))
         discard;
     out_color = vec4(c8) / 255.0;
+#ifndef P_NO_FRAGDEPTH
     float zmax = uintBitsToFloat(sh.depth.y);
-    float zd = (sh.depth.x & 1u) != 0u ? v_w : gl_FragCoord.z * zmax;
+    float zd = (P_DEPTHX & 1u) != 0u ? v_w : gl_FragCoord.z * zmax;
     float cmin = uintBitsToFloat(sh.depth.z), cmax = uintBitsToFloat(sh.depth.w);
-    if ((sh.depth.x & 2u) != 0u && (zd < cmin || zd > cmax))
+    if ((P_DEPTHX & 2u) != 0u && (zd < cmin || zd > cmax))
     discard;
-    gl_FragDepth = clamp(clamp(zd, cmin, cmax) / zmax, 0.0, 1.0);
+    float zc = clamp(zd, cmin, cmax);
+    // Integer depth formats (depth.x bit 2): store whole depth units, as the
+    // D3D11 path and the console do. Fractions differ by a rounding step
+    // between passes drawn with different programs, and the equal-depth
+    // tests of model overlays (player lighting/detail passes) then fail.
+    if ((P_DEPTHX & 4u) != 0u)
+        zc = floor(zc);
+    gl_FragDepth = clamp(zc / zmax, 0.0, 1.0);
+#endif
 }
