@@ -54,6 +54,14 @@ typedef struct {
      * high-resolution image for a stretched 1x one. */
     uint8_t *shadow;
     int shadow_valid;
+    /* Render-to-texture without a guest-RAM round trip. `rtt` is a 1x
+     * R8G8B8A8 copy of the rendered colour (SDL blit converts from the
+     * target's B8G8R8A8 and downscales k>1), sampled directly when the
+     * title reads this surface as a texture. `version` counts content
+     * changes; rtt is refreshed when it lags. See sg_surface_rtt(). */
+    SDL_GPUTexture *rtt;
+    uint32_t version;
+    uint32_t rtt_version;
 } SgSurface;
 
 #define SG_MAX_PIPELINES 4096   /* fragment variants multiply states */

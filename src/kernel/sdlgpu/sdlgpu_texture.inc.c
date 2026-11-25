@@ -258,20 +258,32 @@ static int sg_texture_for_stage(int st, SgTextureUse *use)
         return 0;
     /* Render-to-texture: the title samples a surface it drew (screen
    * effects, replays). If the GPU drew it, guest RAM -- which the snapshot
-   * read -- is stale: finish the queue and download it first. Addresses
-   * are compared as physical (contiguous-window and physical aliases of
-   * the same 64 MB). */
+   * read -- is stale. Preferred path: bind a GPU-side 1x copy of the surface
+   * (sg_surface_rtt), no round trip. Fallback: finish the queue and download
+   * to guest RAM, as before. Addresses are compared as physical
+   * (contiguous-window and physical aliases of the same 64 MB). */
     {
         uint32_t lo = tx->offset & 0x03FFFFFFu;
         uint32_t hi = lo + (uint32_t)s_texture_snapshot[st].bytes;
         for (i = 0; i < SG_MAX_SURFACES; i++) {
             SgSurface *s = &s_sg.surf[i];
             uint32_t slo = s->guest & 0x03FFFFFFu, shi = slo + s->pitch * s->h;
-            if (s->color && s->owner == SG_OWNER_GPU && lo < shi && slo < hi) {
-                sg_queue_flush();
-                sg_download(s);
-                xbox_texture_snapshot_refresh(st);
+            if (!s->color || s->owner != SG_OWNER_GPU || lo >= shi || slo >= hi)
+                continue;
+            sg_queue_flush();
+            /* Only when the texture is exactly the whole surface: a sub-
+             * rectangle sample needs a matching region, not the full copy. */
+            if (sg_gpurt_enabled() && !cube && lo == slo && w == s->w && h == s->h) {
+                SDL_GPUTexture *rt = sg_surface_rtt(s);
+                if (rt) {
+                    *use = (SgTextureUse){ rt, NULL, s->w, s->h, NULL, 0,
+                                           sg_sampler_for_stage(st), 0 };
+                    return 1;
+                }
             }
+            sg_download(s);
+            xbox_texture_snapshot_refresh(st);
+            break; /* guest copy is current: the cache path decodes it */
         }
     }
 

@@ -318,6 +318,7 @@ static int sg_queue_draw(const SgDraw *d) {
     /* The GPU copy will be the newer one. Anything that reads the surface on
      * the CPU flushes the queue first (sg_cpu_access, sg_flip). */
     d->surface->owner = SG_OWNER_GPU;
+    d->surface->version++;   /* content changed: a render-to-texture copy is stale */
     return 1;
 }
 

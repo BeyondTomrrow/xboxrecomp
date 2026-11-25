@@ -224,12 +224,13 @@ static void sg_present_flip(void)
         if (fps && now - t0 >= 1000) {
             fprintf(stderr, "  [SDLGPU] drain %d ms, download %d ms (per second)\n",
                     SDL_SetAtomicInt(&s_sg_stat_drain_us, 0) / 1000, SDL_SetAtomicInt(&s_sg_stat_dl_us, 0) / 1000);
-            fprintf(stderr, "  [SDLGPU] %.1f flips/s, %d downloads, %d surface uploads, %d passes, %d draws\n",
+            fprintf(stderr, "  [SDLGPU] %.1f flips/s, %d downloads, %d surface uploads, %d passes, %d draws, %d rtt\n",
                     SDL_SetAtomicInt(&s_sg_stat_flips, 0) * 1000.0 / (double)(now - t0),
                     SDL_SetAtomicInt(&s_sg_stat_downloads, 0),
                     SDL_SetAtomicInt(&s_sg_stat_uploads, 0),
                     SDL_SetAtomicInt(&s_sg_stat_passes, 0),
-                    SDL_SetAtomicInt(&s_sg_stat_draws, 0));
+                    SDL_SetAtomicInt(&s_sg_stat_draws, 0),
+                    SDL_SetAtomicInt(&s_sg_stat_rtt, 0));
             t0 = now;
         }
     }

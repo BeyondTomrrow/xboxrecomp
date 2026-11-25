@@ -14,7 +14,7 @@ static void sg_download(SgSurface *s);
 
 /* RECOMP_SDLGPU_FPS: per-second flips, downloads (each a full GPU sync)
  * and surface uploads, printed by sg_present_flip. */
-static SDL_AtomicInt s_sg_stat_flips, s_sg_stat_downloads, s_sg_stat_uploads, s_sg_stat_passes, s_sg_stat_draws;
+static SDL_AtomicInt s_sg_stat_flips, s_sg_stat_downloads, s_sg_stat_uploads, s_sg_stat_passes, s_sg_stat_draws, s_sg_stat_rtt;
 static SDL_AtomicInt s_sg_stat_drain_us, s_sg_stat_dl_us;   /* download: prior GPU work, then the copy itself */
 
 static uint8_t *sg_guest_bytes(uint32_t va) {
@@ -23,6 +23,8 @@ static uint8_t *sg_guest_bytes(uint32_t va) {
 
 static void sg_surface_release(SgSurface *s) {
     free(s->shadow);
+    if (s->rtt)
+        SDL_ReleaseGPUTexture(s_sg.dev, s->rtt);
     if (s->low)
         SDL_ReleaseGPUTexture(s_sg.dev, s->low);
     if (s->color)
@@ -86,12 +88,59 @@ static void sg_blit(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *src, uint32_t sw,
 static SDL_GPUTexture *sg_surface_upload_target(SgSurface *s) {
     SDL_AddAtomicInt(&s_sg_stat_uploads, 1);
     s->shadow_valid = 0;   /* the GPU copy is about to become the guest's */
+    s->version++;          /* the GPU copy's content changes: rtt is stale */
     return s->k > 1 ? sg_surface_low(s) : s->color;
 }
 
 static void sg_surface_upscale(SDL_GPUCommandBuffer *cmd, SgSurface *s) {
     if (s->k > 1 && s->low)
         sg_blit(cmd, s->low, s->w, s->h, s->color, s->w * s->k, s->h * s->k);
+}
+
+/* GPU render-to-texture: on by default; RECOMP_SDLGPU_NO_GPURTT=1 falls back
+ * to the download-through-guest-RAM path. */
+static int sg_gpurt_enabled(void) {
+    static int on = -1;
+    if (on < 0)
+        on = getenv("RECOMP_SDLGPU_NO_GPURTT") == NULL;
+    return on;
+}
+
+/* A 1x R8G8B8A8 texture holding s's rendered colour, so a draw that samples
+ * this surface can bind it directly instead of downloading to guest RAM and
+ * re-uploading (a full GPU sync per frame). The blit also downscales k>1 and
+ * converts B8G8R8A8 -> R8G8B8A8 (SDL_BlitGPUTexture converts formats). The
+ * surface stays GPU-owned, so guest RAM is untouched; sg_cpu_access() and
+ * the software-fallback path still download it when they need the bytes.
+ * Returns NULL (caller falls back to the download path) on any failure. */
+static SDL_GPUTexture *sg_surface_rtt(SgSurface *s) {
+    SDL_GPUCommandBuffer *cmd;
+
+    if (!s->rtt) {
+        SDL_GPUTextureCreateInfo info = {
+            .type = SDL_GPU_TEXTURETYPE_2D, .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+            .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER | SDL_GPU_TEXTUREUSAGE_COLOR_TARGET,
+            .width = s->w, .height = s->h, .layer_count_or_depth = 1, .num_levels = 1,
+        };
+        s->rtt = SDL_CreateGPUTexture(s_sg.dev, &info);
+        if (!s->rtt) {
+            sg_gpu_error("surface rtt texture");
+            return NULL;
+        }
+        s->rtt_version = 0xFFFFFFFFu;
+    }
+    if (s->rtt_version != s->version) {
+        cmd = SDL_AcquireGPUCommandBuffer(s_sg.dev);
+        if (!cmd) {
+            sg_gpu_error("rtt: command buffer");
+            return NULL;
+        }
+        sg_blit(cmd, s->color, s->w * s->k, s->h * s->k, s->rtt, s->w, s->h);
+        SDL_SubmitGPUCommandBuffer(cmd);
+        s->rtt_version = s->version;
+        SDL_AddAtomicInt(&s_sg_stat_rtt, 1);
+    }
+    return s->rtt;
 }
 
 /* Colour and depth-stencil textures for a new w x h surface. */
@@ -120,6 +169,9 @@ static int sg_surface_create(SgSurface *s, uint32_t w, uint32_t h) {
     s->low = NULL;
     s->shadow = NULL;
     s->shadow_valid = 0;
+    s->rtt = NULL;
+    s->version = 0;
+    s->rtt_version = 0xFFFFFFFFu; /* force a blit on first sample */
     return 1;
 }
 
@@ -359,8 +411,10 @@ static int sg_clear_surface(uint32_t param) {
     }
     SDL_EndGPURenderPass(SDL_BeginGPURenderPass(cmd, &color, 1, &depth));
     SDL_SubmitGPUCommandBuffer(cmd);
-    if (channels)
+    if (channels) {
         s->owner = SG_OWNER_GPU; /* the GPU copy is now the newer one */
+        s->version++;
+    }
     /* Clear the software depth/stencil buffers as well. A 3D batch that
      * falls back to software tests against s_zbuf; left uncleared it held
      * depth from long ago and most fallback pixels failed the test and
