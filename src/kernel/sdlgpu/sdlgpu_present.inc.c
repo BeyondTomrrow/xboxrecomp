@@ -113,6 +113,8 @@ static void sg_present_dump(SgSurface *s)
     SDL_GPUFence *done;
     const uint8_t *px;
     FILE *f;
+    static const char *base;
+    static int seq = -1, stop;
     uint32_t W = s->w * s->k, H = s->h * s->k;   /* the scaled target, as drawn */
     uint32_t y, row = W * 4u, bytes = row * H;
 
@@ -123,13 +125,33 @@ static void sg_present_dump(SgSurface *s)
     }
     if (!path)
         return;
-    /* On request: touch <path>.req and the next flip is written to <path>
-     * (the request file is removed). For driving the game from a script. */
-    if (++flips % 15 == 0) {
+    {
+        /* RECOMP_SDLGPU_DUMP_SEQ=<n>: <n> consecutive flips from DUMP_AT, each
+         * written as <path>.<flip>.bmp. Frame-by-frame evidence. */
+        static char seq_name[1200];
         char req[1024];
-        snprintf(req, sizeof req, "%s.req", path);
-        if (remove(req) == 0)
-            at = flips;
+        if (seq < 0) {
+            const char *v = getenv("RECOMP_SDLGPU_DUMP_SEQ");
+            seq = v ? atoi(v) : 0;
+            if (seq)
+                base = path;
+        }
+        if (seq) {
+            flips++;
+            if (!stop)
+                stop = at + seq;
+            if (flips < at || flips >= stop)
+                return;
+            snprintf(seq_name, sizeof seq_name, "%s.%d.bmp", base, flips);
+            path = seq_name;
+            at = flips;                     /* this flip is the one to write */
+        } else if (++flips % 15 == 0) {
+            /* On request: touch <path>.req and the next flip is written to
+             * <path> (the request file is removed). */
+            snprintf(req, sizeof req, "%s.req", path);
+            if (remove(req) == 0)
+                at = flips;
+        }
     }
     if (flips != at)
         return;
